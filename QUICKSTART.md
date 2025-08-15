@@ -18,7 +18,46 @@ pip install -e .
 python -c "import spider; print('SPIDER installed successfully!')"
 ```
 
-### 2. Prepare Sample Data
+### 2. Train EikoNet Model
+
+Before running SPIDER, you need a trained EikoNet model for travel time prediction.
+
+**Create velocity model** (`velmod.csv`):
+```csv
+depth,vs,vp
+-5.0,3.3,6.0
+0.0,3.3,6.0
+5.0,3.4,6.1
+10.0,3.5,6.2
+15.0,3.6,6.3
+20.0,3.7,6.4
+```
+
+**Create EikoNet config** (`eikonet.json`):
+```json
+{
+    "velmod_file": "velmod.csv",
+    "lon_min": -120.0,
+    "lat_min": 35.0,
+    "z_min": -5.0,
+    "z_max": 50.0,
+    "scale": 200.0,
+    "model_file": "model.pt",
+    "train_batch_size": 512,
+    "val_batch_size": 10000,
+    "n_train": 1000000,
+    "n_test": 2000000,
+    "n_epochs": 1000,
+    "lr": 1e-3
+}
+```
+
+**Train the model**:
+```bash
+python eikonet_train.py eikonet.json
+```
+
+### 3. Prepare Sample Data
 
 Create these two CSV files:
 
@@ -41,7 +80,7 @@ evt_002,evt_003,STA1,P,0.3,0.08
 evt_002,evt_003,STA1,S,0.6,0.12
 ```
 
-### 3. Create Configuration
+### 4. Create Configuration
 
 Create `params.json`:
 
@@ -73,13 +112,13 @@ Create `params.json`:
 }
 ```
 
-### 4. Run SPIDER
+### 5. Run SPIDER
 
 ```bash
 python SPIDER.py params.json
 ```
 
-### 5. Analyze Results
+### 6. Analyze Results
 
 ```python
 from spider.io.samples import read_all_samples
@@ -106,10 +145,11 @@ print(f"Mean depth: {summary.X[:, 2].mean():.2f} km")
 
 ### Required Files
 
-1. **EikoNet Model**: Pre-trained neural network model (`.pt` file)
-2. **Event Catalog**: CSV with event locations and times
-3. **Differential Times**: CSV with phase arrival time differences
-4. **Configuration**: JSON parameter file
+1. **EikoNet Model**: Pre-trained neural network model (`.pt` file) - **You must train this first**
+2. **Velocity Model**: CSV with depth-dependent velocities (`velmod.csv`)
+3. **Event Catalog**: CSV with event locations and times
+4. **Differential Times**: CSV with phase arrival time differences
+5. **Configuration**: JSON parameter file
 
 ### System Requirements
 

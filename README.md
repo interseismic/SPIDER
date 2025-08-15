@@ -59,7 +59,46 @@ python -c "import spider; print('SPIDER installed successfully!')"
 
 ## ⚡ Quick Start
 
-### 1. Prepare Your Data
+### 1. Train EikoNet Model (Required)
+
+Before running SPIDER, you need a trained EikoNet model for travel time prediction.
+
+**Create EikoNet configuration** (`eikonet.json`):
+```json
+{
+    "velmod_file": "path/to/velmod.csv",
+    "lon_min": -117.5,
+    "lat_min": 33.0,
+    "z_min": -5.0,
+    "z_max": 80.0,
+    "scale": 400.0,
+    "model_file": "path/to/model.pt",
+    "train_batch_size": 512,
+    "val_batch_size": 10000,
+    "n_train": 1000000,
+    "n_test": 2000000,
+    "n_epochs": 1000,
+    "lr": 1e-3
+}
+```
+
+**Train the model**:
+```bash
+# Download and run EikoNet training script
+python eikonet_train.py eikonet.json
+```
+
+**Velocity model format** (`velmod.csv`):
+```csv
+depth,vs,vp
+-5.0,3.3,6.0
+0.0,3.3,6.0
+5.0,3.4,6.1
+10.0,3.5,6.2
+...
+```
+
+### 2. Prepare Your Data
 
 SPIDER requires two main input files:
 
@@ -72,9 +111,9 @@ evt_002,-117.6,34.3,12.1,2023-01-01T12:05:00
 
 **Differential Times** (`dtimes.csv`):
 ```csv
-event1_id,event2_id,network,station,phase,dt_obs,dt_err
-evt_001,evt_002,NET1,STA1,P,0.5,0.1
-evt_001,evt_002,NET1,STA1,S,1.2,0.15
+event1_id,event2_id,station,phase,dt_obs,dt_err
+evt_001,evt_002,STA1,P,0.5,0.1
+evt_001,evt_002,STA1,S,1.2,0.15
 ```
 
 ### 2. Create Configuration File
@@ -247,6 +286,70 @@ summary = compute_cat_dd_and_xyz(samples, burn_in=100, thin=2)
 ```
 
 ## 🔧 Advanced Features
+
+### EikoNet Model Training
+
+SPIDER uses EikoNet, a neural network for fast travel time prediction. You must train this model before running SPIDER.
+
+#### Training Configuration
+
+**EikoNet JSON Parameters** (`eikonet.json`):
+
+| Parameter | Type | Description | Example |
+|-----------|------|-------------|---------|
+| `velmod_file` | string | Path to velocity model CSV | `"velmod.csv"` |
+| `lon_min`, `lat_min` | float | Spatial domain bounds | `-117.5, 33.0` |
+| `z_min`, `z_max` | float | Depth bounds (km) | `-5.0, 80.0` |
+| `scale` | float | Spatial scale factor | `400.0` |
+| `model_file` | string | Output model path | `"model.pt"` |
+| `train_batch_size` | int | Training batch size | `512` |
+| `val_batch_size` | int | Validation batch size | `10000` |
+| `n_train` | int | Training samples | `1000000` |
+| `n_test` | int | Test samples | `2000000` |
+| `n_epochs` | int | Training epochs | `1000` |
+| `lr` | float | Learning rate | `1e-3` |
+
+#### Velocity Model Format
+
+Create a CSV file with depth-dependent velocities:
+
+```csv
+depth,vs,vp
+-5.0,3.3,6.0
+0.0,3.3,6.0
+5.0,3.4,6.1
+10.0,3.5,6.2
+15.0,3.6,6.3
+20.0,3.7,6.4
+...
+```
+
+#### Training Process
+
+```bash
+# 1. Prepare velocity model
+# Create velmod.csv with your regional velocity structure
+
+# 2. Configure training
+# Edit eikonet.json with your parameters
+
+# 3. Train the model
+python eikonet_train.py eikonet.json
+
+# 4. Verify training
+# Check that model.pt was created successfully
+```
+
+#### Training Tips
+
+- **Domain size**: Ensure spatial bounds cover your study area
+- **Depth range**: Include all relevant depths for your earthquakes
+- **Velocity model**: Use region-specific velocity structure
+- **Training samples**: More samples = better accuracy (but longer training)
+- **Batch size**: Adjust based on GPU memory
+- **Learning rate**: Start with 1e-3, reduce if training is unstable
+
+For detailed EikoNet training instructions, see [docs/EIKONET_TRAINING.md](docs/EIKONET_TRAINING.md).
 
 ### Weights & Biases Integration
 
