@@ -8,12 +8,6 @@ import h5py
 from pyproj import Proj
 
 
-def _use_zarr_backend(params: Dict[str, Any]) -> bool:
-    path = params.get('samples_outfile', '')
-    # Treat directory or .zarr suffix as Zarr backend
-    return bool(path) and (path.endswith('.zarr') or (os.path.exists(path) and os.path.isdir(path)))
-
-
 SAMPLE_FIELDS = ['longitude', 'latitude', 'depth', 'delta_t', 'X', 'Y', 'Z']
 
 
@@ -51,9 +45,6 @@ def _ensure_root_datasets(f: h5py.File, n_events: int, sample_capacity: int, par
 
 
 def clear_samples_file(params) -> bool:
-    if _use_zarr_backend(params):
-        from . import samples_zarr as _z
-        return _z.clear_samples_file(params)
     store_path = params.get('samples_outfile', 'samples.h5')
     if not os.path.exists(store_path):
         return True
@@ -65,9 +56,6 @@ def clear_samples_file(params) -> bool:
 
 
 def get_next_sample_count(params) -> int:
-    if _use_zarr_backend(params):
-        from . import samples_zarr as _z
-        return _z.get_next_sample_count(params)
     store_path = params.get('samples_outfile', 'samples.h5')
     if not os.path.exists(store_path):
         return 0
@@ -195,11 +183,32 @@ def save_samples_periodic(
     return sample_count
 
 
-def read_all_samples(params) -> Dict[str, np.ndarray]:
+def read_all_samples(
+    params,
+    backend: str = 'numpy',
+    device: str | None = None,
+    dtype: torch.dtype = torch.float32,
+    pin_memory: bool = False,
+    thin: int = 1,
+) -> Dict[str, np.ndarray] | Dict[str, torch.Tensor]:
+    """Read all samples from HDF5 file with optional thinning.
+    
+    Args:
+        params: Parameter dictionary containing 'samples_outfile'
+        backend: 'numpy' or 'torch' for output format
+        device: Target device for torch tensors
+        dtype: Data type for torch tensors
+        pin_memory: Whether to pin memory for torch tensors
+        thin: Thinning factor - keep every nth sample (default: 1 = no thinning)
+    """
     store_path = params.get('samples_outfile', 'samples.h5')
     if not os.path.exists(store_path):
         print(f"Samples store not found: {store_path}")
         return {}
+    
+    if thin < 1:
+        raise ValueError(f"thin must be >= 1, got {thin}")
+    
     with h5py.File(store_path, 'r') as f:
         batches = []
         for name in f.keys():
@@ -225,7 +234,15 @@ def read_all_samples(params) -> Dict[str, np.ndarray]:
             event_ids = np.asarray([str(i) for i in range(n_events_meta)], dtype=str)
 
         n_events = batches[0][1]['longitude'].shape[0]
-        total_samples = sum(b[1]['longitude'].shape[1] for b in batches)
+        
+        # Calculate total samples after thinning
+        total_samples = 0
+        for _, grp in batches:
+            n_samples_in_batch = grp['longitude'].shape[1]
+            if thin == 1:
+                total_samples += n_samples_in_batch
+            else:
+                total_samples += len(range(0, n_samples_in_batch, thin))
 
         out = {
             'event_ids': event_ids,
@@ -241,14 +258,45 @@ def read_all_samples(params) -> Dict[str, np.ndarray]:
         offset = 0
         for _, grp in batches:
             w = grp['longitude'].shape[1]
-            sl = slice(offset, offset + w)
-            out['longitude'][:, sl] = grp['longitude'][:]
-            out['latitude'][:, sl]  = grp['latitude'][:]
-            out['depth'][:, sl]     = grp['depth'][:]
-            out['delta_t'][:, sl]   = grp['delta_t'][:]
-            out['X'][:, sl]         = grp['X'][:]
-            out['Y'][:, sl]         = grp['Y'][:]
-            out['Z'][:, sl]         = grp['Z'][:]
-            offset += w
+            # Apply thinning to this batch
+            if thin == 1:
+                # No thinning - use all samples
+                sl = slice(offset, offset + w)
+                out['longitude'][:, sl] = grp['longitude'][:]
+                out['latitude'][:, sl]  = grp['latitude'][:]
+                out['depth'][:, sl]     = grp['depth'][:]
+                out['delta_t'][:, sl]   = grp['delta_t'][:]
+                out['X'][:, sl]         = grp['X'][:]
+                out['Y'][:, sl]         = grp['Y'][:]
+                out['Z'][:, sl]         = grp['Z'][:]
+                offset += w
+            else:
+                # Apply thinning - keep every nth sample
+                thinned_indices = slice(0, w, thin)
+                n_thinned = len(range(0, w, thin))
+                sl = slice(offset, offset + n_thinned)
+                out['longitude'][:, sl] = grp['longitude'][:, thinned_indices]
+                out['latitude'][:, sl]  = grp['latitude'][:, thinned_indices]
+                out['depth'][:, sl]     = grp['depth'][:, thinned_indices]
+                out['delta_t'][:, sl]   = grp['delta_t'][:, thinned_indices]
+                out['X'][:, sl]         = grp['X'][:, thinned_indices]
+                out['Y'][:, sl]         = grp['Y'][:, thinned_indices]
+                out['Z'][:, sl]         = grp['Z'][:, thinned_indices]
+                offset += n_thinned
 
-    return out
+    # Return as-is if numpy backend requested (default)
+    if str(backend).lower() == 'numpy':
+        return out
+
+    # Torch backend: wrap numeric arrays as tensors; keep 'event_ids' as-is (numpy of str)
+    target_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    out_torch: Dict[str, torch.Tensor] | Dict[str, np.ndarray] = {'event_ids': out['event_ids']}
+    for name in SAMPLE_FIELDS:
+        arr = out[name]
+        t = torch.from_numpy(arr).to(dtype)
+        if pin_memory and target_device != 'cpu':
+            t = t.pin_memory()
+        out_torch[name] = t.to(target_device, non_blocking=True) if target_device != 'cpu' else t
+
+    return out_torch  # type: ignore[return-value]

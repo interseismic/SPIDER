@@ -1,9 +1,12 @@
 import numpy as _np
 import numpy as np
 import matplotlib.pyplot as _plt
+from typing import Union, Sequence, Optional
+
+from spider.analysis import EventSamplesSummary
 
 
-def plot_event_distributions(samples_data,
+def plot_event_distributions(samples_data: Union[dict, EventSamplesSummary],
                              n_rows=6,
                              n_cols=4,
                              coords=("X", "Y", "Z"),
@@ -47,13 +50,30 @@ def plot_event_distributions(samples_data,
         from scipy.stats import gaussian_kde as _gaussian_kde
         _use_fft = False
 
-    # Validate inputs
-    assert 'event_ids' in samples_data, "samples_data must include 'event_ids'"
-    for c in coords:
-        if c not in samples_data:
-            raise KeyError(f"Coordinate '{c}' not found in samples_data")
-
-    n_events, n_samples = samples_data[coords[0]].shape
+    # Support EventSamplesSummary or legacy dict
+    is_summary = isinstance(samples_data, EventSamplesSummary)
+    if is_summary:
+        invalid = [c for c in coords if c not in ("X", "Y", "Z")]
+        if invalid:
+            raise KeyError(f"When using EventSamplesSummary, only 'X','Y','Z' are supported for coords (got {invalid})")
+        # Determine shape from first available coord
+        shape_source = None
+        for c in coords:
+            arr = getattr(samples_data, c, None)
+            if arr is not None:
+                shape_source = arr
+                break
+        if shape_source is None:
+            raise ValueError("EventSamplesSummary does not contain any of the requested coords")
+        n_events, n_samples = shape_source.shape
+        event_ids = samples_data.cat_dd["evid"].values if samples_data.cat_dd is not None and "evid" in samples_data.cat_dd.columns else _np.arange(n_events)
+    else:
+        assert 'event_ids' in samples_data, "samples_data must include 'event_ids'"
+        for c in coords:
+            if c not in samples_data:
+                raise KeyError(f"Coordinate '{c}' not found in samples_data")
+        n_events, n_samples = samples_data[coords[0]].shape
+        event_ids = samples_data['event_ids']
     num_to_plot = min(n_rows * n_cols, n_events)
 
     # Select events
@@ -128,14 +148,17 @@ def plot_event_distributions(samples_data,
         axis = ax[r, c]
 
         for coord in coords:
-            series = samples_data[coord][ev_idx, burn_in:]
+            if is_summary:
+                series = getattr(samples_data, coord)[ev_idx, :]
+            else:
+                series = samples_data[coord][ev_idx, burn_in:]
             x_vals = (series * factor)
             x_kde, y_kde = _kde_curve(x_vals)
             axis.plot(x_kde, y_kde, label=coord, color=coordinates_colors.get(coord, None))
 
         # Title with event id if available
         try:
-            evid = samples_data['event_ids'][ev_idx]
+            evid = event_ids[ev_idx]
         except Exception:
             evid = str(ev_idx)
         axis.set_title(str(evid), fontsize=9)
@@ -158,10 +181,18 @@ def plot_event_distributions(samples_data,
     return fig, ax
 
 
-def build_catalog_posterior_mean(event_samples):
+def build_catalog_posterior_mean(samples_data: Union[dict, EventSamplesSummary]):
     """
     Build a catalog of posterior means for each event.
     """
+    if isinstance(samples_data, EventSamplesSummary):
+        if samples_data.cat_dd is None:
+            raise ValueError("EventSamplesSummary must include cat_dd to build the catalog")
+        import polars as pl
+        # Use cat_dd directly
+        return pl.DataFrame(samples_data.cat_dd)
+
+    event_samples = samples_data
     lats = event_samples["latitude"].mean(axis=1)
     lons = event_samples["longitude"].mean(axis=1)
     deps = event_samples["depth"].mean(axis=1)
@@ -177,7 +208,7 @@ def build_catalog_posterior_mean(event_samples):
     return catalog
 
 
-def plot_event_chains(samples_data,
+def plot_event_chains(samples_data: Union[dict, EventSamplesSummary],
                       n_rows=2,
                       n_cols=2,
                       coords=("X", "Y", "Z"),
@@ -220,12 +251,28 @@ def plot_event_chains(samples_data,
         (fig, ax): matplotlib figure and axes grid.
     """
     # Validate fields
-    assert 'event_ids' in samples_data, "samples_data must include 'event_ids'"
-    for c in coords:
-        if c not in samples_data:
-            raise KeyError(f"Coordinate '{c}' not found in samples_data")
-
-    n_events, n_samples = samples_data[coords[0]].shape
+    is_summary = isinstance(samples_data, EventSamplesSummary)
+    if is_summary:
+        invalid = [c for c in coords if c not in ("X", "Y", "Z")]
+        if invalid:
+            raise KeyError(f"When using EventSamplesSummary, only 'X','Y','Z' are supported for coords (got {invalid})")
+        shape_source = None
+        for c in coords:
+            arr = getattr(samples_data, c, None)
+            if arr is not None:
+                shape_source = arr
+                break
+        if shape_source is None:
+            raise ValueError("EventSamplesSummary does not contain any of the requested coords")
+        n_events, n_samples = shape_source.shape
+        event_ids_resolved = samples_data.cat_dd["evid"].values if samples_data.cat_dd is not None and "evid" in samples_data.cat_dd.columns else _np.arange(n_events)
+    else:
+        assert 'event_ids' in samples_data, "samples_data must include 'event_ids'"
+        for c in coords:
+            if c not in samples_data:
+                raise KeyError(f"Coordinate '{c}' not found in samples_data")
+        n_events, n_samples = samples_data[coords[0]].shape
+        event_ids_resolved = samples_data['event_ids']
     num_panels = min(n_rows * n_cols, n_events)
 
     # Resolve event selection
@@ -234,7 +281,7 @@ def plot_event_chains(samples_data,
         selection = _np.asarray(event_indices, dtype=int)
     elif event_ids is not None:
         # Map event IDs to indices
-        eid_arr = _np.asarray(samples_data['event_ids'])
+        eid_arr = _np.asarray(event_ids_resolved)
         idxs = []
         for eid in event_ids:
             matches = _np.nonzero(eid_arr == eid)[0]
@@ -278,10 +325,14 @@ def plot_event_chains(samples_data,
         # x-axis: sample indices after burn-in & thinning
         sample_idx = _np.arange(burn_in, n_samples, thin)
         for coord in coords:
-            series = samples_data[coord][ev_idx, burn_in:]
+            if is_summary:
+                series = getattr(samples_data, coord)[ev_idx, :]
+            else:
+                series = samples_data[coord][ev_idx, burn_in:]
             if thin > 1:
                 series = series[::thin]
             y_vals = (series * factor)
+            y_vals -= y_vals.mean()
             axis.plot(sample_idx[: y_vals.shape[0]], y_vals, label=coord,
                       alpha=alpha, linewidth=linewidth, color=coordinates_colors.get(coord, None))
             if show_mean and y_vals.size > 0:
@@ -289,7 +340,7 @@ def plot_event_chains(samples_data,
 
         # Title with event id
         try:
-            evid = samples_data['event_ids'][ev_idx]
+            evid = event_ids_resolved[ev_idx]
         except Exception:
             evid = str(ev_idx)
         axis.set_title(str(evid), fontsize=9)
@@ -397,7 +448,7 @@ def plot_uncertainty_histograms(
     plt.show()
 
 
-def plot_event_marginal_hist2d(samples_data,
+def plot_event_marginal_hist2d(samples_data: Union[dict, EventSamplesSummary],
                                event_index=None,
                                event_id=None,
                                coords=("X", "Y", "Z"),
@@ -416,7 +467,8 @@ def plot_event_marginal_hist2d(samples_data,
                                top_row_ylim=None,
                                n_contours=8,
                                equal_aspect=True,
-                               title=None):
+                               title=None,
+                               center_data=False):
     """Plot 1D marginals and 2D histograms with contours for a single event.
 
     Top row: 1D histograms for coords[0], coords[1], coords[2]
@@ -439,6 +491,7 @@ def plot_event_marginal_hist2d(samples_data,
         n_contours: number of contour levels (excluding min).
         equal_aspect: if True, set equal aspect for bottom row plots.
         title: optional suptitle for the figure.
+        center_data: if True, subtract the mean from each coordinate before plotting.
 
     Returns:
         (fig, axes): matplotlib figure and axes array of shape (2, 3).
@@ -446,13 +499,26 @@ def plot_event_marginal_hist2d(samples_data,
     # Validate coords
     if len(coords) != 3:
         raise ValueError("coords must be a tuple/list of exactly three field names")
+    is_summary = isinstance(samples_data, EventSamplesSummary)
     for c in coords:
-        if c not in samples_data:
-            raise KeyError(f"Coordinate '{c}' not found in samples_data")
+        if is_summary:
+            if c not in ("X", "Y", "Z"):
+                raise KeyError(f"When using EventSamplesSummary, only 'X','Y','Z' are supported (got '{c}')")
+        else:
+            if c not in samples_data:
+                raise KeyError(f"Coordinate '{c}' not found in samples_data")
 
     # Resolve event index
-    if event_id is not None and 'event_ids' in samples_data:
-        eid_arr = _np.asarray(samples_data['event_ids'])
+    event_ids_resolved = None
+    if is_summary:
+        if getattr(samples_data, 'cat_dd', None) is not None and 'evid' in samples_data.cat_dd.columns:
+            event_ids_resolved = _np.asarray(samples_data.cat_dd['evid'].values)
+    else:
+        if 'event_ids' in samples_data:
+            event_ids_resolved = _np.asarray(samples_data['event_ids'])
+
+    if event_id is not None and event_ids_resolved is not None:
+        eid_arr = event_ids_resolved
         matches = _np.nonzero(eid_arr == event_id)[0]
         if matches.size > 0:
             event_index = int(matches[0])
@@ -463,9 +529,17 @@ def plot_event_marginal_hist2d(samples_data,
     factor = 1000.0 if units.lower().startswith('meter') else 1.0
     series = []
     for c in coords:
-        arr = samples_data[c][event_index, burn_in:]
-        arr = arr * factor
-        series.append(_np.asarray(arr))
+        if is_summary:
+            arr = getattr(samples_data, c)[event_index, :]
+        else:
+            arr = samples_data[c][event_index, burn_in:]
+        arr = _np.asarray(arr) * factor
+        # Flatten any 2D/ND arrays to 1D vector of samples
+        if arr.ndim > 1:
+            arr = arr.reshape(-1)
+        if center_data and arr.size > 0:
+            arr = arr - _np.mean(arr)
+        series.append(arr)
     Xv, Yv, Zv = series  # using names to mirror example
 
     # Build bins

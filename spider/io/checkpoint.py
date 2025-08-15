@@ -3,110 +3,88 @@ import os
 import torch
 
 
-def save_checkpoint(params, optimizer, epoch, N, ΔX_src, samples, stats_tensor):
+def save_checkpoint(params, optimizer, epoch, N, ΔX_src, samples, stats_tensor, phase: str, global_step_count: int = 0):
+    """Save a checkpoint including phase and step metadata.
+
+    optimizer: can be Adam (MAP) or SGLD-like (phases 2–4).
+    phase: one of {"map", "phase2", "phase3", "phase4"}.
+    """
     checkpoint_dir = Path(params["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}.pth"
 
     checkpoint_data = {
-        "epoch": epoch,
-        "N": N,
-        "ΔX_src": ΔX_src.cpu().detach(),  # Keep as tensor instead of numpy
+        "phase": str(phase),
+        "epoch": int(epoch),
+        "N": int(N),
+        "ΔX_src": ΔX_src.cpu().detach(),
         "samples": samples,
-        "stats_tensor": stats_tensor.cpu().detach(),  # Keep as tensor instead of numpy
+        "stats_tensor": stats_tensor.cpu().detach(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "optimizer_type": optimizer.__class__.__name__,
+        "global_step_count": int(global_step_count or 0),
     }
     torch.save(checkpoint_data, checkpoint_path)
     print(f"Saved checkpoint to {checkpoint_path}")
 
 
-def load_checkpoint(params, optimizer, device):
+def load_checkpoint(params, device):
+    """Load the most recent checkpoint by modification time.
+
+    Returns a dict with keys:
+      'phase', 'epoch', 'N', 'ΔX_src', 'samples', 'stats_tensor',
+      'optimizer_state_dict', 'optimizer_type', 'global_step_count'.
+
+    Returns None if no checkpoint available.
+    """
     checkpoint_dir = Path(params["checkpoint_dir"])
     if not checkpoint_dir.exists():
         print(f"Checkpoint directory not found: {params['checkpoint_dir']}")
-        return 0, 0, None, None, None
+        return None
 
-    # Get all checkpoint files and sort them numerically by epoch number
     checkpoint_files = list(checkpoint_dir.glob("checkpoint_epoch_*.pth"))
     if not checkpoint_files:
         print(f"No checkpoint files found in {params['checkpoint_dir']}")
-        return 0, 0, None, None, None
+        return None
 
-    # Extract epoch numbers and sort numerically
-    checkpoint_epochs = []
-    for checkpoint_file in checkpoint_files:
-        try:
-            # Extract epoch number from filename like "checkpoint_epoch_499.pth"
-            filename = checkpoint_file.name
-            epoch_str = filename.replace("checkpoint_epoch_", "").replace(".pth", "")
-            epoch_num = int(epoch_str)
-            checkpoint_epochs.append((epoch_num, checkpoint_file))
-        except (ValueError, AttributeError):
-            continue
+    latest_checkpoint_path = max(checkpoint_files, key=lambda p: p.stat().st_mtime)
 
-    if not checkpoint_epochs:
-        print(f"No valid checkpoint files found in {params['checkpoint_dir']}")
-        return 0, 0, None, None, None
-
-    # Sort by epoch number and get the latest
-    checkpoint_epochs.sort(key=lambda x: x[0])  # Sort by epoch number
-    latest_epoch, latest_checkpoint_path = checkpoint_epochs[-1]
-
-    print(f"Found {len(checkpoint_epochs)} checkpoint files with epochs: {[epoch for epoch, _ in checkpoint_epochs]}")
-    print(f"Loading latest checkpoint from epoch {latest_epoch}: {latest_checkpoint_path}")
+    print(f"Loading latest checkpoint: {latest_checkpoint_path}")
     try:
-        # Try loading with weights_only=True first (PyTorch 2.6+ default)
-        checkpoint_data = torch.load(latest_checkpoint_path, map_location=torch.device(device), weights_only=True)
+        data = torch.load(latest_checkpoint_path, map_location=torch.device(device), weights_only=True)
     except Exception as e:
         if "weights_only" in str(e) or "WeightsUnpickler" in str(e):
-            # Fall back to weights_only=False for backward compatibility
             print("Falling back to weights_only=False for checkpoint loading")
-            checkpoint_data = torch.load(latest_checkpoint_path, map_location=torch.device(device), weights_only=False)
+            data = torch.load(latest_checkpoint_path, map_location=torch.device(device), weights_only=False)
         else:
             raise e
 
-    epoch = checkpoint_data["epoch"]
-    N = checkpoint_data["N"]
-
-    # Handle both tensor and numpy formats for backward compatibility
-    ΔX_src_data = checkpoint_data["ΔX_src"]
-    if isinstance(ΔX_src_data, torch.Tensor):
-        ΔX_src = ΔX_src_data.to(device=device, dtype=torch.float32)
+    # Normalize tensors to proper device/dtype
+    dX_data = data.get("ΔX_src")
+    if isinstance(dX_data, torch.Tensor):
+        ΔX_src = dX_data.to(device=device, dtype=torch.float32)
     else:
-        ΔX_src = torch.tensor(ΔX_src_data, dtype=torch.float32, device=device)
-
-    # Ensure the tensor requires gradients for autograd
+        ΔX_src = torch.tensor(dX_data, dtype=torch.float32, device=device)
     ΔX_src.requires_grad_(True)
 
-    samples = checkpoint_data["samples"]
-
-    # Handle both tensor and numpy formats for backward compatibility
-    stats_tensor_data = checkpoint_data["stats_tensor"]
-    if isinstance(stats_tensor_data, torch.Tensor):
-        stats_tensor = stats_tensor_data.to(device=device, dtype=torch.float32)
+    st_data = data.get("stats_tensor")
+    if isinstance(st_data, torch.Tensor):
+        stats_tensor = st_data.to(device=device, dtype=torch.float32)
     else:
-        stats_tensor = torch.tensor(stats_tensor_data, dtype=torch.float32, device=device)
+        stats_tensor = torch.tensor(st_data, dtype=torch.float32, device=device)
 
-    # Load the optimizer state
-    optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
-
-    # Fix: Improved parameter reference management to avoid memory issues
-    old_param = optimizer.param_groups[0]['params'][0]
-
-    # Update the optimizer's parameter reference to point to the loaded tensor
-    optimizer.param_groups[0]['params'][0] = ΔX_src
-
-    # Transfer the state from the old parameter to the new one more safely
-    if old_param in optimizer.state:
-        # Create a copy of the state to avoid reference issues
-        old_state = optimizer.state[old_param]
-        optimizer.state[ΔX_src] = old_state
-        # Clear the old state entry
-        del optimizer.state[old_param]
-        # Clear the old parameter reference
-        del old_param
-
-    return epoch, N, ΔX_src, samples, stats_tensor
+    out = {
+        "phase": str(data.get("phase", "phase4")),
+        "epoch": int(data.get("epoch", 0)),
+        "N": int(data.get("N", 0)),
+        "ΔX_src": ΔX_src,
+        "samples": data.get("samples", []),
+        "stats_tensor": stats_tensor,
+        "optimizer_state_dict": data.get("optimizer_state_dict", {}),
+        "optimizer_type": data.get("optimizer_type", ""),
+        "global_step_count": int(data.get("global_step_count", 0)),
+    }
+    return out
 
 
 def clear_checkpoint_files(params):
