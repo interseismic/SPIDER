@@ -72,9 +72,9 @@ evt_002,-117.6,34.3,12.1,2023-01-01T12:05:00
 
 **Differential Times** (`dtimes.csv`):
 ```csv
-event1_id,event2_id,station,phase,dt_obs,dt_err
-evt_001,evt_002,STA1,P,0.5,0.1
-evt_001,evt_002,STA1,S,1.2,0.15
+event1_id,event2_id,network,station,phase,dt_obs,dt_err
+evt_001,evt_002,NET1,STA1,P,0.5,0.1
+evt_001,evt_002,NET1,STA1,S,1.2,0.15
 ```
 
 ### 2. Create Configuration File
