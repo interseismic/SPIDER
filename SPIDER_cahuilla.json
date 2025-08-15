@@ -1,0 +1,56 @@
+{
+    "dtime_file": "/home/zross/git/SPIDER/cahuilla/dtimes_qtm_corr_1000knn.csv",
+    "station_file": "/home/zross/git/SPIDER/cahuilla/cahuilla_stations.csv",
+    "catalog_infile": "/home/zross/git/SPIDER/cahuilla/events_qtm_corr_1000knn.csv",
+    "catalog_outfile": "/home/zross/git/SPIDER/cahuilla/SPIDER_out.csv",
+    "samples_outfile": "/home/zross/git/SPIDER/cahuilla/SPIDER_samples_final.h5",
+    "model_file": "/home/zross/git/SPIDER/cahuilla/model.pt",
+    
+    "lon_min": -118.5,
+    "lat_min": 32.5,
+    "z_min": -5.0,
+    "z_max": 80.0,
+    "scale": 400.0,
+    "event_lat_bounds": [33.4, 33.6],
+    "event_lon_bounds": [-116.9, -116.66],
+    
+    "phase1_epochs": 3000,
+    "phase2_epochs": 10,
+    "phase3_epochs": 1000,
+    "phase4_epochs": 15000,
+    
+    "lr_warmup": 2e-3,
+    "lr_sgld": 3.44668973e-11,
+    "batch_size_warmup": 1000000,
+    "batch_size_sgld": 1000000,
+    "save_every_n": 10,
+    
+    "phase_unc": [0.01, 0.01],
+    "prior_event_std": [0.25, 0.25, 0.25, 0.10],
+    "prior_centroid_std": [0.01, 0.01, 0.01, 0.01],
+    
+    "devices": [3, 4, 5, 6],
+    
+    "checkpoint_dir": "cahuilla/checkpoints/",
+    "checkpoint_interval": 100,
+    "min_samples_to_save": 10,
+    
+    "use_wandb": true,
+    "wandb_project_name": "spider_paper",
+    "wandb_run_name": "cahuilla_final_001",
+    
+    "rel_change_window": 10,
+    "rel_change_window2": 100,
+    "samples_store_lonlat": true,
+    "io_event_chunk": 2048,
+    "reset_batch_numbers": false,
+    "clear_samples_on_reset": false,
+    
+    "cc_min": 0.6,
+    "min_dtimes": 6,
+    "min_dtimes_per_pair": 0,
+    "max_abs_input_dt": 0.5,
+    "remove_duplicates": false,
+    "flip_dt_sign": false,
+    "dtime_thin_frac": 1.0
+}

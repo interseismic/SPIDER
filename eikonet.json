@@ -1,0 +1,16 @@
+{
+"velmod_file": "/home/zross/git/SPIDER/cahuilla/velmod.csv",
+"lon_min": -117.5,
+"lat_min": 33.0,
+"z_min": -5.0,
+"z_max": 80.0,
+"scale": 400.0,
+"model_file": "/home/zross/git/SPIDER/cahuilla/model.pt",
+"train_batch_size": 512,
+"val_batch_size": 10000,
+"n_train": 1000000,
+"n_test": 2000000,
+"n_epochs": 1000,
+"lr": 1e-3
+}
+

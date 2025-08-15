@@ -10,7 +10,9 @@ import sys
 import json
 import torch
 
-from spider.core import locate_all, prepare_input_dfs
+from spider.core import prepare_input_dfs
+from spider.core.locate import locate_all
+from spider.utils import init_wandb_if_enabled
 
 
 class EikoNet(torch.nn.Module):
@@ -133,6 +135,18 @@ if __name__== "__main__":
     stations, dtimes, origins = prepare_input_dfs(params)
 
     print("Dataset has %d events with %d dtimes" % (origins.shape[0], dtimes.shape[0]))
+    
+    # Initialize wandb if enabled (after we have the actual dataset info)
+    if params.get("use_wandb", False):
+        # Add actual dataset info to params before wandb initialization
+        params["total_events"] = origins.shape[0]
+        params["total_dtimes"] = dtimes.shape[0]
+    
+    wandb_logger = init_wandb_if_enabled(params)
 
     print("Running SPIDER")
-    locate_all(params, origins, dtimes, model, device)
+    locate_all(params, origins, dtimes, model, device, wandb_logger)
+    
+    # Finish wandb run
+    if wandb_logger:
+        wandb_logger.finish()
