@@ -1,0 +1,275 @@
+"""Sampler backend factory for SPIDER inference phases (2–4)."""
+
+import torch
+from typing import Tuple, List
+
+from .sgld import pSGLD  # default backend
+from .sghmc import SGHMC
+from .adaptive_sghmc import AdaptiveSGHMC
+
+
+def _attach_set_lr(opt: torch.optim.Optimizer) -> None:
+    if not hasattr(opt, "set_lr"):
+        def set_lr(self, new_lr: float):
+            for g in self.param_groups:
+                g["lr"] = float(new_lr)
+        opt.set_lr = set_lr.__get__(opt, opt.__class__)  # type: ignore[attr-defined]
+    if not hasattr(opt, "preconditioner_stats"):
+        def preconditioner_stats(self):
+            return {"min": float("nan"), "p25": float("nan"), "median": float("nan"), "p75": float("nan"), "max": float("nan")}
+        opt.preconditioner_stats = preconditioner_stats.__get__(opt, opt.__class__)  # type: ignore[attr-defined]
+    if not hasattr(opt, "grad_vs_noise_geomean"):
+        def grad_vs_noise_geomean(self) -> float:
+            if hasattr(self, "grad_vs_noise_stats"):
+                return float(self.grad_vs_noise_stats().get("gm", float("nan")))
+            return float("nan")
+        opt.grad_vs_noise_geomean = grad_vs_noise_geomean.__get__(opt, opt.__class__)  # type: ignore[attr-defined]
+    if not hasattr(opt, "grad_vs_noise_stats"):
+        def grad_vs_noise_stats(self) -> dict:
+            return {"gm": float("nan"), "median": float("nan"), "p10": float("nan"), "p90": float("nan"), "min": float("nan"), "max": float("nan")}
+        opt.grad_vs_noise_stats = grad_vs_noise_stats.__get__(opt, opt.__class__)  # type: ignore[attr-defined]
+
+
+def _ensure_common_group_keys(opt: torch.optim.Optimizer, *, params: dict, n_obs: int) -> None:
+    for g in opt.param_groups:
+        g.setdefault("beta", float(params["sampler_beta"]))
+        g.setdefault("eps", float(params["sampler_eps"]))
+        g.setdefault("preconditioning", False)
+        g.setdefault("preconditioner", "none")
+        g.setdefault("add_noise", False)
+        g.setdefault("noise_scale", 0.0)
+        # Force update temperature as backend defaults might set it to 1.0
+        g["temperature"] = float(params["sampler_temperature"])
+        g.setdefault("n_obs", int(n_obs))
+        g.setdefault("freeze_preconditioner", bool(params["freeze_preconditioner_sampling"]))
+        g.setdefault("is_burnin", True)
+
+
+def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimizer]:
+    """
+    Factory for sampler backends used in Phases 2–4.
+    Returns (backend_name, optimizer_instance).
+
+    Supported backends:
+      - 'psgld' (default)
+      - 'sghmc'
+      - 'adaptive_sghmc'
+      - 'sgld_simple' (plain SGD, mostly for debugging)
+
+    Legacy aliases are no longer supported; use the canonical backend names above.
+    """
+    backend = str(params["sampler_backend"]).strip().lower()
+    # Parameter list: ΔX_src plus optional log noise scales
+    base_params_list: List[torch.nn.Parameter] = [state.dX_src]
+    if state.learn_noise_scale and state.log_scale_theta is not None:
+        base_params_list.append(state.log_scale_theta)
+
+    # Optional: uncollapsed shared-event latent b (sampled as a *separate* param group).
+    # This field is very high-dimensional and often needs smaller step/noise to remain stable.
+    b_lat = getattr(state, "shared_event_latent_b", None)
+    use_b_lat = bool((b_lat is not None) and bool(params.get("_shared_event_latent_enabled", False)))
+    overrides_active = bool(params.get("_shared_event_latent_sampler_overrides_active", False))
+    lr = float(params["lr_sampler"])
+    lr_mode = str(params["sampler_lr_mode"]).strip().lower()
+    n_obs = int(getattr(state, "N", params.get("n_obs", 1)))
+    if n_obs <= 0:
+        n_obs = 1
+
+    if backend == "psgld":
+        lr_eff = lr
+        if lr_mode == "per_obs":
+            # pSGLD multiplies minibatch-mean grads by n_obs internally; scale lr down by n_obs to keep
+            # the user-facing lr more stable across dataset sizes, while still targeting the true posterior.
+            lr_eff = lr / float(n_obs)
+        # Use per-group settings when latent b is active.
+        base_group = {"params": base_params_list, "group_name": "core"}
+        param_groups = [base_group]
+        if use_b_lat:
+            g_lat = {"params": [b_lat], "group_name": "shared_event_latent"}
+            # Only apply per-group knobs if the user explicitly provided overrides.
+            if overrides_active:
+                eps_b = float(
+                    params.get(
+                        "_shared_event_latent_eps",
+                        max(float(params["sampler_eps"]), 1e-3),
+                    )
+                )
+                include_gamma_b = bool(params.get("_shared_event_latent_include_gamma", False))
+                freeze_b = bool(params.get("_shared_event_latent_freeze_preconditioner_sampling", False))
+                g_lat.update({"eps": eps_b, "include_gamma": include_gamma_b, "freeze_preconditioner": freeze_b})
+            param_groups.append(g_lat)
+        opt = pSGLD(
+            params=param_groups,
+            n_obs=state.N,
+            lr=lr_eff,
+            beta=float(params["sampler_beta"]),
+            eps=float(params["sampler_eps"]),
+            preconditioning=bool(params["sampler_preconditioning"]),
+            preconditioner=str(params["sampler_preconditioner"]).lower(),
+            include_gamma=bool(params.get("sampler_preconditioning_include_gamma", True)),
+            add_noise=False,
+        )
+        _ensure_common_group_keys(opt, params=params, n_obs=state.N)
+
+        # Ensure group keys reflect config (avoid accidental "none")
+        precond = str(params["sampler_preconditioner"]).lower()
+        # Backwards-compatible alias
+        if precond == "matrix_ema":
+            precond = "blockdiag_fisher"
+        include_gamma_proxy_bdf = bool(params.get("sampler_preconditioning_include_gamma_proxy", False))
+        for g in opt.param_groups:
+            g["preconditioner"] = precond
+            g["preconditioning"] = bool(params["sampler_preconditioning"])
+            # Optional: attach static disjoint blocks for blockdiag_fisher (computed in LocateState).
+            if precond == "blockdiag_fisher":
+                # Optional: cheap diagonal Γ proxy for blockdiag_fisher.
+                g["blockdiag_fisher_include_gamma_proxy"] = include_gamma_proxy_bdf
+                bm = getattr(state, "precond_block_members", None)
+                bs = getattr(state, "precond_block_sizes", None)
+                if bm is not None and bs is not None:
+                    g["blockdiag_fisher_block_members"] = bm
+                    g["blockdiag_fisher_block_sizes"] = bs
+                    g["blockdiag_fisher_max_cluster_size"] = int(params.get("blockdiag_fisher_max_cluster_size", bm.shape[1]))
+
+        return "psgld", opt
+
+    if backend == "sghmc":
+        lr_eff = lr
+        if lr_mode == "per_obs":
+            # SGHMC drift uses n_obs * (minibatch-mean grad) internally; scale lr down by n_obs so
+            # lr_sampler can be interpreted as a per-observation knob (more stable across dataset sizes).
+            lr_eff = lr / float(n_obs)
+        base_group = {"params": base_params_list, "group_name": "core"}
+        param_groups = [base_group]
+        if use_b_lat:
+            g_lat = {"params": [b_lat], "group_name": "shared_event_latent"}
+            if overrides_active:
+                eps_b = float(
+                    params.get(
+                        "_shared_event_latent_eps",
+                        max(float(params["sampler_eps"]), 1e-3),
+                    )
+                )
+                freeze_b = bool(params.get("_shared_event_latent_freeze_preconditioner_sampling", False))
+                g_lat.update({"eps": eps_b, "freeze_preconditioner": freeze_b})
+            param_groups.append(g_lat)
+        opt = SGHMC(
+            params=param_groups,
+            n_obs=state.N,
+            lr=lr_eff,
+            beta=float(params["sampler_beta"]),  # reuse beta for RMSprop stats
+            eps=float(params["sampler_eps"]),
+            alpha=float(params.get("sghmc_alpha", 0.01)),
+            preconditioning=bool(params["sampler_preconditioning"]),
+            add_noise=False,  # noise off in phase 2; enabled later
+        )
+        _ensure_common_group_keys(opt, params=params, n_obs=state.N)
+
+        # Force preconditioner mode from config (avoid default "none")
+        precond = str(params["sampler_preconditioner"]).lower()
+        for g in opt.param_groups:
+            g["preconditioner"] = precond
+            g["preconditioning"] = bool(params["sampler_preconditioning"])
+
+        # Ensure alpha exists in groups
+        for g in opt.param_groups:
+            g.setdefault("alpha", float(params.get("sghmc_alpha", 0.01)))
+        return "sghmc", opt
+
+    if backend == "adaptive_sghmc":
+        # BOHAMIANN-style adaptive (scale-adapted) SGHMC.
+        # Uses burn-in to adapt diagonal preconditioning statistics.
+        mdecay = float(params.get("adaptive_sghmc_mdecay", params.get("sghmc_alpha", 0.05)))
+        # Use the standard sampler epsilon (sampler.eps in nested config), materialized as `sampler_eps`.
+        # This keeps the epsilon knob consistent across samplers and avoids a separate adaptive_sghmc-specific epsilon.
+        eps = float(params["sampler_eps"])
+        lr_eff = lr
+        if lr_mode == "per_obs":
+            # AdaptiveSGHMC (like pSGLD) uses minibatch-mean gradients scaled by n_obs internally (via scale_grad).
+            # Interpret lr_sampler as a per-observation knob by scaling lr down by n_obs for stability/knob portability.
+            lr_eff = lr / float(n_obs)
+        base_group = {"params": base_params_list, "group_name": "core"}
+        param_groups = [base_group]
+        if use_b_lat:
+            # AdaptiveSGHMC uses `epsilon` (and also honors `eps`) for numerical stability.
+            # Do not apply lr/temperature multipliers here; locate._apply_sampler_group_overrides() will.
+            g_lat = {"params": [b_lat], "group_name": "shared_event_latent"}
+            if overrides_active:
+                eps_b = float(
+                    params.get(
+                        "_shared_event_latent_eps",
+                        max(float(params["sampler_eps"]), 1e-3),
+                    )
+                )
+                freeze_b = bool(params.get("_shared_event_latent_freeze_preconditioner_sampling", False))
+                g_lat.update({"epsilon": eps_b, "eps": eps_b, "freeze_preconditioner": freeze_b})
+            param_groups.append(g_lat)
+        opt = AdaptiveSGHMC(
+            params=param_groups,
+            lr=lr_eff,
+            # In SPIDER, default burn-in length is controlled by Phase 3 (epochs),
+            # unless explicitly overridden via adaptive_sghmc_burnin_steps.
+            num_burn_in_steps=int(params.get("adaptive_sghmc_burnin_steps", params.get("phase3_epochs", 0))),
+            epsilon=eps,
+            # BOHAMIANN uses mdecay as the (constant) friction term.
+            mdecay=mdecay,
+            scale_grad=float(state.N),
+            # BOHAMIANN always injects noise; SPIDER will still manage noise_scale/temperature,
+            # but we force add_noise on in the epoch runner for this backend.
+            add_noise=True,
+        )
+        _ensure_common_group_keys(opt, params=params, n_obs=state.N)
+        # Identify the preconditioner for logging
+        for g in opt.param_groups:
+            g["preconditioner"] = "adaptive_sghmc"
+            g["preconditioning"] = True
+            g["n_obs"] = int(state.N)
+            g["scale_grad"] = float(state.N)
+        return "adaptive_sghmc", opt
+
+    if backend in {"sgnht", "sgnht_rmsprop", "psgnht"}:
+        raise ValueError(
+            "Unsupported sampler backend 'sgnht'. SGNHT support has been removed from this codebase. "
+            "Use 'sghmc' or 'psgld' instead."
+        )
+
+    if backend == "sgld_simple":
+        # Simple SGD-based backend with no preconditioning; acts as placeholder
+        base_group = {"params": base_params_list, "group_name": "core"}
+        param_groups = [base_group]
+        if use_b_lat:
+            g_lat = {"params": [b_lat], "group_name": "shared_event_latent"}
+            if overrides_active:
+                eps_b = float(
+                    params.get(
+                        "_shared_event_latent_eps",
+                        max(float(params["sampler_eps"]), 1e-3),
+                    )
+                )
+                freeze_b = bool(params.get("_shared_event_latent_freeze_preconditioner_sampling", False))
+                g_lat.update({"eps": eps_b, "freeze_preconditioner": freeze_b})
+            param_groups.append(g_lat)
+        opt = torch.optim.SGD(param_groups, lr=lr)
+        _attach_set_lr(opt)
+        _ensure_common_group_keys(opt, params=params, n_obs=state.N)
+        return "sgld_simple", opt
+
+    raise ValueError(
+        f"Unknown sampler backend '{backend}'. Supported: psgld, sghmc, adaptive_sghmc, sgld_simple."
+    )
+
+
+def transplant_from_adam_if_supported(adam_opt: torch.optim.Optimizer, sampler: torch.optim.Optimizer) -> None:
+    """
+    If the sampler backend supports transplanting Adam's exp_avg_sq (RMSprop stats),
+    perform the transplant. Currently supported for pSGLD (and used for SGHMC as well).
+    """
+    try:
+        # Only pSGLD exposes a direct transplant function; SGHMC uses the same state key.
+        from .sgld import transplant_v_from_adam as _tx
+        _tx(adam_opt, sampler)
+    except Exception:
+        # No-op if unsupported
+        pass
+
+
