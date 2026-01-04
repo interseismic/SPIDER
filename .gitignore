@@ -1,0 +1,5 @@
+# Code-only repo: ignore everything by default, except `spider/`
+*
+!.gitignore
+!spider/
+!spider/**
