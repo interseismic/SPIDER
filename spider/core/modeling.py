@@ -787,6 +787,20 @@ def compute_likelihood_loss(
                     print("Info: slowness_re.station_basis enabled; solving per (phase,component) in station-basis space (not per-station groups).")
                 params["_slowness_re_warned_station_basis_grouping"] = True
 
+            # Determine whether to split by connected component blocks (mirrors the station_phase grouping logic).
+            n_comp = params.get("_runtime_n_components", 1)
+            try:
+                n_comp_i = int(n_comp) if n_comp is not None else 1
+            except Exception:
+                n_comp_i = 1
+            prefer_componentwise = (
+                n_comp_i > 1
+                and isinstance(cid_ev, torch.Tensor)
+                and isinstance(comp_to_block, torch.Tensor)
+                and isinstance(K_blocks, list) and len(K_blocks) > 0
+                and isinstance(offs, torch.Tensor)
+            )
+
             # Component id per row (for blockwise Kuu)
             if isinstance(cid_ev, torch.Tensor):
                 comp_row_all = cid_ev.index_select(0, idx[:, 0].to(dtype=torch.int64))
