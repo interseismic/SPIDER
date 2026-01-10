@@ -350,18 +350,6 @@ def _run_epoch(
         t_perm0 = time.time()
         state.begin_epoch_rr(seed=int(seed0 + epoch_index), shuffle=shuffle)
         permute_time_s = float(time.time() - t_perm0)
-        if epoch_index == 0:
-            try:
-                if (not ddp_enabled) or ddp_is_main:
-                    print(
-                        f"[spider][INFO][BATCH] standard.shuffle={int(shuffle)} "
-                        f"permute_s={permute_time_s:.3f} "
-                        f"batch_size={int(state.params.get('batch_size_sgld', 0) or 0)} "
-                        f"N={int(getattr(state, 'N', 0) or 0)}",
-                        flush=True,
-                    )
-            except Exception:
-                pass
         # Expose whether this epoch is shuffled to lower-level code (e.g. caching in likelihoods).
         state.params["_runtime_batch_shuffle"] = bool(shuffle)
 
@@ -546,22 +534,6 @@ def _run_epoch(
     except Exception:
         pass
 
-    # Optional: batch-level progress heartbeat (especially helpful in torchrun/DDP where only rank0 prints).
-    # This prevents "looks hung" confusion on very large datasets.
-    batch_progress_every = 0
-    try:
-        if bool(state.params.get("verbose", False)):
-            diag = _get_diagnostics_cfg(state.params)
-            if isinstance(diag, dict):
-                # Default: in DDP, print every 10 batches when verbose=true.
-                if ddp_enabled:
-                    batch_progress_every = int(diag.get("ddp_batch_progress_every", 10))
-                else:
-                    batch_progress_every = int(diag.get("batch_progress_every", 0))
-    except Exception:
-        batch_progress_every = 0
-    if batch_progress_every < 0:
-        batch_progress_every = 0
     # Best-effort: total batches (works for standard batching / ranges)
     total_batches = None
     try:
@@ -779,21 +751,6 @@ def _run_epoch(
             except Exception:
                 # Leave batch unsharded if something goes wrong; better than crashing mid-run.
                 pass
-
-        # Optional progress heartbeat at the start of the batch (rank0 only under torchrun).
-        try:
-            if batch_progress_every > 0 and ((bi % batch_progress_every) == 0) and ((not ddp_enabled) or ddp_is_main):
-                done = int(bi)
-                tot = int(total_batches) if total_batches is not None else -1
-                elapsed = float(time.time() - epoch_start_time)
-                if tot > 0:
-                    rate = float(done) / max(1e-9, elapsed)
-                    eta = float(tot - done) / max(1e-9, rate)
-                    print(f"[spider][INFO][BATCH] epoch={epoch_index} batch={done}/{tot} elapsed_s={elapsed:.1f} eta_s={eta:.1f}", flush=True)
-                else:
-                    print(f"[spider][INFO][BATCH] epoch={epoch_index} batch={done} elapsed_s={elapsed:.1f}", flush=True)
-        except Exception:
-            pass
 
         # Noise scales for loss
         σp, σs = _current_noise_scales(state)
