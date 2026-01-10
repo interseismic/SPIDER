@@ -37,6 +37,13 @@ Start from the template:
 
 - `spider/examples/params_template.json`
 
+### Library utilities (optional)
+
+The CLI does not depend on these modules, but they are available for scripting:
+
+- `spider.analysis` (post-processing)
+- `spider.plotting` (plot helpers)
+
 ### Maintenance / “what’s stale?”
 
 See:

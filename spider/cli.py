@@ -32,6 +32,41 @@ from spider.core.config_schema import (
 from spider.core.priors_config import validate_and_materialize_priors
 
 
+def _load_params_json(path: str) -> dict:
+	"""Load a JSON params file from disk."""
+	with open(path, "r") as f:
+		return json.load(f)
+
+
+def _validate_params_all(params: dict, *, require_priors: bool = True) -> dict:
+	"""
+	Validate/materialize the strict nested-config schema used by the CLI.
+
+	This is intentionally centralized because many subcommands used to duplicate
+	the same block1..5 + priors validation sequence.
+	"""
+	params = validate_and_materialize_block1(params)
+	params = validate_and_materialize_block2(params)
+	params = validate_and_materialize_block3(params)
+	params = validate_and_materialize_block4(params)
+	params = validate_and_materialize_block5(params)
+	if require_priors:
+		params = validate_and_materialize_priors(params)
+	return params
+
+
+def _validate_params_synth(params: dict) -> dict:
+	"""
+	Validation/materialization for `spider synth`.
+
+	Synth intentionally does not require priors and does not require all inference blocks.
+	"""
+	params = validate_and_materialize_block1(params)
+	params = validate_and_materialize_block3(params)
+	params = validate_and_materialize_block5(params)
+	return params
+
+
 def _device_from_id(device_id: int) -> torch.device:
 	"""
 	Map an internal device id to a torch.device.
@@ -95,33 +130,18 @@ def _load_model(params: dict, device: int | str) -> torch.nn.Module:
 
 def _cmd_locate_full(args: argparse.Namespace) -> int:
 	"""Legacy: run the full pipeline (Phase 1 + Phase 2–4)."""
-	# Load params JSON
-	with open(args.params, "r") as f:
-		params = json.load(f)
-
-	# Strict block1 config (nested-only; no defaults; no legacy keys)
-	params = validate_and_materialize_block1(params)
-	# Strict block2 config (nested-only; no defaults; no legacy keys)
-	params = validate_and_materialize_block2(params)
-	# Strict block3 config (nested-only; no defaults; no legacy keys)
-	params = validate_and_materialize_block3(params)
-	# Strict block4 config (nested-only; no defaults; no legacy keys)
-	params = validate_and_materialize_block4(params)
-	# Strict block5 config (nested-only; no defaults; no legacy keys)
-	params = validate_and_materialize_block5(params)
-	# Strict priors config (nested-only; no defaults; no legacy keys)
-	params = validate_and_materialize_priors(params)
+	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
 
 	# Device selection:
-	# - `spider locate` is single-device.
-	# - Multi-GPU should use `spider locate-multi` (one process per GPU).
+	# - Single-device commands use exactly one entry from `inference.compute.devices` (or --device override).
+	# - Multi-GPU independent chains should use `spider sample-multi` / `spider locate-multi` (one process per GPU).
 	dev_list = list(params.get("devices", []))
 	if not dev_list:
-		raise ValueError("No devices configured. Set compute.devices in the config, or pass --device.")
+		raise ValueError("No devices configured. Set inference.compute.devices in the config, or pass --device.")
 	if args.device is None:
 		if len(dev_list) != 1:
 			raise ValueError(
-				f"Config compute.devices has {len(dev_list)} entries but `spider locate` is single-device. "
+				f"Config inference.compute.devices has {len(dev_list)} entries but this command is single-device. "
 				"Use `spider locate-multi` for multi-GPU, or pass --device to pick one GPU."
 			)
 		device_id = _parse_device_entry(dev_list[0])
@@ -166,14 +186,7 @@ def _cmd_locate_full(args: argparse.Namespace) -> int:
 
 def _cmd_locate_map(args: argparse.Namespace) -> int:
 	"""Run Phase 1 only, then dump a Phase-2 bundle."""
-	with open(args.params, "r") as f:
-		params = json.load(f)
-	params = validate_and_materialize_block1(params)
-	params = validate_and_materialize_block2(params)
-	params = validate_and_materialize_block3(params)
-	params = validate_and_materialize_block4(params)
-	params = validate_and_materialize_block5(params)
-	params = validate_and_materialize_priors(params)
+	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
 
 	# --- Optional distributed (torchrun) mode ---
 	# This is a *single-chain* multi-GPU mode (data-parallel minibatches) for Phase 1 (MAP).
@@ -184,7 +197,7 @@ def _cmd_locate_map(args: argparse.Namespace) -> int:
 
 	dev_list = list(params.get("devices", []))
 	if not dev_list:
-		raise ValueError("No devices configured. Set compute.devices in the config, or pass --device.")
+		raise ValueError("No devices configured. Set inference.compute.devices in the config, or pass --device.")
 
 	if ddp_enabled:
 		if args.device is not None:
@@ -200,7 +213,7 @@ def _cmd_locate_map(args: argparse.Namespace) -> int:
 		if args.device is None:
 			if len(dev_list) != 1:
 				raise ValueError(
-					f"Config compute.devices has {len(dev_list)} entries but `spider locate-map` is single-device. "
+					f"Config inference.compute.devices has {len(dev_list)} entries but `spider locate-map` is single-device. "
 					"Use `torchrun -m spider locate-map ...` for single-chain multi-GPU MAP, "
 					"use `spider locate-map --device ...` to pick one device, or run one map per GPU manually."
 				)
@@ -277,14 +290,7 @@ def _cmd_locate_map(args: argparse.Namespace) -> int:
 
 def _cmd_sample(args: argparse.Namespace) -> int:
 	"""Run Phase 2–4 starting from a Phase-2 bundle (skips Phase 1)."""
-	with open(args.params, "r") as f:
-		params = json.load(f)
-	params = validate_and_materialize_block1(params)
-	params = validate_and_materialize_block2(params)
-	params = validate_and_materialize_block3(params)
-	params = validate_and_materialize_block4(params)
-	params = validate_and_materialize_block5(params)
-	params = validate_and_materialize_priors(params)
+	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
 
 	# --- Optional distributed (torchrun) mode ---
 	# This is a *single-chain* multi-GPU mode (data-parallel minibatches).
@@ -296,7 +302,7 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 
 	dev_list = list(params.get("devices", []))
 	if not dev_list:
-		raise ValueError("No devices configured. Set compute.devices in the config, or pass --device.")
+		raise ValueError("No devices configured. Set inference.compute.devices in the config, or pass --device.")
 
 	if ddp_enabled:
 		if args.device is not None:
@@ -313,7 +319,7 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 		if args.device is None:
 			if len(dev_list) != 1:
 				raise ValueError(
-					f"Config compute.devices has {len(dev_list)} entries but `spider sample` is single-device. "
+					f"Config inference.compute.devices has {len(dev_list)} entries but `spider sample` is single-device. "
 					"Use `spider sample-multi` for multi-GPU, or pass --device to pick one GPU."
 				)
 			device_id = _parse_device_entry(dev_list[0])
@@ -395,14 +401,7 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 
 def _cmd_analyze_resid(args: argparse.Namespace) -> int:
 	"""Run post-Phase1 residual diagnostics from an existing Phase-2 bundle (no MAP rerun)."""
-	with open(args.params, "r") as f:
-		params = json.load(f)
-	params = validate_and_materialize_block1(params)
-	params = validate_and_materialize_block2(params)
-	params = validate_and_materialize_block3(params)
-	params = validate_and_materialize_block4(params)
-	params = validate_and_materialize_block5(params)
-	params = validate_and_materialize_priors(params)
+	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
 
 	# Optional CLI overrides for shared_event_latent tau estimation inside analyze-resid.
 	# analyze_resid_from_bundle() already calls maybe_estimate_shared_event_latent_tau_after_phase1(state=...),
@@ -456,11 +455,11 @@ def _cmd_analyze_resid(args: argparse.Namespace) -> int:
 
 	dev_list = list(params.get("devices", []))
 	if not dev_list:
-		raise ValueError("No devices configured. Set compute.devices in the config, or pass --device.")
+		raise ValueError("No devices configured. Set inference.compute.devices in the config, or pass --device.")
 	if args.device is None:
 		if len(dev_list) != 1:
 			raise ValueError(
-				f"Config compute.devices has {len(dev_list)} entries but `spider analyze-resid` is single-device. "
+				f"Config inference.compute.devices has {len(dev_list)} entries but `spider analyze-resid` is single-device. "
 				"Pass --device to pick one GPU."
 			)
 		device_id = _parse_device_entry(dev_list[0])
@@ -626,109 +625,6 @@ def _cmd_locate_multi(args: argparse.Namespace) -> int:
 	return _cmd_sample_multi(args)
 
 
-def _cmd_locate_multi_legacy(args: argparse.Namespace) -> int:
-	"""
-	Launch multiple independent SPIDER locate chains (one process per GPU/device).
-	This is the recommended way to use 1-8 GPUs without rewriting the sampler for multi-device autograd.
-	"""
-	with open(args.params, "r") as f:
-		base_params = json.load(f)
-
-	# Devices: either provided explicitly, or use compute.devices from params.
-	devs = None
-	if getattr(args, "devices", None):
-		devs = [_parse_device_entry(x.strip()) for x in str(args.devices).split(",") if str(x).strip()]
-	else:
-		try:
-			devs = [_parse_device_entry(x) for x in base_params.get("inference", {}).get("compute", {}).get("devices", [])]
-		except Exception:
-			devs = []
-	if not devs:
-		raise ValueError("locate-multi requires devices (either --devices or inference.compute.devices in params).")
-
-	n_chains = int(args.chains) if getattr(args, "chains", None) is not None else int(len(devs))
-	n_chains = max(1, n_chains)
-	seed0 = int(getattr(args, "seed0", 0))
-
-	# Output base
-	out_dir = str(getattr(args, "out_dir", "") or os.path.dirname(os.path.abspath(args.params)) or ".")
-	os.makedirs(out_dir, exist_ok=True)
-
-	procs = []
-	tmp_paths = []
-	chain_sample_paths = []
-	merged_out_path = None
-	for ci in range(n_chains):
-		dev = int(devs[ci % len(devs)])
-		p = json.loads(json.dumps(base_params))  # cheap deep copy
-
-		# Override device for this chain
-		p.setdefault("inference", {})
-		p["inference"].setdefault("compute", {})
-		p["inference"]["compute"]["devices"] = [dev]
-
-		# Add/override runtime seed so batching RNG differs per chain
-		p.setdefault("inference", {})
-		p["inference"].setdefault("runtime", {})
-		p["inference"]["runtime"]["seed"] = int(seed0 + 1000003 * ci)
-
-		# Unique sample/checkpoint outputs
-		p.setdefault("io", {})
-		samp = str(p["io"].get("samples_outfile", os.path.join(out_dir, "SPIDER_samples.h5")))
-		root, ext = os.path.splitext(samp)
-		if not ext:
-			ext = ".h5"
-		p["io"]["samples_outfile"] = f"{root}_chain{ci}{ext}"
-		chain_sample_paths.append(p["io"]["samples_outfile"])
-
-		ck = str(p["io"].get("checkpoint_dir", os.path.join(out_dir, "checkpoints")))
-		p["io"]["checkpoint_dir"] = os.path.join(ck, f"chain{ci}")
-
-		# Unique wandb run name if enabled
-		if isinstance(p.get("wandb", None), dict):
-			rn = str(p["wandb"].get("run_name", "spider"))
-			p["wandb"]["run_name"] = f"{rn}_chain{ci}"
-
-		# Write temp params file
-		fd, tmp_path = tempfile.mkstemp(prefix=f"spider_chain{ci}_", suffix=".json", dir=out_dir)
-		os.close(fd)
-		with open(tmp_path, "w") as f:
-			json.dump(p, f, indent=4)
-		tmp_paths.append(tmp_path)
-
-		cmd = [sys.executable, "-m", "spider", "locate", tmp_path, "--device", str(dev)]
-		print(f"[locate-multi] chain={ci} device={dev} seed={p['inference']['runtime']['seed']} samples={p['io']['samples_outfile']}")
-		if getattr(args, "dry_run", False):
-			continue
-		procs.append(subprocess.Popen(cmd))
-
-	# Wait
-	if not getattr(args, "dry_run", False):
-		rc = 0
-		for pr in procs:
-			r = pr.wait()
-			rc = rc if rc != 0 else int(r)
-		if rc != 0:
-			return int(rc)
-
-		# Merge chain sample stores into the original io.samples_outfile so existing notebooks/scripts keep working.
-		do_merge = bool(getattr(args, "merge", True))
-		if do_merge:
-			try:
-				from spider.io.samples import merge_samples_hdf5
-				base_out = str(base_params.get("io", {}).get("samples_outfile", ""))
-				if not base_out:
-					base_out = os.path.join(out_dir, "SPIDER_samples.h5")
-				merged_out_path = merge_samples_hdf5(out_path=base_out, in_paths=chain_sample_paths, overwrite=True)
-				print(f"[locate-multi] merged chains -> {merged_out_path}")
-			except Exception as e:
-				print(f"[locate-multi] WARNING: merge failed: {e}")
-				# Don't fail the run if sampling succeeded.
-
-		return int(rc)
-	return 0
-
-
 def _project_events_to_xyz(origins: pl.DataFrame, lat0: float, lon0: float) -> np.ndarray:
 	projector = Proj(proj="laea", lat_0=lat0, lon_0=lon0, datum="WGS84", units="km")
 	XX, YY = projector(origins["longitude"].to_numpy(), origins["latitude"].to_numpy())
@@ -766,14 +662,7 @@ def _random_field_values_xy(
 
 def _cmd_synth(args: argparse.Namespace) -> int:
 	# Load params
-	with open(args.params, "r") as f:
-		params = json.load(f)
-	# Strict block1 config for synth (no priors required)
-	params = validate_and_materialize_block1(params)
-	# Block 3 needed for synth (uses batch_size_warmup for chunking)
-	params = validate_and_materialize_block3(params)
-	# Block 5 needed for synth (devices)
-	params = validate_and_materialize_block5(params)
+	params = _validate_params_synth(_load_params_json(args.params))
 	device_id = int(args.device) if args.device is not None else int(params["devices"][0])
 	if torch.cuda.is_available():
 		device = torch.device(f"cuda:{device_id}")
@@ -1213,7 +1102,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 		"--device",
 		type=int,
 		default=None,
-		help="CUDA device id to use (locate is single-device; required if compute.devices has >1)",
+		help="CUDA device id to use (single-device; required if inference.compute.devices has >1)",
 	)
 	p_locate.add_argument("--shift-guard", action="store_true", help="Abort if any event moves > factor × prior stds; prints offending observations")
 	p_locate.add_argument("--shift-guard-factor", type=float, default=None, help="Factor relative to prior_event_std; default 5.0")
@@ -1224,7 +1113,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	p_multi.add_argument("params", help="Path to parameter JSON file")
 	p_multi.add_argument("--bundle", type=str, default=None, help="Path to Phase-2 bundle (default: <checkpoint_dir>/phase2_bundle.pth)")
 	p_multi.add_argument("--chains", type=int, default=None, help="Number of chains to run (default: number of devices)")
-	p_multi.add_argument("--devices", type=str, default=None, help="Comma-separated CUDA device ids (default: compute.devices from params)")
+	p_multi.add_argument("--devices", type=str, default=None, help="Comma-separated CUDA device ids (default: inference.compute.devices from params)")
 	p_multi.add_argument("--seed0", type=int, default=0, help="Base seed for chain RNG offsets (default: 0)")
 	p_multi.add_argument("--out-dir", type=str, default=None, help="Directory to write chain param files (default: params directory)")
 	p_multi.add_argument("--dry-run", action="store_true", help="Print what would run, but do not start processes")
@@ -1242,7 +1131,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	# synth subcommand
 	p_synth = subparsers.add_parser("synth", help="Generate a synthetic differential time dataset matching the current configuration")
 	p_synth.add_argument("params", help="Path to parameter JSON file")
-	p_synth.add_argument("--device", type=int, default=None, help="CUDA device id to use (default: compute.devices[0])")
+	p_synth.add_argument("--device", type=int, default=None, help="CUDA device id to use (default: inference.compute.devices[0])")
 	p_synth.set_defaults(func=_cmd_synth)
 
 	return parser

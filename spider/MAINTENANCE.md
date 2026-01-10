@@ -17,6 +17,17 @@ currently supported vs. what is “historical / local”.
   - Strict nested config schema in `spider/core/config_schema.py`
   - Priors validation/materialization in `spider/core/priors_config.py`
 
+### Library-only modules (not required by the CLI)
+
+These modules are **not imported by the CLI**, but may still be useful for ad-hoc analysis scripts:
+
+- `spider/analysis/` (post-processing and summaries)
+- `spider/plotting/` (plot helpers)
+
+If you want to keep the repo strictly “runtime-only”, these can be moved out of the
+package (or into an explicit `spider/extra/` namespace). If you keep them, prefer
+minimal dependencies and clear docstrings since they’re not exercised by the main pipeline.
+
 ### Common “stale” items (usually local artifacts, not part of the supported runtime)
 
 These are typically **outputs** or **build artifacts** that should not be committed:

@@ -6,11 +6,9 @@ from .samples import (
     read_all_samples,
 )
 from .synth import synth_initial_catalog_from_truth, SynthCatalogResult
-from .utils import clear_memory
 
 __all__ = [
     'save_checkpoint', 'load_checkpoint', 'clear_checkpoint_files',
     'save_samples_periodic', 'clear_samples_file', 'get_next_sample_count', 'read_all_samples',
     'synth_initial_catalog_from_truth', 'SynthCatalogResult',
-    'clear_memory',
 ]

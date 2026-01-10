@@ -57,7 +57,7 @@ def _read_text(path: str) -> str:
         return f.read()
 
 
-def _imports_from_ast(tree: ast.AST, *, current_module: str) -> set[str]:
+def _imports_from_ast(tree: ast.AST, *, current_module: str, is_package: bool) -> set[str]:
     """
     Return a set of imported *module names* as strings.
 
@@ -72,13 +72,18 @@ def _imports_from_ast(tree: ast.AST, *, current_module: str) -> set[str]:
         if level <= 0:
             return module
         parts = current_module.split(".")
-        # current_module is a module path; drop the final segment to get package
-        base = parts[:-1]
-        if level > len(base):
+        # For regular modules, relative imports are resolved from the *containing package*.
+        # For package __init__.py modules, they are resolved from the package itself.
+        base_parts = parts if is_package else parts[:-1]
+        if not base_parts:
             return None
-        prefix = ".".join(base[: len(base) - level + 1]) if (len(base) - level + 1) > 0 else ""
+        # In Python, level=1 means "current package", level=2 means "parent", etc.
+        keep = len(base_parts) - (level - 1)
+        if keep <= 0:
+            return None
+        prefix = ".".join(base_parts[:keep])
         if module:
-            return f"{prefix}.{module}" if prefix else module
+            return f"{prefix}.{module}"
         return prefix or None
 
     for node in ast.walk(tree):
@@ -106,7 +111,7 @@ def _build_import_graph(mods: Sequence[ModuleInfo]) -> dict[str, set[str]]:
         except SyntaxError:
             # Skip files that aren't parseable in this environment; they are still "present".
             continue
-        imports = _imports_from_ast(tree, current_module=m.module)
+        imports = _imports_from_ast(tree, current_module=m.module, is_package=os.path.basename(m.path) == "__init__.py")
         # Keep only edges into known modules (within this package snapshot)
         for imp in imports:
             if imp in by_module:
@@ -131,6 +136,22 @@ def _reachable(graph: Mapping[str, set[str]], roots: Iterable[str]) -> set[str]:
             if nxt not in seen:
                 stack.append(nxt)
     return seen
+
+
+def _promote_parent_packages(mods: Iterable[str]) -> set[str]:
+    """
+    Given a set of reachable modules, also mark their parent packages as reachable.
+
+    This reduces false positives where a submodule is imported (e.g. spider.optim.sgld)
+    but the package `spider.optim` isn't explicitly imported anywhere.
+    """
+    out: set[str] = set(mods)
+    for m in list(out):
+        parts = m.split(".")
+        # Keep promoting `a.b.c` -> `a.b` -> `a`
+        for k in range(len(parts) - 1, 0, -1):
+            out.add(".".join(parts[:k]))
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -162,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     package_dir = os.path.abspath(args.package_dir)
     mods = list(_iter_py_modules(package_dir, args.package_name))
     graph = _build_import_graph(mods)
-    reach = _reachable(graph, args.roots)
+    reach = _promote_parent_packages(_reachable(graph, args.roots))
 
     ignore_prefixes = tuple(str(x).strip() for x in (args.ignore_prefix or []) if str(x).strip())
 
