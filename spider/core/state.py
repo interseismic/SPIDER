@@ -127,6 +127,13 @@ class LocateState:
     # These are per-event neighbor lists into the concatenated inducing index list.
     shared_event_latent_inducing_neighbor_idx: Optional[torch.Tensor] = None  # (n_events, m) int64, padded with -1
     shared_event_latent_inducing_neighbor_k: Optional[torch.Tensor] = None    # (n_events, m) float32 kernel values
+    # Inducing point locations in event index space (concatenated global inducing list).
+    # Legacy: used to map inducing index -> event id (to fetch inducing XYZ from X_src).
+    # For Option-B fixed inducing geometry, prefer `shared_event_latent_inducing_xyz_km`.
+    shared_event_latent_inducing_event_idx: Optional[torch.Tensor] = None    # (M_total,) int64 event indices
+    # Fixed inducing-point XYZ locations (km), concatenated across components.
+    # Used by slowness_inducing_gp Option-B to keep kernel geometry consistent while events move.
+    shared_event_latent_inducing_xyz_km: Optional[torch.Tensor] = None       # (M_total, 3) float32
     # Inducing prior blocks (component-wise). Offsets index into the concatenated inducing list.
     shared_event_latent_inducing_offsets: Optional[torch.Tensor] = None       # (n_blocks+1,) int64
     shared_event_latent_inducing_K_blocks: Optional[list] = None              # list[Tensor], each (M_c, M_c)
@@ -145,7 +152,7 @@ class LocateState:
     # Owner-bucket caching
     _bucket_last_epoch: Optional[int] = None                 # last epoch index we rebuilt buckets
 
-    def begin_epoch_rr(self, *, seed: Optional[int] = None, use_full_N: bool = True) -> None:
+    def begin_epoch_rr(self, *, seed: Optional[int] = None, use_full_N: bool = True, shuffle: bool = True) -> None:
         """
         Prepare random-reshuffled (without replacement) contiguous tensors for this epoch.
         After calling, use `state.II_epoch` and `state.YY_epoch` in place of `state.II`, `state.YY`
@@ -154,6 +161,7 @@ class LocateState:
         Args:
             seed: Optional integer for reproducible reshuffles (e.g., pass `epoch`).
             use_full_N: If True, use `self.N` rows; otherwise infer from `self.II.shape[0]`.
+            shuffle: If False, skip the random permutation and expose contiguous views in original order.
         """
         # Keep row counts consistent across all per-edge tensors.
         # Root fix for CUDA IndexKernel asserts: never allow `self.N` to drift away from tensor lengths.
@@ -209,11 +217,25 @@ class LocateState:
         # Authoritative N for this epoch is the tensor length.
         self.N = int(N)
 
-        # Build permutation once per epoch (CPU RNG for determinism across devices)
-        gen = torch.Generator(device=self.II.device)
+        if not bool(shuffle):
+            # No permutation: just expose per-epoch views in original order.
+            # (Avoid `.contiguous()` here to prevent copying massive tensors.)
+            self._perm_epoch = None
+            self.II_epoch = self.II
+            self.YY_epoch = self.YY
+            if self.row_station_index is not None and int(self.row_station_index.shape[0]) == int(self.N):
+                self.row_station_index_epoch = self.row_station_index
+            else:
+                self.row_station_index_epoch = None
+            return
+
+        # Build permutation once per epoch (CPU RNG for determinism across devices/processes).
+        # This is especially important for torchrun/DDP where each rank uses a different CUDA device.
+        gen = torch.Generator(device="cpu")
         if seed is not None:
             gen.manual_seed(int(seed))
-        perm = torch.randperm(int(self.N), generator=gen, device=self.II.device)
+        perm = torch.randperm(int(self.N), generator=gen, device="cpu")
+        perm = perm.to(device=self.II.device)
 
         # Create contiguous, permuted views so your [i_start:i_end] slicing stays valid
         self.II_epoch = self.II.index_select(0, perm).contiguous()
@@ -278,6 +300,61 @@ def _clamp_dX_inplace(state: LocateState) -> None:
         state.dX_src[:, dim].clamp_(-c, c)
 
 
+@torch.no_grad()
+def _apply_shared_event_latent_constraints_inplace(state: LocateState) -> None:
+    """
+    Apply optional identifiability constraints to shared_event_latent parameters in-place.
+
+    Motivation:
+    shared_event_latent enters the likelihood as (b_{s,e2,phase} - b_{s,e1,phase}).
+    Any component of b that is *constant across stations* for a given event/phase is
+    indistinguishable from an origin-time shift Δt_e and can "absorb" it.
+
+    When enabled, we project out that station-common mode so Δt remains identifiable.
+    """
+    try:
+        if not bool(state.params.get("_shared_event_latent_enabled", False)):
+            return
+        b = getattr(state, "shared_event_latent_b", None)
+        if not isinstance(b, torch.Tensor) or b.ndim != 3 or int(b.shape[2]) != 2:
+            return
+        n_stations = int(getattr(state, "n_stations", 0) or 0)
+        if n_stations <= 0:
+            return
+        # Two parameterizations:
+        # - Per-station coefficients: b shape (n_stations, K, 2) where K is n_events or M_inducing.
+        # - Station-basis coefficients: b shape (R, K, 2) with W (n_stations, R).
+        if int(b.shape[0]) == int(n_stations):
+            # Remove station-mean per (event/inducing, phase): b <- b - mean_s(b)
+            mu = b.mean(dim=0, keepdim=True)
+            b.sub_(mu)
+            return
+
+        W = getattr(state, "shared_event_latent_station_basis_W", None)
+        if not isinstance(W, torch.Tensor) or W.ndim != 2 or int(W.shape[0]) != int(n_stations):
+            return
+        R = int(W.shape[1])
+        if int(b.shape[0]) != int(R):
+            return
+
+        # In basis mode, reconstructed station coefficients are C = W @ A where A=b (R,K,2).
+        # Station-mean is (1/S) 1^T C = ((1/S) W^T 1)^T A. Let r = (1/S) W^T 1 (R,).
+        # Enforce r^T A == 0 by projecting A onto the orthogonal complement of r.
+        ones = torch.ones((n_stations,), device=W.device, dtype=W.dtype)
+        r = (W.transpose(0, 1).matmul(ones)) / float(max(1, n_stations))  # (R,)
+        denom = torch.dot(r, r).clamp_min(0.0)
+        if not torch.isfinite(denom) or float(denom.item()) <= 0.0:
+            return
+        # dot[k,phase] = r^T A[:,k,phase]
+        dot = torch.tensordot(r.to(dtype=b.dtype, device=b.device), b, dims=([0], [0]))  # (K,2)
+        # A <- A - (r/||r||^2) * dot
+        denom_b = denom.to(device=b.device, dtype=b.dtype)
+        b.sub_((r.to(dtype=b.dtype, device=b.device) / denom_b).view(R, 1, 1) * dot.view(1, -1, 2))
+    except Exception:
+        # Constraints must never crash inference.
+        return
+
+
 def _attach_dd_preconditioner_metric(state: LocateState) -> None:
     """Attach per-event degree tensor to ΔX_src for DD preconditioning."""
     deg = state.dd_event_degree
@@ -289,7 +366,13 @@ def _attach_dd_preconditioner_metric(state: LocateState) -> None:
                 pass
         return
     try:
-        setattr(state.dX_src, "_dd_degree", deg.view(-1, 1))
+        # Support either:
+        # - deg shape (Ne,)   -> broadcast across 4 dims
+        # - deg shape (Ne,4)  -> per-dimension degree scaling (e.g., apply to XYZ only)
+        if isinstance(deg, torch.Tensor) and deg.ndim == 2:
+            setattr(state.dX_src, "_dd_degree", deg)
+        else:
+            setattr(state.dX_src, "_dd_degree", deg.view(-1, 1))
     except Exception as exc:
         print(f"Warning: could not attach DD preconditioner tensor: {exc}")
 

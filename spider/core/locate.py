@@ -57,36 +57,78 @@ from .modeling import (
 )
 
 
+def _ddp_enabled(params: dict) -> bool:
+    try:
+        return int(params.get("_ddp_world_size", 1) or 1) > 1
+    except Exception:
+        return False
+
+
+def _ddp_is_main(params: dict) -> bool:
+    try:
+        return int(params.get("_ddp_rank", 0) or 0) == 0
+    except Exception:
+        return True
+
+
 def _sampler_extra_metrics(optimizer: Optional[torch.optim.Optimizer]) -> Dict[str, float]:
+    """
+    Extra sampler diagnostics for W&B.
+
+    We intentionally do NOT log `drift_ratio_*` metrics anymore (removed).
+
+    We *do* log two SGHMC-specific diagnostics when SGHMC is active and Langevin noise is enabled:
+      - grad_noise_to_langevin_*: ratio of minibatch-gradient-induced update variance to injected noise variance
+      - t_eff_var_over_target: effective temperature estimate (variance-based) relative to target temperature
+    """
     metrics: Dict[str, float] = {}
     if optimizer is None:
         return metrics
 
-    if hasattr(optimizer, "drift_vs_noise_per_dim"):
-        try:
-            # ratios is (N, 4) or None
-            ratios = optimizer.drift_vs_noise_per_dim()  # type: ignore[attr-defined]
-            if ratios is not None:
-                # Calculate stats for each dimension (0=x, 1=y, 2=z, 3=t)
-                dim_names = ["x", "y", "z", "t"]
-                for i, name in enumerate(dim_names):
-                    dim_data = ratios[:, i]  # (N,)
-                    
-                    # Basic stats
-                    metrics[f"drift_ratio_{name}_mean"] = float(dim_data.mean())
-                    metrics[f"drift_ratio_{name}_median"] = float(dim_data.median())
-                    
-                    # Min/Max (robustness check)
-                    metrics[f"drift_ratio_{name}_min"] = float(dim_data.min())
-                    metrics[f"drift_ratio_{name}_max"] = float(dim_data.max())
+    # Only when SGHMC backend is active.
+    try:
+        if str(optimizer.__class__.__name__).strip().lower() != "sghmc":
+            return metrics
+    except Exception:
+        return metrics
 
-                    # Log-mean (for order-of-magnitude tracking)
-                    # Add epsilon to avoid log(0)
-                    log_mean = torch.log10(dim_data + 1e-20).mean()
-                    metrics[f"drift_ratio_{name}_log10_mean"] = float(log_mean)
+    # Only meaningful when Langevin noise is actually on (phases 3–4).
+    try:
+        pg0 = optimizer.param_groups[0] if hasattr(optimizer, "param_groups") and len(optimizer.param_groups) > 0 else {}
+        add_noise = bool(pg0.get("add_noise", False))
+        noise_scale = float(pg0.get("noise_scale", 0.0))
+        if (not add_noise) or (not (noise_scale > 0.0)):
+            return metrics
+    except Exception:
+        return metrics
 
-        except Exception:
-            pass
+    # 1) Drift-vs-noise variance ratio (minibatch gradient noise vs injected noise)
+    try:
+        if hasattr(optimizer, "grad_vs_noise_stats"):
+            s = optimizer.grad_vs_noise_stats()  # type: ignore[attr-defined]
+            if isinstance(s, dict):
+                med = float(s.get("median", float("nan")))
+                gm = float(s.get("gm", float("nan")))
+                if med == med:
+                    metrics["grad_noise_to_langevin_med"] = med
+                if gm == gm:
+                    metrics["grad_noise_to_langevin_gm"] = gm
+    except Exception:
+        pass
+
+    # 2) Effective temperature (variance-based), normalized by target temperature (should be ~1)
+    try:
+        if hasattr(optimizer, "temperature_stats"):
+            t = optimizer.temperature_stats()  # type: ignore[attr-defined]
+            if isinstance(t, dict):
+                vmed = float(t.get("var_median_over_target", float("nan")))
+                vgm = float(t.get("var_gm_over_target", float("nan")))
+                if vmed == vmed:
+                    metrics["t_eff_var_over_target"] = vmed
+                if vgm == vgm:
+                    metrics["t_eff_var_over_target_gm"] = vgm
+    except Exception:
+        pass
 
     return metrics
 
@@ -940,13 +982,40 @@ def _print_initial_residual_stats(state: LocateState) -> None:
         print("Initial residual stats: no observations.")
         return
     bs = max(int(state.batch_size_warmup), 1)
+    # For very large datasets, computing full residual stats can be expensive.
+    # Use a capped random sample by default to keep this a fast pre-Phase1 sanity check.
+    try:
+        max_rows = int(state.params.get("initial_residual_stats_max_rows", 200_000))
+    except Exception:
+        max_rows = 200_000
+    max_rows = int(max(10_000, max_rows))
+    N = int(state.N)
+    if N > max_rows:
+        try:
+            seed = int(state.params.get("runtime_seed", 0) or 0) + 1337
+        except Exception:
+            seed = 1337
+        rng = np.random.default_rng(int(seed))
+        idx_np = rng.choice(N, size=int(max_rows), replace=False).astype(np.int64, copy=False)
+        idx_np.sort()
+        idx_t = torch.as_tensor(idx_np, device=state.device, dtype=torch.int64)
+        II = state.II.index_select(0, idx_t)
+        YY = state.YY.index_select(0, idx_t)
+        N_eval = int(idx_t.numel())
+        suffix = f" (sampled n={N_eval}/{N})"
+    else:
+        II = state.II
+        YY = state.YY
+        N_eval = int(N)
+        suffix = ""
+
     # Evaluate residuals at ΔX=0 (i.e., current X_src + 0)
     zero_dX = torch.zeros_like(state.dX_src, device=state.dX_src.device)
     residuals = compute_residuals_full(
-        state.II, state.YY, state.X_src, zero_dX, state.model, bs, state.N
+        II, YY, state.X_src, zero_dX, state.model, bs, N_eval
     )
-    idx_p = torch.nonzero(state.YY[:, 4] < 0.5).squeeze(-1)
-    idx_s = torch.nonzero(state.YY[:, 4] > 0.5).squeeze(-1)
+    idx_p = torch.nonzero(YY[:, 4] < 0.5).squeeze(-1)
+    idx_s = torch.nonzero(YY[:, 4] > 0.5).squeeze(-1)
 
     def _stats(mask: torch.Tensor) -> Tuple[float, float, float, int]:
         if mask.numel() == 0:
@@ -960,7 +1029,7 @@ def _print_initial_residual_stats(state: LocateState) -> None:
     mse_p, mae_p, mad_p, n_p = _stats(idx_p)
     mse_s, mae_s, mad_s, n_s = _stats(idx_s)
     print(
-        f"Initial residual stats (ΔX=0): "
+        f"Initial residual stats (ΔX=0){suffix}: "
         f"P(n={n_p}) MSE={mse_p:.6e} s^2 MAE={mae_p:.6e} s MAD={mad_p:.6e} s | "
         f"S(n={n_s}) MSE={mse_s:.6e} s^2 MAE={mae_s:.6e} s MAD={mad_s:.6e} s"
     )
@@ -1006,6 +1075,7 @@ def _format_epoch_line(*, phase: str, step: int, total: int, metrics: Dict[str, 
         f"dx={metrics.get('dx_med_abs', float('nan')):.3e}",
         f"dy={metrics.get('dy_med_abs', float('nan')):.3e}",
         f"dz={metrics.get('dz_med_abs', float('nan')):.3e}",
+        f"dT={metrics.get('dt_med_abs', float('nan')):.3e}",
         f"dr_max={metrics.get('dr_max', float('nan')):.3e}",
         f"dr_90={metrics.get('dr_90', float('nan')):.3e}",
         f"t={metrics.get('epoch_time', float('nan')):.1f}s",
@@ -1017,7 +1087,9 @@ def _format_epoch_line(*, phase: str, step: int, total: int, metrics: Dict[str, 
 
 def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=None) -> None:
     """Noise-free MAP warmup using Adam on ΔX_src."""
-    print(f"Phase 1: MAP (optimizer=adam) | {_format_sampler_status(state.optimizer)}")
+    ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+    if ddp_main:
+        print(f"Phase 1: MAP (optimizer=adam) | {_format_sampler_status(state.optimizer)}")
     checkpoint_interval = state.params.get("checkpoint_interval", 50)
     # Optional cosine LR scheduler
     use_cosine = bool(state.params.get("phase1_use_cosine", False))
@@ -1088,19 +1160,20 @@ def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=No
             wandb_logger.log_phase1_metrics(epoch, wandb_metrics, global_step=state.global_step_count)
         
         # Report current posterior noise scales instead of MADs
-        σp_now, σs_now = _current_noise_scales(state)
-        print(_format_epoch_line(
-            phase="phase1",
-            step=epoch + 1,
-            total=int(state.params.get("phase1_epochs", 0)),
-            metrics=metrics,
-            opt=state.optimizer,
-            extra=f"sigma_p={float(σp_now):.4f} sigma_s={float(σs_now):.4f}",
-        ))
-        _shift_guard_check(state, context=f"phase1 epoch {epoch}")
+        if ddp_main:
+            σp_now, σs_now = _current_noise_scales(state)
+            print(_format_epoch_line(
+                phase="phase1",
+                step=epoch + 1,
+                total=int(state.params.get("phase1_epochs", 0)),
+                metrics=metrics,
+                opt=state.optimizer,
+                extra=f"sigma_p={float(σp_now):.4f} sigma_s={float(σs_now):.4f}",
+            ))
+            _shift_guard_check(state, context=f"phase1 epoch {epoch}")
 
         # periodic checkpoint for MAP phase
-        if checkpoint_interval > 0 and epoch > 0 and (epoch % checkpoint_interval == 0):
+        if ddp_main and checkpoint_interval > 0 and epoch > 0 and (epoch % checkpoint_interval == 0):
             save_checkpoint(
                 state.params,
                 state.optimizer,
@@ -1115,7 +1188,12 @@ def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=No
                 event_precision_matrix=state.event_precision_matrix,
             )
 
-    _finalize_phase1(state)
+    # Finalization is mostly file/diagnostic side-effects; only rank0 should run it in torchrun mode.
+    if ddp_main:
+        _finalize_phase1(state)
+    else:
+        # Still incrementally clamp/constraints happen in the loop; ensure all ranks exit cleanly.
+        pass
 
 def _apply_linearization_filter(state: LocateState, target_phase: str) -> None:
     """
@@ -1524,7 +1602,19 @@ def _resume_or_initialize(state: LocateState):
         info("Resetting batch numbers to 0 (reset_batch_numbers=True)", section="RUN")
         clear_checkpoint_files(state.params)
         if clear_samples_on_reset:
-            clear_samples_file(state.params)
+            ok = clear_samples_file(state.params)
+            if ok:
+                try:
+                    sp = str(state.params.get("samples_outfile", state.params.get("io", {}).get("samples_outfile", "samples.h5")))
+                except Exception:
+                    sp = "samples.h5"
+                info(f"Deleted samples file '{sp}' (clear_samples_on_reset=True)", section="SAMPLES")
+            if not ok:
+                try:
+                    sp = str(state.params.get("samples_outfile", state.params.get("io", {}).get("samples_outfile", "samples.h5")))
+                except Exception:
+                    sp = "samples.h5"
+                warn(f"Failed to delete samples file '{sp}' (clear_samples_on_reset=True). New batches may append.", section="SAMPLES")
         state.sample_count = 0
         return "phase1", 0, False, None
 
@@ -1536,7 +1626,19 @@ def _resume_or_initialize(state: LocateState):
     # Check if we should clear samples even when resuming from checkpoint
     if clear_samples_on_reset and not reset_batch_numbers:
         info("Clearing samples file while resuming from checkpoint (clear_samples_on_reset=True)", section="SAMPLES")
-        clear_samples_file(state.params)
+        ok = clear_samples_file(state.params)
+        if ok:
+            try:
+                sp = str(state.params.get("samples_outfile", state.params.get("io", {}).get("samples_outfile", "samples.h5")))
+            except Exception:
+                sp = "samples.h5"
+            info(f"Deleted samples file '{sp}' (clear_samples_on_reset=True)", section="SAMPLES")
+        if not ok:
+            try:
+                sp = str(state.params.get("samples_outfile", state.params.get("io", {}).get("samples_outfile", "samples.h5")))
+            except Exception:
+                sp = "samples.h5"
+            warn(f"Failed to delete samples file '{sp}' (clear_samples_on_reset=True). New batches may append.", section="SAMPLES")
         
     if ckpt is None:
         # fresh run
@@ -1635,6 +1737,7 @@ def _phase2_preconditioner(
     assert state.sampler is not None
     sampler = state.sampler
     sampler_backend = str(state.params["sampler_backend"]).strip().lower()
+    ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
     
     # ... existing comments ...
 
@@ -1668,7 +1771,8 @@ def _phase2_preconditioner(
             g['preconditioning'] = False
             g['freeze_preconditioner'] = True
 
-    print(f"Phase 2: drift-only (noise=off) | {_format_sampler_status(state.sampler)}")
+    if ddp_main:
+        print(f"Phase 2: drift-only (noise=off) | {_format_sampler_status(state.sampler)}")
     for epoch in range(start_epoch, state.params["phase2_epochs"]):
         metrics = _run_epoch(state, epoch, sampler, noise_scale_factor=0.0)
         
@@ -1681,40 +1785,13 @@ def _phase2_preconditioner(
             mp, ms = _compute_phase_mads(state, state.batch_size_sgld)
             mad_p_val, mad_s_val = mp.item(), ms.item()
 
-        # Grad noise vs Langevin diagnostic (geometric mean, median, p10, p90)
-        gnoise_gm = float('nan')
-        gnoise_med = float('nan')
-        gnoise_p10 = float('nan')
-        gnoise_p90 = float('nan')
-        teff_gm = float('nan')
-        teff_med = float('nan')
-        teff_var_gm = float('nan')
-        teff_var_med = float('nan')
-        teff_over = float('nan')
-        teff_var_over = float('nan')
-        try:
-            if bool(state.params.get("sgld_log_gnoise", False)) and _want_wandb_group(state.params, "sampler"):
-                stats = sampler.grad_vs_noise_stats()  # type: ignore[attr-defined]
-                gnoise_gm = float(stats["gm"])
-                gnoise_med = float(stats["median"])
-                gnoise_p10 = float(stats.get("p10", float("nan")))
-                gnoise_p90 = float(stats.get("p90", float("nan")))
-        except Exception:
-            pass
-        try:
-            if bool(state.params.get("sgld_log_temperature", False)) and _want_wandb_group(state.params, "sampler") and hasattr(sampler, "temperature_stats"):
-                tstats = sampler.temperature_stats()  # type: ignore[attr-defined]
-                teff_gm = float(tstats.get("msq_gm", float("nan")))
-                teff_med = float(tstats.get("msq_median", float("nan")))
-                teff_var_gm = float(tstats.get("var_gm", float("nan")))
-                teff_var_med = float(tstats.get("var_median", float("nan")))
-                teff_over = float(tstats.get("msq_median_over_target", float("nan")))
-                teff_var_over = float(tstats.get("var_median_over_target", float("nan")))
-        except Exception:
-            pass
+        # NOTE:
+        # - We intentionally do NOT log drift_ratio_* metrics (removed; too noisy/expensive).
+        # - We DO log SGHMC grad_noise_to_langevin + t_eff_var_over_target when SGHMC noise is enabled
+        #   via `_sampler_extra_metrics()` (sampling diagnostics group).
 
-        # Log metrics to wandb if enabled
-        if wandb_logger and _want_wandb_group(state.params, "core"):
+        # Log metrics to wandb if enabled (rank0 only under torchrun)
+        if ddp_main and wandb_logger and _want_wandb_group(state.params, "core"):
             wandb_metrics = {k:v for k,v in metrics.items()}
             # Noise scales (learned or fixed)
             try:
@@ -1744,44 +1821,31 @@ def _phase2_preconditioner(
                     "learning_rate": lr0,
                     "noise_enabled": int(noise_enabled),
                 })
-            # Only log these diagnostics when noise is enabled; otherwise they are undefined / misleading.
-            if noise_enabled and _want_wandb_group(state.params, "sampler"):
-                if bool(state.params.get("sgld_log_gnoise", False)):
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_gm", gnoise_gm)
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_med", gnoise_med)
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_p10", gnoise_p10)
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_p90", gnoise_p90)
-                if bool(state.params.get("sgld_log_temperature", False)):
-                    _wb_add_if_finite(wandb_metrics, "sghmc_teff_gm", teff_gm)
-                    _wb_add_if_finite(wandb_metrics, "sghmc_teff_med", teff_med)
-                    _wb_add_if_finite(wandb_metrics, "sghmc_teff_var_gm", teff_var_gm)
-                    _wb_add_if_finite(wandb_metrics, "sghmc_teff_var_med", teff_var_med)
-                    _wb_add_if_finite(wandb_metrics, "sghmc_teff_over_target", teff_over)
-                    _wb_add_if_finite(wandb_metrics, "sghmc_teff_var_over_target", teff_var_over)
             if _want_wandb_group(state.params, "sampler"):
                 wandb_metrics.update(_sampler_extra_metrics(sampler))
             wandb_logger.log_phase2_metrics(epoch, wandb_metrics, global_step=state.global_step_count)
 
-        # Report current posterior noise scales instead of MADs
-        σp_now, σs_now = _current_noise_scales(state)
-        print(_format_epoch_line(
-            phase="phase2",
-            step=epoch + 1,
-            total=int(state.params.get("phase2_epochs", 0)),
-            metrics=metrics,
-            opt=sampler,
-            # Keep console output compact: avoid printing sampler diagnostics every epoch.
-            extra=f"sigma_p={float(σp_now):.4f} sigma_s={float(σs_now):.4f}",
-        ))
+        # Report current posterior noise scales instead of MADs (rank0 only under torchrun)
+        if ddp_main:
+            σp_now, σs_now = _current_noise_scales(state)
+            print(_format_epoch_line(
+                phase="phase2",
+                step=epoch + 1,
+                total=int(state.params.get("phase2_epochs", 0)),
+                metrics=metrics,
+                opt=sampler,
+                # Keep console output compact: avoid printing sampler diagnostics every epoch.
+                extra=f"sigma_p={float(σp_now):.4f} sigma_s={float(σs_now):.4f}",
+            ))
         
         # Hierarchical prior (Wishart) Gibbs update is handled centrally inside `_run_epoch`
         # so it can run consistently in phases 1–4 without duplication.
 
         _shift_guard_check(state, context=f"phase2 epoch {epoch+1}")
 
-        # periodic checkpointing (no samples written in phase 2)
+        # periodic checkpointing (no samples written in phase 2) (rank0 only under torchrun)
         checkpoint_interval = int(state.params.get("checkpoint_interval", 50))
-        if checkpoint_interval > 0 and epoch > 0 and (epoch % checkpoint_interval == 0) and (not skip_saving_first_epoch):
+        if ddp_main and checkpoint_interval > 0 and epoch > 0 and (epoch % checkpoint_interval == 0) and (not skip_saving_first_epoch):
             save_checkpoint(
                 state.params,
                 state.sampler,  # type: ignore[arg-type]
@@ -1799,23 +1863,24 @@ def _phase2_preconditioner(
         if skip_saving_first_epoch:
             skip_saving_first_epoch = False
 
-    # Save checkpoint at end of phase 2
+    # Save checkpoint at end of phase 2 (rank0 only under torchrun)
     phase2_last_epoch = int(state.params.get("phase2_epochs", 0)) - 1
     if phase2_last_epoch < 0:
         phase2_last_epoch = 0
-    save_checkpoint(
-        state.params,
-        state.sampler,  # type: ignore[arg-type]
-        epoch=phase2_last_epoch,
-        N=state.N,
-        ΔX_src=state.dX_src,
-        samples=[],
-        stats_tensor=state.stats_tensor,
-        phase="phase2",
-        global_step_count=state.global_step_count,
-        noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
-        event_precision_matrix=state.event_precision_matrix,
-    )
+    if ddp_main:
+        save_checkpoint(
+            state.params,
+            state.sampler,  # type: ignore[arg-type]
+            epoch=phase2_last_epoch,
+            N=state.N,
+            ΔX_src=state.dX_src,
+            samples=[],
+            stats_tensor=state.stats_tensor,
+            phase="phase2",
+            global_step_count=state.global_step_count,
+            noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
+            event_precision_matrix=state.event_precision_matrix,
+        )
     
     # Compute FIM diagnostics and/or install FIM Preconditioner
     try:
@@ -1951,7 +2016,11 @@ def _phase3_noise_ramp(
 ) -> None:
     assert state.sampler is not None
     sampler = state.sampler
-    print(f"Phase 3: noise ramp | {_format_sampler_status(state.sampler)}")
+    ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+    if ddp_main:
+        ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+        if ddp_main:
+            print(f"Phase 3: noise ramp | {_format_sampler_status(state.sampler)}")
     ramp_len = int(state.params.get("phase3_epochs", 500))
 
     # Re-verify FIM installation before starting Phase 3
@@ -2025,9 +2094,13 @@ def _phase3_noise_ramp(
         # regardless of whether the preconditioning is frozen for sampling.
         g['is_burnin'] = True
     if sampler_backend == "adaptive_sghmc":
-        print(f"Phase 3: burn-in | {_format_sampler_status(sampler)}")
+        ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+        if ddp_main:
+            print(f"Phase 3: burn-in | {_format_sampler_status(sampler)}")
     else:
-        print(f"Phase 3: noise ramp | {_format_sampler_status(sampler)}")
+        ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+        if ddp_main:
+            print(f"Phase 3: noise ramp | {_format_sampler_status(sampler)}")
 
     for t in range(start_epoch, ramp_len):
         # Noise scale ramp: skip for adaptive samplers because they expect full noise during burn-in/adaptation.
@@ -2046,41 +2119,10 @@ def _phase3_noise_ramp(
             mp, ms = _compute_phase_mads(state, state.batch_size_sgld)
             mad_p_val, mad_s_val = mp.item(), ms.item()
 
-        # Grad noise vs Langevin diagnostic (geometric mean, median, p10, p90)
-        gnoise_gm = float('nan')
-        gnoise_med = float('nan')
-        gnoise_p10 = float('nan')
-        gnoise_p90 = float('nan')
-        teff_gm = float('nan')
-        teff_med = float('nan')
-        teff_var_gm = float('nan')
-        teff_var_med = float('nan')
-        teff_over = float('nan')
-        teff_var_over = float('nan')
+        # See note in Phase 2: drift_ratio_* is removed; SGHMC teff/noise diagnostics are logged only when noise is on.
         tau_mean = float('nan')
         tau_med = float('nan')
-        # Only compute sampler diagnostics if we're actually logging them.
         if wandb_logger and _want_wandb_group(state.params, "sampler"):
-            try:
-                if hasattr(sampler, "grad_vs_noise_stats"):
-                    stats = sampler.grad_vs_noise_stats()  # type: ignore[attr-defined]
-                    gnoise_gm = float(stats.get("gm", float("nan")))
-                    gnoise_med = float(stats.get("median", float("nan")))
-                    gnoise_p10 = float(stats.get("p10", float("nan")))
-                    gnoise_p90 = float(stats.get("p90", float("nan")))
-            except Exception:
-                pass
-            try:
-                if hasattr(sampler, "temperature_stats"):
-                    tstats = sampler.temperature_stats()  # type: ignore[attr-defined]
-                    teff_gm = float(tstats.get("msq_gm", float("nan")))
-                    teff_med = float(tstats.get("msq_median", float("nan")))
-                    teff_var_gm = float(tstats.get("var_gm", float("nan")))
-                    teff_var_med = float(tstats.get("var_median", float("nan")))
-                    teff_over = float(tstats.get("msq_median_over_target", float("nan")))
-                    teff_var_over = float(tstats.get("var_median_over_target", float("nan")))
-            except Exception:
-                pass
             try:
                 if hasattr(sampler, "tau_stats"):
                     taustats = sampler.tau_stats()  # type: ignore[attr-defined]
@@ -2089,8 +2131,8 @@ def _phase3_noise_ramp(
             except Exception:
                 pass
 
-        # Log metrics to wandb if enabled
-        if wandb_logger and _want_wandb_group(state.params, "core"):
+        # Log metrics to wandb if enabled (rank0 only under torchrun)
+        if ddp_main and wandb_logger and _want_wandb_group(state.params, "core"):
             wandb_metrics = {k:v for k,v in metrics.items()}
             # Noise scales (learned or fixed)
             try:
@@ -2121,43 +2163,33 @@ def _phase3_noise_ramp(
                     "noise_enabled": int(noise_enabled),
                     "ramp_progress": (t + 1) / ramp_len,
                 })
-                if noise_enabled:
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_gm", gnoise_gm)
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_med", gnoise_med)
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_p10", gnoise_p10)
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_p90", gnoise_p90)
-                    _wb_add_if_finite(wandb_metrics, "teff_gm", teff_gm)
-                    _wb_add_if_finite(wandb_metrics, "teff_med", teff_med)
-                    _wb_add_if_finite(wandb_metrics, "teff_var_gm", teff_var_gm)
-                    _wb_add_if_finite(wandb_metrics, "teff_var_med", teff_var_med)
-                    _wb_add_if_finite(wandb_metrics, "teff_over_target", teff_over)
-                    _wb_add_if_finite(wandb_metrics, "teff_var_over_target", teff_var_over)
                 # tau_* only exists for samplers that expose tau_stats(); skip NaNs.
                 _wb_add_if_finite(wandb_metrics, "tau_mean", tau_mean)
                 _wb_add_if_finite(wandb_metrics, "tau_med", tau_med)
                 wandb_metrics.update(_sampler_extra_metrics(sampler))
             wandb_logger.log_phase3_metrics(t, wandb_metrics, global_step=state.global_step_count)
 
-        # Report current posterior noise scales instead of MADs
-        σp_now, σs_now = _current_noise_scales(state)
-        print(_format_epoch_line(
-            phase="phase3",
-            step=t + 1,
-            total=int(ramp_len),
-            metrics=metrics,
-            opt=sampler,
-            # Keep console output compact: avoid printing sampler diagnostics every epoch.
-            extra=f"sigma_p={float(σp_now):.4f} sigma_s={float(σs_now):.4f} ramp={progress:.3f}",
-        ))
+        # Report current posterior noise scales instead of MADs (rank0 only under torchrun)
+        if ddp_main:
+            σp_now, σs_now = _current_noise_scales(state)
+            print(_format_epoch_line(
+                phase="phase3",
+                step=t + 1,
+                total=int(ramp_len),
+                metrics=metrics,
+                opt=sampler,
+                # Keep console output compact: avoid printing sampler diagnostics every epoch.
+                extra=f"sigma_p={float(σp_now):.4f} sigma_s={float(σs_now):.4f} ramp={progress:.3f}",
+            ))
         
         # Hierarchical prior (Wishart) Gibbs update is handled centrally inside `_run_epoch`
         # so it can run consistently in phases 1–4 without duplication.
 
         _shift_guard_check(state, context=f"phase3 iter {t+1}")
 
-        # periodic checkpointing during phase 3 ramp (no samples written)
+        # periodic checkpointing during phase 3 ramp (no samples written) (rank0 only under torchrun)
         checkpoint_interval = int(state.params.get("checkpoint_interval", 50))
-        if checkpoint_interval > 0 and t > 0 and (t % checkpoint_interval == 0) and (not skip_saving_first_epoch):
+        if ddp_main and checkpoint_interval > 0 and t > 0 and (t % checkpoint_interval == 0) and (not skip_saving_first_epoch):
             save_checkpoint(
                 state.params,
                 state.sampler,  # type: ignore[arg-type]
@@ -2175,23 +2207,24 @@ def _phase3_noise_ramp(
         if skip_saving_first_epoch:
             skip_saving_first_epoch = False
 
-    # Save checkpoint at end of phase 3
+    # Save checkpoint at end of phase 3 (rank0 only under torchrun)
     phase3_last_iter = int(ramp_len) - 1
     if phase3_last_iter < 0:
         phase3_last_iter = 0
-    save_checkpoint(
-        state.params,
-        state.sampler,  # type: ignore[arg-type]
-        epoch=phase3_last_iter,
-        N=state.N,
-        ΔX_src=state.dX_src,
-        samples=[],
-        stats_tensor=state.stats_tensor,
-        phase="phase3",
-        global_step_count=state.global_step_count,
-        noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
-        event_precision_matrix=state.event_precision_matrix,
-    )
+    if ddp_main:
+        save_checkpoint(
+            state.params,
+            state.sampler,  # type: ignore[arg-type]
+            epoch=phase3_last_iter,
+            N=state.N,
+            ΔX_src=state.dX_src,
+            samples=[],
+            stats_tensor=state.stats_tensor,
+            phase="phase3",
+            global_step_count=state.global_step_count,
+            noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
+            event_precision_matrix=state.event_precision_matrix,
+        )
 
 
 def _phase4_sampling(
@@ -2199,6 +2232,7 @@ def _phase4_sampling(
 ) -> None:
     assert state.sampler is not None
     sampler = state.sampler
+    ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
     # Ensure LR is set from config.
     # For lr_mode='per_obs' we apply lr_eff = lr_sampler / N for pSGLD/SGHMC/AdaptiveSGHMC.
     try:
@@ -2225,10 +2259,14 @@ def _phase4_sampling(
     except Exception:
         n_epochs = 0
     if n_epochs <= 0:
-        print("Phase 4: sampling skipped (phase4_epochs=0)")
+        ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+        if ddp_main:
+            print("Phase 4: sampling skipped (phase4_epochs=0)")
         return
     if int(start_epoch) >= int(n_epochs):
-        print(f"Phase 4: sampling skipped (start_epoch={start_epoch} >= phase4_epochs={n_epochs})")
+        ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+        if ddp_main:
+            print(f"Phase 4: sampling skipped (start_epoch={start_epoch} >= phase4_epochs={n_epochs})")
         return
 
     freeze_precond = bool(state.params.get("freeze_preconditioner_sampling", True))
@@ -2236,7 +2274,9 @@ def _phase4_sampling(
         g["freeze_preconditioner"] = freeze_precond
         g["is_burnin"] = False
     _apply_sampler_group_overrides(state, sampler)
-    print(f"Phase 4: sampling | {_format_sampler_status(sampler)}")
+    ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+    if ddp_main:
+        print(f"Phase 4: sampling | {_format_sampler_status(sampler)}")
 
     # Track relative parameter changes over the last N and N2 epochs
     rel_window = int(state.params.get("rel_change_window", 10))
@@ -2260,41 +2300,10 @@ def _phase4_sampling(
             mp, ms = _compute_phase_mads(state, state.batch_size_sgld)
             mad_p_val, mad_s_val = mp.item(), ms.item()
 
-        # Grad noise vs Langevin diagnostic (geometric mean, median, p10, p90)
-        gnoise_gm = float('nan')
-        gnoise_med = float('nan')
-        gnoise_p10 = float('nan')
-        gnoise_p90 = float('nan')
-        teff_gm = float('nan')
-        teff_med = float('nan')
-        teff_var_gm = float('nan')
-        teff_var_med = float('nan')
-        teff_over = float('nan')
-        teff_var_over = float('nan')
+        # See note in Phase 2: drift_ratio_* is removed; SGHMC teff/noise diagnostics are logged only when noise is on.
         tau_mean = float('nan')
         tau_med = float('nan')
-        # Only compute sampler diagnostics if we're actually logging them.
         if wandb_logger and _want_wandb_group(state.params, "sampler"):
-            try:
-                if hasattr(sampler, "grad_vs_noise_stats"):
-                    stats = sampler.grad_vs_noise_stats()  # type: ignore[attr-defined]
-                    gnoise_gm = float(stats.get("gm", float("nan")))
-                    gnoise_med = float(stats.get("median", float("nan")))
-                    gnoise_p10 = float(stats.get("p10", float("nan")))
-                    gnoise_p90 = float(stats.get("p90", float("nan")))
-            except Exception:
-                pass
-            try:
-                if hasattr(sampler, "temperature_stats"):
-                    tstats = sampler.temperature_stats()  # type: ignore[attr-defined]
-                    teff_gm = float(tstats.get("msq_gm", float("nan")))
-                    teff_med = float(tstats.get("msq_median", float("nan")))
-                    teff_var_gm = float(tstats.get("var_gm", float("nan")))
-                    teff_var_med = float(tstats.get("var_median", float("nan")))
-                    teff_over = float(tstats.get("msq_median_over_target", float("nan")))
-                    teff_var_over = float(tstats.get("var_median_over_target", float("nan")))
-            except Exception:
-                pass
             try:
                 if hasattr(sampler, "tau_stats"):
                     taustats = sampler.tau_stats()  # type: ignore[attr-defined]
@@ -2303,8 +2312,8 @@ def _phase4_sampling(
             except Exception:
                 pass
 
-        # Log metrics to wandb if enabled
-        if wandb_logger and _want_wandb_group(state.params, "core"):
+        # Log metrics to wandb if enabled (rank0 only under torchrun)
+        if ddp_main and wandb_logger and _want_wandb_group(state.params, "core"):
             wandb_metrics = {k:v for k,v in metrics.items()}
             # Noise scales (learned or fixed)
             try:
@@ -2334,38 +2343,28 @@ def _phase4_sampling(
                     "learning_rate": lr0,
                     "noise_enabled": int(noise_enabled),
                 })
-                if noise_enabled:
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_gm", gnoise_gm)
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_med", gnoise_med)
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_p10", gnoise_p10)
-                    _wb_add_if_finite(wandb_metrics, "grad_noise_to_langevin_p90", gnoise_p90)
-                    _wb_add_if_finite(wandb_metrics, "teff_gm", teff_gm)
-                    _wb_add_if_finite(wandb_metrics, "teff_med", teff_med)
-                    _wb_add_if_finite(wandb_metrics, "teff_var_gm", teff_var_gm)
-                    _wb_add_if_finite(wandb_metrics, "teff_var_med", teff_var_med)
-                    _wb_add_if_finite(wandb_metrics, "teff_over_target", teff_over)
-                    _wb_add_if_finite(wandb_metrics, "teff_var_over_target", teff_var_over)
                 # tau_* only exists for samplers that expose tau_stats(); skip NaNs.
                 _wb_add_if_finite(wandb_metrics, "tau_mean", tau_mean)
                 _wb_add_if_finite(wandb_metrics, "tau_med", tau_med)
                 wandb_metrics.update(_sampler_extra_metrics(sampler))
             wandb_logger.log_phase4_metrics(epoch, wandb_metrics, global_step=state.global_step_count)
 
-        # Compact console line
-        σp_now, σs_now = _current_noise_scales(state)
-        print(_format_epoch_line(
-            phase="phase4",
-            step=epoch + 1,
-            total=int(n_epochs),
-            metrics=metrics,
-            opt=sampler,
-            extra=f"sigma_p={float(σp_now):.4f} sigma_s={float(σs_now):.4f}",
-        ))
-        _shift_guard_check(state, context=f"phase4 epoch {epoch}")
+        # Compact console line (rank0 only under torchrun)
+        if ddp_main:
+            σp_now, σs_now = _current_noise_scales(state)
+            print(_format_epoch_line(
+                phase="phase4",
+                step=epoch + 1,
+                total=int(n_epochs),
+                metrics=metrics,
+                opt=sampler,
+                extra=f"sigma_p={float(σp_now):.4f} sigma_s={float(σs_now):.4f}",
+            ))
+            _shift_guard_check(state, context=f"phase4 epoch {epoch}")
 
-        # Periodic checkpointing / sample flush
+        # Periodic checkpointing (rank0 only under torchrun)
         checkpoint_interval = int(state.params.get("checkpoint_interval", 50))
-        if checkpoint_interval > 0 and epoch > 0 and (epoch % checkpoint_interval == 0) and (not skip_saving_first_epoch):
+        if ddp_main and checkpoint_interval > 0 and epoch > 0 and (epoch % checkpoint_interval == 0) and (not skip_saving_first_epoch):
             save_checkpoint(
                 state.params,
                 sampler,
@@ -2379,10 +2378,31 @@ def _phase4_sampling(
                 noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
                 event_precision_matrix=state.event_precision_matrix,
             )
+
+        # Periodic sample flush to HDF5 (rank0 only under torchrun)
+        # Historically, we flushed samples at checkpoint cadence. `sample_write_interval`
+        # allows these to be decoupled (defaults to checkpoint_interval when omitted).
+        sample_write_interval = int(state.params.get("sample_write_interval", checkpoint_interval))
+        write_samples = bool(state.params.get("write_samples", True))
+        if (
+            ddp_main
+            and write_samples
+            and sample_write_interval > 0
+            and epoch > 0
+            and (epoch % sample_write_interval == 0)
+            and (not skip_saving_first_epoch)
+        ):
             state.sample_count = save_samples_periodic(
-                state.params, state.origins0, state.X_src,
-                state.samples, state.projector, state.sample_count,
-                noise_log_scales=state.noise_log_scales
+                state.params,
+                state.origins0,
+                state.X_src,
+                state.samples,
+                state.projector,
+                state.sample_count,
+                noise_log_scales=state.noise_log_scales,
+                global_step_count=int(state.global_step_count),
+                epoch=int(epoch),
+                phase="phase4",
             )
             state.samples = []
             state.noise_log_scales = []
@@ -2390,25 +2410,35 @@ def _phase4_sampling(
         if skip_saving_first_epoch:
             skip_saving_first_epoch = False
 
-    # Final flush + checkpoint
-    state.sample_count = save_samples_periodic(
-        state.params, state.origins0, state.X_src, state.samples, state.projector, state.sample_count,
-        noise_log_scales=state.noise_log_scales
-    )
-    last_epoch = int(n_epochs) - 1
-    save_checkpoint(
-        state.params,
-        sampler,
-        last_epoch,
-        state.N,
-        state.dX_src,
-        [],
-        state.stats_tensor,
-        phase="phase4",
-        global_step_count=state.global_step_count,
-        noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
-        event_precision_matrix=state.event_precision_matrix,
-    )  # type: ignore[arg-type]
+    # Final flush + checkpoint (rank0 only under torchrun)
+    if ddp_main:
+        if bool(state.params.get("write_samples", True)):
+            state.sample_count = save_samples_periodic(
+                state.params,
+                state.origins0,
+                state.X_src,
+                state.samples,
+                state.projector,
+                state.sample_count,
+                noise_log_scales=state.noise_log_scales,
+                global_step_count=int(state.global_step_count),
+                epoch=int(last_epoch),
+                phase="phase4",
+            )
+        last_epoch = int(n_epochs) - 1
+        save_checkpoint(
+            state.params,
+            sampler,
+            last_epoch,
+            state.N,
+            state.dX_src,
+            [],
+            state.stats_tensor,
+            phase="phase4",
+            global_step_count=state.global_step_count,
+            noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
+            event_precision_matrix=state.event_precision_matrix,
+        )  # type: ignore[arg-type]
     return
 
 
@@ -2632,6 +2662,7 @@ def _maybe_select_shared_event_latent_inducing_points(state: "LocateState") -> N
         top_k = int(state.params.get("_shared_event_latent_inducing_plan_top_k", 10))
         seed_strategy = str(state.params.get("_shared_event_latent_inducing_plan_seed_strategy", "max_degree")).strip().lower()
         use_xyz = bool(state.params.get("_shared_event_latent_inducing_plan_use_xyz", False))
+        fixed_xyz = bool(state.params.get("_shared_event_latent_inducing_fixed_xyz", False))
         out_path = state.params.get("_shared_event_latent_inducing_plan_selection_outfile", None)
         if out_path is None or str(out_path).strip() == "":
             out_path = "shared_event_latent_inducing_selection.npz"
@@ -2742,6 +2773,11 @@ def _maybe_select_shared_event_latent_inducing_points(state: "LocateState") -> N
         return
 
     inducing_idx = np.concatenate(inducing_idx_all, axis=0).astype(np.int64, copy=False)
+    # Always store MAP inducing XYZ locations (km). Used by slowness_inducing_gp Option-B fixed inducing geometry.
+    try:
+        inducing_xyz_km = X_map[inducing_idx, :3].astype(np.float32, copy=False) if inducing_idx.size > 0 else np.zeros((0, 3), dtype=np.float32)
+    except Exception:
+        inducing_xyz_km = np.zeros((0, 3), dtype=np.float32)
     offsets = np.asarray(inducing_off, dtype=np.int64)
     comp_out_a = np.asarray(comp_out, dtype=np.int64)
     m_out_a = np.asarray(m_out, dtype=np.int64)
@@ -2778,9 +2814,11 @@ def _maybe_select_shared_event_latent_inducing_points(state: "LocateState") -> N
             component_n_events=counts[comp_out_a].astype(np.int64, copy=False),
             component_offsets=offsets,
             inducing_event_idx=inducing_idx,
+            inducing_xyz_km=inducing_xyz_km,
             ell_km=np.asarray([float(ell)], dtype=np.float32),
             cover_r_km=np.asarray([float(r)], dtype=np.float32),
             use_xyz=np.asarray([int(bool(use_xyz))], dtype=np.int8),
+            fixed_xyz=np.asarray([int(bool(fixed_xyz))], dtype=np.int8),
             seed_strategy=np.asarray([seed_strategy], dtype=object),
             max_dist_to_inducing_km=cov_out_a,
         )
@@ -2790,6 +2828,7 @@ def _maybe_select_shared_event_latent_inducing_points(state: "LocateState") -> N
             state.params["_shared_event_latent_inducing_component_id"] = comp_out_a
             state.params["_shared_event_latent_inducing_component_offsets"] = offsets
             state.params["_shared_event_latent_inducing_event_idx"] = inducing_idx
+            state.params["_shared_event_latent_inducing_xyz_km"] = inducing_xyz_km
             state.params["_shared_event_latent_inducing_cover_r_km"] = float(r)
             state.params["_shared_event_latent_inducing_use_xyz_runtime"] = bool(use_xyz)
             state.params["_shared_event_latent_inducing_selection_file_runtime"] = str(out_path_s)
@@ -2835,6 +2874,7 @@ def _maybe_build_shared_event_latent_inducing_interpolation(state: "LocateState"
     comp_ids = state.params.get("_shared_event_latent_inducing_component_id", None)
     comp_off = state.params.get("_shared_event_latent_inducing_component_offsets", None)
     inducing_event_idx = state.params.get("_shared_event_latent_inducing_event_idx", None)
+    inducing_xyz_km = state.params.get("_shared_event_latent_inducing_xyz_km", None)
     if comp_ids is None or comp_off is None or inducing_event_idx is None:
         # Try to load from NPZ file
         sel_path = state.params.get("_shared_event_latent_inducing_selection_file_runtime", None)
@@ -2852,6 +2892,8 @@ def _maybe_build_shared_event_latent_inducing_interpolation(state: "LocateState"
             comp_ids = data["component_id"]
             comp_off = data["component_offsets"]
             inducing_event_idx = data["inducing_event_idx"]
+            if "inducing_xyz_km" in data:
+                inducing_xyz_km = data["inducing_xyz_km"]
             # prefer runtime use_xyz from file if present
             if "use_xyz" in data:
                 try:
@@ -2866,6 +2908,8 @@ def _maybe_build_shared_event_latent_inducing_interpolation(state: "LocateState"
         comp_ids = np.asarray(comp_ids, dtype=np.int64)
         comp_off = np.asarray(comp_off, dtype=np.int64)
         inducing_event_idx = np.asarray(inducing_event_idx, dtype=np.int64)
+        if inducing_xyz_km is not None:
+            inducing_xyz_km = np.asarray(inducing_xyz_km, dtype=np.float32)
     except Exception:
         return
     if comp_ids.size == 0 or comp_off.size != comp_ids.size + 1 or inducing_event_idx.size == 0:
@@ -2904,6 +2948,9 @@ def _maybe_build_shared_event_latent_inducing_interpolation(state: "LocateState"
     # Output arrays (fixed m per event; padded with -1/0)
     neigh_idx = np.full((n_events, m), -1, dtype=np.int64)
     neigh_k = np.zeros((n_events, m), dtype=np.float32)
+    # Precompute Matérn(3/2) kernel values at MAP for each event->neighbor inducing pair.
+    # This is used by slowness_re at runtime to avoid per-batch distance/exp computation.
+    neigh_k_matern32 = np.zeros((n_events, m), dtype=np.float32)
     neigh_d = np.zeros((n_events, m), dtype=np.float32) if store_dist else None
 
     t0 = time.time()
@@ -2913,8 +2960,17 @@ def _maybe_build_shared_event_latent_inducing_interpolation(state: "LocateState"
         i0 = int(comp_off[bi]); i1 = int(comp_off[bi + 1])
         if i1 <= i0:
             continue
-        U_ev = inducing_event_idx[i0:i1]
-        M = int(U_ev.size)
+        # Inducing locations for this component. Prefer fixed inducing XYZ if available.
+        Uc = None
+        try:
+            if inducing_xyz_km is not None and getattr(inducing_xyz_km, "ndim", 0) == 2 and int(inducing_xyz_km.shape[1]) >= int(P.shape[1]):
+                Uc = np.asarray(inducing_xyz_km[i0:i1, : int(P.shape[1])]).astype(np.float32, copy=False)
+        except Exception:
+            Uc = None
+        if Uc is None:
+            U_ev = inducing_event_idx[i0:i1]
+            Uc = P[U_ev]
+        M = int(Uc.shape[0])
         if M <= 0:
             continue
         # All events in this component
@@ -2922,7 +2978,6 @@ def _maybe_build_shared_event_latent_inducing_interpolation(state: "LocateState"
         if ev_idx.size == 0:
             continue
         Pc = P[ev_idx]
-        Uc = P[U_ev]
         kq = int(min(m, M))
         if kq <= 0:
             continue
@@ -2985,6 +3040,29 @@ def _maybe_build_shared_event_latent_inducing_interpolation(state: "LocateState"
         section="LIKELIHOOD",
     )
 
+    # Keep interpolation in memory for inducing modes so inference does not need NPZ round-trips.
+    # (We may still write NPZ below for reproducibility / restarts.)
+    try:
+        mode = str(state.params.get("_shared_event_latent_parameterization", "full")).strip().lower()
+        if mode in {"inducing_gp", "slowness_inducing_gp"}:
+            dev = state.device
+            state.shared_event_latent_inducing_neighbor_idx = torch.from_numpy(neigh_idx).to(device=dev, dtype=torch.int64)
+            state.shared_event_latent_inducing_neighbor_k = torch.from_numpy(neigh_k).to(device=dev, dtype=torch.float32)
+            try:
+                state.shared_event_latent_inducing_event_idx = torch.from_numpy(inducing_event_idx).to(device=dev, dtype=torch.int64)
+            except Exception:
+                state.shared_event_latent_inducing_event_idx = None
+            try:
+                if inducing_xyz_km is not None:
+                    state.shared_event_latent_inducing_xyz_km = torch.from_numpy(np.asarray(inducing_xyz_km, dtype=np.float32)).to(device=dev, dtype=torch.float32)
+                else:
+                    state.shared_event_latent_inducing_xyz_km = None
+            except Exception:
+                state.shared_event_latent_inducing_xyz_km = None
+            state.params["_shared_event_latent_inducing_interpolation_in_memory"] = True
+    except Exception:
+        pass
+
     # Write NPZ (relative -> checkpoint_dir)
     try:
         out_path_s = str(out_path)
@@ -2996,6 +3074,7 @@ def _maybe_build_shared_event_latent_inducing_interpolation(state: "LocateState"
             component_id=comp_ids,
             component_offsets=comp_off,
             inducing_event_idx=inducing_event_idx,
+            inducing_xyz_km=(inducing_xyz_km if inducing_xyz_km is not None else np.zeros((0, 3), dtype=np.float32)),
             event_component_id=ev_comp.astype(np.int64, copy=False),
             neighbor_inducing_global_idx=neigh_idx,
             neighbor_kernel=neigh_k,
@@ -3013,6 +3092,714 @@ def _maybe_build_shared_event_latent_inducing_interpolation(state: "LocateState"
     except Exception as e:
         warn(f"Could not write inducing interpolation NPZ: {e}", section="LIKELIHOOD")
     return
+
+
+@torch.no_grad()
+def _maybe_select_slowness_re_inducing_points(state: "LocateState") -> None:
+    """
+    Stage-2: Select inducing points per connected component for the collapsed slowness covariance likelihood.
+
+    This is analogous to `_maybe_select_shared_event_latent_inducing_points`, but is gated by
+    `model.likelihood.slowness_re` and stores results under `_slowness_re_*` keys.
+    """
+    try:
+        if not bool(state.params.get("_slowness_re_enabled", False)):
+            return
+        if not bool(state.params.get("_slowness_re_inducing_plan_enable", False)):
+            return
+        ell = float(state.params.get("_slowness_re_ell_km", 0.0))
+        if not (ell > 0.0):
+            return
+        cover_frac = float(state.params.get("_slowness_re_inducing_plan_cover_frac_of_ell", 1.0))
+        if not (cover_frac > 0.0) or (not math.isfinite(cover_frac)):
+            cover_frac = 1.0
+        r = float(cover_frac) * float(ell)
+        min_m = int(state.params.get("_slowness_re_inducing_plan_min_inducing_per_component", 1))
+        max_m = int(state.params.get("_slowness_re_inducing_plan_max_inducing_per_component", 1024))
+        top_k = int(state.params.get("_slowness_re_inducing_plan_top_k", 10))
+        seed_strategy = str(state.params.get("_slowness_re_inducing_plan_seed_strategy", "max_degree")).strip().lower()
+        fixed_xyz = bool(state.params.get("_slowness_re_inducing_fixed_xyz", True))
+        out_path = state.params.get("_slowness_re_inducing_plan_selection_outfile", None)
+        top_k = max(1, top_k)
+        min_m = max(1, min_m)
+        max_m = max(min_m, max_m)
+        if seed_strategy not in {"max_degree", "random"}:
+            seed_strategy = "max_degree"
+    except Exception:
+        return
+
+    # If selection already present (resume), do nothing.
+    try:
+        if state.params.get("_slowness_re_inducing_event_idx", None) is not None and state.params.get("_slowness_re_inducing_component_offsets", None) is not None:
+            return
+    except Exception:
+        pass
+
+    if getattr(state, "cluster_ids", None) is None or getattr(state, "cluster_counts", None) is None:
+        return
+    try:
+        comp = state.cluster_ids.detach().cpu().numpy().astype(np.int64, copy=False)
+        counts = state.cluster_counts.detach().cpu().numpy().reshape(-1).astype(np.int64, copy=False)
+    except Exception:
+        return
+    if comp.size == 0 or counts.size == 0:
+        return
+    n_comp = int(counts.size)
+
+    # MAP event XYZ in km
+    try:
+        X_map = (state.X_src.detach() + state.dX_src.detach())[:, :3].to(torch.float32).cpu().numpy()
+    except Exception:
+        return
+    if X_map.shape[0] != comp.shape[0]:
+        return
+    P = X_map[:, :3].astype(np.float32, copy=False)
+
+    # Optional degree for linkage-aware seeding
+    deg = None
+    try:
+        if getattr(state, "dd_event_degree", None) is not None:
+            deg = state.dd_event_degree.detach().cpu().numpy().reshape(-1).astype(np.float32, copy=False)
+            if deg.shape[0] != comp.shape[0]:
+                deg = None
+    except Exception:
+        deg = None
+
+    rng = np.random.default_rng(int(state.params.get("runtime_seed", 0)))
+    t0 = time.time()
+
+    comp_ids = np.arange(n_comp, dtype=np.int64)
+    valid = counts > 0
+    comp_ids = comp_ids[valid]
+    comp_ids = comp_ids[np.argsort(-counts[comp_ids])]
+
+    inducing_idx_all: list[np.ndarray] = []
+    inducing_off = [0]
+    comp_out = []
+    m_out = []
+    cov_out = []
+    for ci in comp_ids.tolist():
+        idxs = np.flatnonzero(comp == int(ci)).astype(np.int64, copy=False)
+        if idxs.size == 0:
+            continue
+        m_cap = int(min(max_m, int(idxs.size)))
+        if seed_strategy == "max_degree" and deg is not None:
+            seed_local = int(np.argmax(deg[idxs]))
+        else:
+            seed_local = int(rng.integers(0, int(idxs.size)))
+        Pc = P[idxs]  # (n,3)
+        sel_local = [seed_local]
+        d0 = Pc - Pc[seed_local]
+        min_d2 = (d0 * d0).sum(axis=1).astype(np.float32, copy=False)
+        while len(sel_local) < m_cap:
+            max_d2 = float(min_d2.max()) if min_d2.size > 0 else 0.0
+            if math.sqrt(max_d2) <= r:
+                break
+            j = int(np.argmax(min_d2))
+            if j in sel_local:
+                break
+            sel_local.append(j)
+            dj = Pc - Pc[j]
+            d2 = (dj * dj).sum(axis=1).astype(np.float32, copy=False)
+            min_d2 = np.minimum(min_d2, d2)
+        max_dist = math.sqrt(float(min_d2.max())) if min_d2.size > 0 else 0.0
+        sel_global = idxs[np.asarray(sel_local, dtype=np.int64)]
+        inducing_idx_all.append(sel_global.astype(np.int64, copy=False))
+        inducing_off.append(int(inducing_off[-1] + int(sel_global.size)))
+        comp_out.append(int(ci))
+        m_out.append(int(sel_global.size))
+        cov_out.append(float(max_dist))
+
+    if not inducing_idx_all:
+        warn("Inducing selection produced no points for slowness_re; skipping.", section="LIKELIHOOD")
+        return
+
+    inducing_idx = np.concatenate(inducing_idx_all, axis=0).astype(np.int64, copy=False)
+    inducing_xyz_km = X_map[inducing_idx, :3].astype(np.float32, copy=False) if inducing_idx.size > 0 else np.zeros((0, 3), dtype=np.float32)
+    offsets = np.asarray(inducing_off, dtype=np.int64)
+    comp_out_a = np.asarray(comp_out, dtype=np.int64)
+    m_out_a = np.asarray(m_out, dtype=np.int64)
+    cov_out_a = np.asarray(cov_out, dtype=np.float32)
+
+    dt_s = time.time() - t0
+    info(
+        f"Inducing selection (slowness_re): comps={int(comp_out_a.size)} sum_M={int(inducing_idx.size):,} "
+        f"ell_km={ell:g} cover_r={r:g} dims=xyz fixed_xyz={int(bool(fixed_xyz))} seed={seed_strategy} dt={dt_s:.1f}s",
+        section="LIKELIHOOD",
+    )
+    order = np.argsort(-counts[comp_out_a])
+    for j in range(int(min(int(top_k), int(order.size)))):
+        ci = int(comp_out_a[order[j]])
+        info(
+            f"  comp[{j}] id={ci} n={int(counts[ci]):,} M={int(m_out_a[order[j]])} "
+            f"max_dist_to_inducing={float(cov_out_a[order[j]]):.3g}km (target_r={r:.3g}km)",
+            section="LIKELIHOOD",
+        )
+
+    # Always expose selection in-memory for runtime use; optionally persist to NPZ if requested.
+    try:
+        state.params["_slowness_re_inducing_component_id"] = comp_out_a
+        state.params["_slowness_re_inducing_component_offsets"] = offsets
+        state.params["_slowness_re_inducing_event_idx"] = inducing_idx
+        state.params["_slowness_re_inducing_xyz_km"] = inducing_xyz_km
+    except Exception:
+        pass
+
+    try:
+        want_write = bool(out_path is not None and str(out_path).strip() != "")
+    except Exception:
+        want_write = False
+    if want_write:
+        try:
+            out_path_s = str(out_path)
+            if not os.path.isabs(out_path_s):
+                base = str(state.params.get("checkpoint_dir", "."))
+                out_path_s = os.path.join(base, out_path_s)
+            os.makedirs(os.path.dirname(out_path_s) or ".", exist_ok=True)
+            np.savez_compressed(
+                out_path_s,
+                component_id=comp_out_a,
+                component_n_events=counts[comp_out_a].astype(np.int64, copy=False),
+                component_offsets=offsets,
+                inducing_event_idx=inducing_idx,
+                inducing_xyz_km=inducing_xyz_km,
+                ell_km=np.asarray([float(ell)], dtype=np.float32),
+                cover_r_km=np.asarray([float(r)], dtype=np.float32),
+                fixed_xyz=np.asarray([int(bool(fixed_xyz))], dtype=np.int8),
+                seed_strategy=np.asarray([seed_strategy], dtype=object),
+                max_dist_to_inducing_km=cov_out_a,
+            )
+            info(f"Wrote slowness_re inducing selection NPZ: {out_path_s}", section="LIKELIHOOD")
+            state.params["_slowness_re_inducing_selection_file_runtime"] = str(out_path_s)
+        except Exception as e:
+            warn(f"Could not write slowness_re inducing selection NPZ: {e}", section="LIKELIHOOD")
+
+
+@torch.no_grad()
+def _maybe_build_slowness_re_inducing_interpolation(state: "LocateState") -> None:
+    """
+    Stage-3: Build per-event inducing neighbor lists for slowness_re.
+
+    We store neighbor indices on-device for runtime use; kernel values in the NPZ (if written)
+    are a convenience only (slowness_re uses Matérn at runtime).
+    """
+    try:
+        if not bool(state.params.get("_slowness_re_enabled", False)):
+            return
+        if not bool(state.params.get("_slowness_re_inducing_plan_enable", False)):
+            return
+        if not bool(state.params.get("_slowness_re_inducing_plan_interpolation_enable", True)):
+            return
+        ell = float(state.params.get("_slowness_re_ell_km", 0.0))
+        if not (ell > 0.0):
+            return
+        m = int(state.params.get("_slowness_re_inducing_plan_interpolation_m", 4))
+        m = max(1, m)
+        fixed_xyz = bool(state.params.get("_slowness_re_inducing_fixed_xyz", True))
+        out_path = state.params.get("_slowness_re_inducing_plan_interpolation_outfile", None)
+    except Exception:
+        return
+
+    # If neighbor idx already present, do nothing (but only if Matérn weights are also available).
+    if getattr(state, "slowness_re_inducing_neighbor_idx", None) is not None and getattr(state, "slowness_re_inducing_neighbor_k_matern32", None) is not None:
+        return
+    if state.params.get("_slowness_re_inducing_neighbor_idx", None) is not None and state.params.get("_slowness_re_inducing_neighbor_k_matern32", None) is not None:
+        try:
+            state.slowness_re_inducing_neighbor_idx = state.params.get("_slowness_re_inducing_neighbor_idx")
+            state.slowness_re_inducing_neighbor_k = state.params.get("_slowness_re_inducing_neighbor_k", None)
+            state.slowness_re_inducing_neighbor_k_matern32 = state.params.get("_slowness_re_inducing_neighbor_k_matern32", None)
+            return
+        except Exception:
+            pass
+
+    # Load selection arrays from memory or file
+    comp_ids = state.params.get("_slowness_re_inducing_component_id", None)
+    comp_off = state.params.get("_slowness_re_inducing_component_offsets", None)
+    inducing_event_idx = state.params.get("_slowness_re_inducing_event_idx", None)
+    inducing_xyz_km = state.params.get("_slowness_re_inducing_xyz_km", None)
+    if comp_ids is None or comp_off is None or inducing_event_idx is None:
+        sel_path = state.params.get("_slowness_re_inducing_selection_file_runtime", None)
+        if sel_path is None:
+            sel_path = state.params.get("_slowness_re_inducing_plan_selection_outfile", None)
+        if sel_path is None:
+            warn("slowness_re interpolation requested but no inducing selection is available.", section="LIKELIHOOD")
+            return
+        try:
+            sel_path_s = str(sel_path)
+            if not os.path.isabs(sel_path_s):
+                base = str(state.params.get("checkpoint_dir", "."))
+                sel_path_s = os.path.join(base, sel_path_s)
+            data = np.load(sel_path_s, allow_pickle=True)
+            comp_ids = data["component_id"]
+            comp_off = data["component_offsets"]
+            inducing_event_idx = data["inducing_event_idx"]
+            if "inducing_xyz_km" in data:
+                inducing_xyz_km = data["inducing_xyz_km"]
+        except Exception as e:
+            warn(f"slowness_re interpolation requested but could not load selection NPZ: {e}", section="LIKELIHOOD")
+            return
+
+    try:
+        comp_ids = np.asarray(comp_ids, dtype=np.int64)
+        comp_off = np.asarray(comp_off, dtype=np.int64)
+        inducing_event_idx = np.asarray(inducing_event_idx, dtype=np.int64)
+        if inducing_xyz_km is not None:
+            inducing_xyz_km = np.asarray(inducing_xyz_km, dtype=np.float32)
+    except Exception:
+        return
+    if comp_ids.size == 0 or comp_off.size != comp_ids.size + 1 or inducing_event_idx.size == 0:
+        return
+
+    if getattr(state, "cluster_ids", None) is None:
+        return
+    try:
+        ev_comp = state.cluster_ids.detach().cpu().numpy().astype(np.int64, copy=False)
+    except Exception:
+        return
+    n_events = int(ev_comp.shape[0])
+
+    # MAP event coordinates (XYZ)
+    try:
+        X_map = (state.X_src.detach() + state.dX_src.detach())[:, :3].to(torch.float32).cpu().numpy()
+    except Exception:
+        return
+    if X_map.shape[0] != n_events:
+        return
+    P = X_map[:, :3].astype(np.float32, copy=False)
+
+    neigh_idx = np.full((n_events, m), -1, dtype=np.int64)
+    neigh_k = np.zeros((n_events, m), dtype=np.float32)
+    neigh_k_matern32 = np.zeros((n_events, m), dtype=np.float32)
+    t0 = time.time()
+    use_scipy = True
+    for bi, cid in enumerate(comp_ids.tolist()):
+        i0 = int(comp_off[bi]); i1 = int(comp_off[bi + 1])
+        if i1 <= i0:
+            continue
+        # Inducing locations for this component
+        Uc = None
+        try:
+            if fixed_xyz and inducing_xyz_km is not None and getattr(inducing_xyz_km, "ndim", 0) == 2 and int(inducing_xyz_km.shape[1]) >= 3:
+                Uc = np.asarray(inducing_xyz_km[i0:i1, :3]).astype(np.float32, copy=False)
+        except Exception:
+            Uc = None
+        if Uc is None:
+            U_ev = inducing_event_idx[i0:i1]
+            Uc = P[U_ev]
+        M = int(Uc.shape[0])
+        if M <= 0:
+            continue
+        ev_idx = np.flatnonzero(ev_comp == int(cid)).astype(np.int64, copy=False)
+        if ev_idx.size == 0:
+            continue
+        Pc = P[ev_idx]
+        kq = int(min(m, M))
+        if kq <= 0:
+            continue
+        try:
+            from scipy.spatial import cKDTree  # type: ignore
+            tree = cKDTree(Uc.astype("float64", copy=False))
+            try:
+                dists, nbrs = tree.query(Pc.astype("float64", copy=False), k=kq, workers=-1)
+            except TypeError:
+                try:
+                    dists, nbrs = tree.query(Pc.astype("float64", copy=False), k=kq, n_jobs=-1)  # type: ignore[call-arg]
+                except TypeError:
+                    dists, nbrs = tree.query(Pc.astype("float64", copy=False), k=kq)
+            if kq == 1:
+                dists = np.asarray(dists).reshape(-1, 1)
+                nbrs = np.asarray(nbrs).reshape(-1, 1)
+        except Exception:
+            use_scipy = False
+            Uc_f = Uc.astype(np.float32, copy=False)
+            Pc_f = Pc.astype(np.float32, copy=False)
+            nbrs = np.empty((Pc_f.shape[0], kq), dtype=np.int64)
+            dists = np.empty((Pc_f.shape[0], kq), dtype=np.float32)
+            chunk = 8192
+            for s0 in range(0, Pc_f.shape[0], chunk):
+                s1 = min(s0 + chunk, Pc_f.shape[0])
+                Q = Pc_f[s0:s1]
+                q2 = (Q * Q).sum(axis=1, keepdims=True)
+                u2 = (Uc_f * Uc_f).sum(axis=1, keepdims=True).T
+                d2 = q2 + u2 - 2.0 * (Q @ Uc_f.T)
+                d2 = np.maximum(d2, 0.0)
+                part = np.argpartition(d2, kth=kq - 1, axis=1)[:, :kq]
+                d2_part = np.take_along_axis(d2, part, axis=1)
+                ord2 = np.argsort(d2_part, axis=1)
+                part_sorted = np.take_along_axis(part, ord2, axis=1)
+                d2_sorted = np.take_along_axis(d2_part, ord2, axis=1)
+                nbrs[s0:s1, :] = part_sorted
+                dists[s0:s1, :] = np.sqrt(d2_sorted).astype(np.float32, copy=False)
+
+        gidx = (np.asarray(nbrs, dtype=np.int64) + int(i0)).astype(np.int64, copy=False)
+        d_f = np.asarray(dists, dtype=np.float32)
+        # Store an RBF value as a placeholder (not used by slowness_re runtime)...
+        k_val = np.exp(-0.5 * (d_f / float(ell)) ** 2).astype(np.float32, copy=False)
+        # ...and store Matérn(3/2) (used by slowness_re runtime).
+        a = np.float32(np.sqrt(3.0) / float(ell))
+        x = (a * d_f).astype(np.float32, copy=False)
+        k_m32 = ((1.0 + x) * np.exp(-x)).astype(np.float32, copy=False)
+        neigh_idx[ev_idx, :kq] = gidx
+        neigh_k[ev_idx, :kq] = k_val
+        neigh_k_matern32[ev_idx, :kq] = k_m32
+
+    dt_s = time.time() - t0
+    info(
+        f"Inducing interpolation (slowness_re): events={n_events:,} m={m} dims=xyz ell_km={ell:g} "
+        f"backend={'scipy_ckdtree' if use_scipy else 'bruteforce'} dt={dt_s:.1f}s",
+        section="LIKELIHOOD",
+    )
+
+    # Keep in memory for runtime
+    try:
+        dev = state.device
+        state.slowness_re_inducing_neighbor_idx = torch.from_numpy(neigh_idx).to(device=dev, dtype=torch.int64)
+        state.slowness_re_inducing_neighbor_k = torch.from_numpy(neigh_k).to(device=dev, dtype=torch.float32)
+        state.slowness_re_inducing_neighbor_k_matern32 = torch.from_numpy(neigh_k_matern32).to(device=dev, dtype=torch.float32)
+        try:
+            state.slowness_re_inducing_event_idx = torch.from_numpy(inducing_event_idx).to(device=dev, dtype=torch.int64)
+        except Exception:
+            state.slowness_re_inducing_event_idx = None
+        try:
+            if inducing_xyz_km is not None:
+                state.slowness_re_inducing_xyz_km = torch.from_numpy(np.asarray(inducing_xyz_km, dtype=np.float32)).to(device=dev, dtype=torch.float32)
+            else:
+                state.slowness_re_inducing_xyz_km = None
+        except Exception:
+            state.slowness_re_inducing_xyz_km = None
+        state.params["_slowness_re_inducing_neighbor_idx"] = state.slowness_re_inducing_neighbor_idx
+        state.params["_slowness_re_inducing_neighbor_k"] = state.slowness_re_inducing_neighbor_k
+        state.params["_slowness_re_inducing_neighbor_k_matern32"] = state.slowness_re_inducing_neighbor_k_matern32
+        state.params["_slowness_re_inducing_event_idx_t"] = state.slowness_re_inducing_event_idx
+        state.params["_slowness_re_inducing_xyz_km_t"] = state.slowness_re_inducing_xyz_km
+        state.params["_slowness_re_inducing_interpolation_in_memory"] = True
+    except Exception:
+        pass
+
+    # Optional NPZ write
+    try:
+        out_path_s = str(out_path) if (out_path is not None and str(out_path).strip() != "") else str("")
+        if out_path_s != "":
+            if not os.path.isabs(out_path_s):
+                base = str(state.params.get("checkpoint_dir", "."))
+                out_path_s = os.path.join(base, out_path_s)
+            os.makedirs(os.path.dirname(out_path_s) or ".", exist_ok=True)
+            np.savez_compressed(
+                out_path_s,
+                component_id=comp_ids,
+                component_offsets=comp_off,
+                inducing_event_idx=inducing_event_idx,
+                inducing_xyz_km=(inducing_xyz_km if inducing_xyz_km is not None else np.zeros((0, 3), dtype=np.float32)),
+                event_component_id=ev_comp.astype(np.int64, copy=False),
+                neighbor_inducing_global_idx=neigh_idx,
+                neighbor_kernel=neigh_k,
+                neighbor_kernel_matern32=neigh_k_matern32,
+                ell_km=np.asarray([float(ell)], dtype=np.float32),
+                fixed_xyz=np.asarray([int(bool(fixed_xyz))], dtype=np.int8),
+            )
+            info(f"Wrote slowness_re inducing interpolation NPZ: {out_path_s}", section="LIKELIHOOD")
+            state.params["_slowness_re_inducing_interpolation_file_runtime"] = str(out_path_s)
+    except Exception as e:
+        warn(f"Could not write slowness_re inducing interpolation NPZ: {e}", section="LIKELIHOOD")
+
+
+@torch.no_grad()
+def _maybe_init_slowness_re(state: "LocateState") -> None:
+    """
+    Initialize inducing K_UU blocks and optional FITC diagonal residual for slowness_re.
+
+    This prepares small per-component matrices that the collapsed likelihood can use at runtime.
+    """
+    try:
+        if not bool(state.params.get("_slowness_re_enabled", False)):
+            return
+    except Exception:
+        return
+
+    # If already initialized (resume), keep existing.
+    if state.params.get("_slowness_re_inducing_K_blocks", None) is not None and state.params.get("_slowness_re_inducing_offsets", None) is not None:
+        return
+
+    try:
+        ell_km = float(state.params.get("_slowness_re_ell_km", 0.0))
+        if not (ell_km > 0.0):
+            return
+        jitter = float(state.params.get("_slowness_re_inducing_jitter", 1e-6))
+        if not math.isfinite(jitter) or jitter < 0.0:
+            jitter = 1e-6
+        fixed_xyz = bool(state.params.get("_slowness_re_inducing_fixed_xyz", True))
+    except Exception:
+        return
+
+    # Need interpolation (neighbor idx) and selection (offsets + inducing idx/xyz)
+    nei_idx = getattr(state, "slowness_re_inducing_neighbor_idx", None)
+    if nei_idx is None:
+        nei_idx = state.params.get("_slowness_re_inducing_neighbor_idx", None)
+    if not isinstance(nei_idx, torch.Tensor):
+        # Try loading from NPZ if present
+        ip = state.params.get("_slowness_re_inducing_interpolation_file_runtime", None) or state.params.get("_slowness_re_inducing_plan_interpolation_outfile", None)
+        if ip is not None:
+            try:
+                ip_s = str(ip)
+                if not os.path.isabs(ip_s):
+                    base = str(state.params.get("checkpoint_dir", "."))
+                    ip_s = os.path.join(base, ip_s)
+                data = np.load(ip_s, allow_pickle=True)
+                neigh_idx_np = np.asarray(data["neighbor_inducing_global_idx"], dtype=np.int64)
+                dev = state.device
+                nei_idx = torch.from_numpy(neigh_idx_np).to(device=dev, dtype=torch.int64)
+                state.slowness_re_inducing_neighbor_idx = nei_idx
+                state.params["_slowness_re_inducing_neighbor_idx"] = nei_idx
+            except Exception:
+                nei_idx = None
+    if not isinstance(nei_idx, torch.Tensor):
+        return
+
+    comp_ids = state.params.get("_slowness_re_inducing_component_id", None)
+    comp_off = state.params.get("_slowness_re_inducing_component_offsets", None)
+    inducing_event_idx = state.params.get("_slowness_re_inducing_event_idx", None)
+    inducing_xyz_km = state.params.get("_slowness_re_inducing_xyz_km", None)
+    if comp_ids is None or comp_off is None or inducing_event_idx is None:
+        sel_path = state.params.get("_slowness_re_inducing_selection_file_runtime", None) or state.params.get("_slowness_re_inducing_plan_selection_outfile", None)
+        if sel_path is None:
+            return
+        try:
+            sel_path_s = str(sel_path)
+            if not os.path.isabs(sel_path_s):
+                base = str(state.params.get("checkpoint_dir", "."))
+                sel_path_s = os.path.join(base, sel_path_s)
+            data = np.load(sel_path_s, allow_pickle=True)
+            comp_ids = data["component_id"]
+            comp_off = data["component_offsets"]
+            inducing_event_idx = data["inducing_event_idx"]
+            if "inducing_xyz_km" in data:
+                inducing_xyz_km = data["inducing_xyz_km"]
+        except Exception:
+            return
+
+    try:
+        comp_ids = np.asarray(comp_ids, dtype=np.int64)
+        comp_off = np.asarray(comp_off, dtype=np.int64)
+        inducing_event_idx = np.asarray(inducing_event_idx, dtype=np.int64)
+        if inducing_xyz_km is not None:
+            inducing_xyz_km = np.asarray(inducing_xyz_km, dtype=np.float32)
+    except Exception:
+        return
+    if comp_ids.size == 0 or comp_off.size != comp_ids.size + 1:
+        return
+
+    # MAP event XYZ in km (for non-fixed inducing geometry)
+    try:
+        X_map = (state.X_src.detach() + state.dX_src.detach())[:, :3].to(torch.float32).cpu().numpy()
+        P = X_map.astype(np.float32, copy=False)
+    except Exception:
+        return
+
+    dev = state.device
+
+    def _matern32_from_dist(D: torch.Tensor) -> torch.Tensor:
+        a = float(np.sqrt(3.0) / float(ell_km))
+        x = (a * D).to(torch.float32)
+        return (1.0 + x) * torch.exp(-x)
+
+    # Build K_UU blocks (per component)
+    t0 = time.time()
+    K_blocks: list[torch.Tensor] = []
+    jitter_escalated_blocks = 0
+    jitter_used_max = float(jitter)
+    for bi, cid in enumerate(comp_ids.tolist()):
+        i0 = int(comp_off[bi]); i1 = int(comp_off[bi + 1])
+        if i1 <= i0:
+            K_blocks.append(torch.zeros((0, 0), device=dev, dtype=torch.float32))
+            continue
+        Uc_np = None
+        try:
+            if fixed_xyz and inducing_xyz_km is not None and getattr(inducing_xyz_km, "ndim", 0) == 2 and int(inducing_xyz_km.shape[1]) >= 3:
+                Uc_np = np.asarray(inducing_xyz_km[i0:i1, :3]).astype(np.float32, copy=False)
+        except Exception:
+            Uc_np = None
+        if Uc_np is None:
+            U_ev = inducing_event_idx[i0:i1]
+            Uc_np = np.asarray(P[U_ev, :3]).astype(np.float32, copy=False)
+        Uc = torch.from_numpy(Uc_np).to(device=dev, dtype=torch.float32)
+        D = torch.cdist(Uc, Uc).to(torch.float32)
+        K0 = _matern32_from_dist(D)
+        K0 = 0.5 * (K0 + K0.transpose(0, 1))
+        mK = int(K0.shape[0])
+        if mK <= 0:
+            K = K0
+        else:
+            I = torch.eye(mK, device=dev, dtype=K0.dtype)
+            j0 = float(jitter)
+            j_used = j0
+            K = K0 + (j_used * I)
+            try:
+                L, chol_info = torch.linalg.cholesky_ex(K)
+                if int(chol_info.item()) != 0:
+                    max_tries = 6
+                    for t in range(1, max_tries + 1):
+                        j_used = j0 * (10.0 ** t)
+                        K = K0 + (j_used * I)
+                        L, chol_info = torch.linalg.cholesky_ex(K)
+                        if int(chol_info.item()) == 0:
+                            break
+            except Exception:
+                pass
+            if j_used > j0:
+                jitter_escalated_blocks += 1
+            if j_used > jitter_used_max:
+                jitter_used_max = float(j_used)
+        K_blocks.append(K)
+
+    offs_t = torch.from_numpy(comp_off).to(device=dev, dtype=torch.int64)
+    state.params["_slowness_re_inducing_offsets"] = offs_t
+    state.params["_slowness_re_inducing_K_blocks"] = K_blocks
+    state.slowness_re_inducing_offsets = offs_t
+    state.slowness_re_inducing_K_blocks = K_blocks
+
+    # Also build a single block-diagonal K_UU over all inducing points. This lets modeling.py solve
+    # per station-phase group without additionally splitting by connected component (still no coupling
+    # across components because K_UU is block diagonal and neighbor supports are disjoint).
+    try:
+        if K_blocks:
+            K_full = torch.block_diag(*[Kb.to(device=dev, dtype=torch.float32) for Kb in K_blocks])
+        else:
+            K_full = torch.zeros((0, 0), device=dev, dtype=torch.float32)
+        state.params["_slowness_re_inducing_K_full"] = K_full
+        state.slowness_re_inducing_K_full = K_full
+        # Also precompute (K_full ⊗ I3) as a block-diagonal matrix to avoid rebuilding it per-group.
+        try:
+            K_full3 = torch.block_diag(K_full, K_full, K_full)
+        except Exception:
+            K_full3 = None
+        state.params["_slowness_re_inducing_K_full_3"] = K_full3
+        state.slowness_re_inducing_K_full_3 = K_full3
+    except Exception:
+        pass
+
+    # Build comp_id -> block index mapping for O(1) lookup at runtime.
+    try:
+        if getattr(state, "cluster_counts", None) is not None:
+            n_comp_total = int(state.cluster_counts.numel())
+        else:
+            n_comp_total = int(comp_ids.max() + 1)
+        comp_to_block = np.full((n_comp_total,), -1, dtype=np.int64)
+        for bi, cid in enumerate(comp_ids.tolist()):
+            if 0 <= int(cid) < int(n_comp_total):
+                comp_to_block[int(cid)] = int(bi)
+        comp_to_block_t = torch.from_numpy(comp_to_block).to(device=dev, dtype=torch.int64)
+        state.params["_slowness_re_inducing_comp_to_block"] = comp_to_block_t
+        state.slowness_re_inducing_comp_to_block = comp_to_block_t
+    except Exception:
+        pass
+
+    dt_init = time.time() - t0
+    info(
+        f"Initialized slowness_re inducing K_UU: blocks={int(comp_ids.size)} sum_M={int(comp_off[-1]):,} "
+        f"ell_km={ell_km:g} jitter={float(jitter):.3g} jitter_used_max={float(jitter_used_max):.3g} "
+        f"jitter_escalated_blocks={int(jitter_escalated_blocks)} dt={dt_init:.1f}s",
+        section="LIKELIHOOD",
+    )
+
+    # Optional FITC diagonal residual (computed at MAP; broadcast in DDP)
+    fitc_enable = bool(state.params.get("_slowness_re_inducing_fitc_enable", False))
+    if fitc_enable:
+        ddp_on = _ddp_enabled(state.params)
+        ddp_main = (not ddp_on) or _ddp_is_main(state.params)
+        dist_ok = False
+        dist = None
+        if ddp_on:
+            try:
+                import torch.distributed as dist  # type: ignore
+                dist_ok = bool(dist.is_available()) and bool(dist.is_initialized())
+            except Exception:
+                dist_ok = False
+                dist = None
+        if ddp_on and dist_ok and (not ddp_main):
+            try:
+                n_ev = int(nei_idx.shape[0])
+                q_t = torch.empty((n_ev,), device=dev, dtype=torch.float32)
+                r_t = torch.empty((n_ev,), device=dev, dtype=torch.float32)
+                dist.broadcast(q_t, src=0)  # type: ignore[union-attr]
+                dist.broadcast(r_t, src=0)  # type: ignore[union-attr]
+                state.params["_slowness_re_inducing_fitc_q_diag"] = q_t
+                state.params["_slowness_re_inducing_fitc_resid"] = r_t
+                state.slowness_re_inducing_fitc_q_diag = q_t
+                state.slowness_re_inducing_fitc_resid = r_t
+            except Exception as e:
+                warn(f"FITC diag residual broadcast failed on non-main rank (slowness_re): {e}", section="LIKELIHOOD")
+                ddp_main = True
+                dist_ok = False
+
+        if (not ddp_on) or ddp_main:
+            try:
+                t_fitc0 = time.time()
+                idx_np = nei_idx.detach().cpu().numpy().astype(np.int64, copy=False)
+                offs_np = comp_off.astype(np.int64, copy=False)
+                K_np = [Kb.detach().cpu().numpy().astype(np.float32, copy=False) for Kb in K_blocks]
+                n_ev = int(idx_np.shape[0])
+                q_diag_np = np.zeros((n_ev,), dtype=np.float32)
+
+                # Inducing point coordinates (XYZ) at MAP
+                if fixed_xyz and inducing_xyz_km is not None and getattr(inducing_xyz_km, "ndim", 0) == 2 and int(inducing_xyz_km.shape[1]) >= 3:
+                    P_ind = inducing_xyz_km.astype(np.float32, copy=False)
+                else:
+                    P_ind = P[inducing_event_idx, :3].astype(np.float32, copy=False)
+
+                a = np.float32(np.sqrt(3.0) / float(ell_km))
+                for e in range(n_ev):
+                    idx_row = idx_np[e]
+                    m = idx_row >= 0
+                    if not bool(m.any()):
+                        q = 0.0
+                    else:
+                        idxv = idx_row[m]
+                        xe = P[int(e), :3]
+                        xu = P_ind[idxv].astype(np.float32, copy=False)
+                        d = np.linalg.norm(xu - xe[None, :], axis=1).astype(np.float32, copy=False)
+                        x = a * d
+                        kv = ((1.0 + x) * np.exp(-x)).astype(np.float32, copy=False)
+                        g0 = int(idxv[0])
+                        bi = int(np.searchsorted(offs_np[1:], g0, side="right"))
+                        if bi < 0 or bi >= len(K_np):
+                            q = 0.0
+                        else:
+                            i0 = int(offs_np[bi])
+                            loc = (idxv - i0).astype(np.int64, copy=False)
+                            try:
+                                Kmm = K_np[bi][np.ix_(loc, loc)]
+                                sol = np.linalg.solve(Kmm, kv)
+                                q = float(kv.dot(sol))
+                            except Exception:
+                                q = 0.0
+                    q_diag_np[e] = float(q)
+
+                q_diag_np = np.clip(q_diag_np, 0.0, 1.0).astype(np.float32, copy=False)
+                resid_np = np.maximum(0.0, 1.0 - q_diag_np).astype(np.float32, copy=False)
+                q_t = torch.from_numpy(q_diag_np).to(device=dev, dtype=torch.float32)
+                r_t = torch.from_numpy(resid_np).to(device=dev, dtype=torch.float32)
+                state.params["_slowness_re_inducing_fitc_q_diag"] = q_t
+                state.params["_slowness_re_inducing_fitc_resid"] = r_t
+                state.slowness_re_inducing_fitc_q_diag = q_t
+                state.slowness_re_inducing_fitc_resid = r_t
+
+                if ddp_on and dist_ok:
+                    try:
+                        dist.broadcast(q_t, src=0)  # type: ignore[union-attr]
+                        dist.broadcast(r_t, src=0)  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+
+                dt_fitc = time.time() - t_fitc0
+                info(
+                    f"FITC diag residual (slowness_re): "
+                    f"q_diag[min/mean/max]={float(q_diag_np.min()):.3g}/{float(q_diag_np.mean()):.3g}/{float(q_diag_np.max()):.3g} "
+                    f"resid[min/mean/max]={float(resid_np.min()):.3g}/{float(resid_np.mean()):.3g}/{float(resid_np.max()):.3g} "
+                    f"(dt={dt_fitc:.2f}s)",
+                    section="LIKELIHOOD",
+                )
+            except Exception as e:
+                warn(f"FITC diag residual computation failed (slowness_re): {e}", section="LIKELIHOOD")
 
 
 @torch.no_grad()
@@ -3037,11 +3824,11 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
         return
 
     mode = str(state.params.get("_shared_event_latent_parameterization", "full")).strip().lower()
-    if mode not in {"full", "inducing_gp", "graph_gmrf"}:
+    if mode not in {"full", "inducing_gp", "slowness_inducing_gp", "graph_gmrf"}:
         mode = "full"
 
     # If already initialized (e.g., resume), keep existing
-    if mode == "inducing_gp":
+    if mode in {"inducing_gp", "slowness_inducing_gp"}:
         fitc_enable = bool(state.params.get("_shared_event_latent_inducing_fitc_enable", False))
         already = (
             getattr(state, "shared_event_latent_b", None) is not None
@@ -3190,16 +3977,53 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
     knn = min(int(knn), max(1, n_events - 1))
 
     # --- inducing_gp parameterization ---
-    if mode == "inducing_gp":
+    # --- slowness_inducing_gp parameterization ---
+    if mode in {"inducing_gp", "slowness_inducing_gp"}:
         # This mode uses Stage-2/3 inducing_plan artifacts (selection + interpolation) to build:
         # - per-event sparse neighbor lists into the concatenated inducing list
         # - per-component GP prior blocks K_UU on inducing coefficients
         dev = state.device
         ell_km = float(state.params.get("_shared_event_latent_ell_km", 0.0))
         if not (ell_km > 0.0):
-            warn("shared_event_latent inducing_gp requires ell_km > 0; disabling.", section="LIKELIHOOD")
+            warn("shared_event_latent inducing_gp/slowness_inducing_gp requires ell_km > 0; disabling.", section="LIKELIHOOD")
             state.params["_shared_event_latent_enabled"] = False
             return
+
+        # Prefer in-memory artifacts (generated earlier in this run) to avoid NPZ disk round-trips.
+        comp_ids = None
+        comp_off = None
+        inducing_event_idx = None
+        inducing_xyz_km = None
+        use_xyz = bool(state.params.get("_shared_event_latent_inducing_use_xyz_runtime", False))
+        fixed_xyz = bool(state.params.get("_shared_event_latent_inducing_fixed_xyz", False))
+        have_interp_mem = False
+        try:
+            comp_ids = state.params.get("_shared_event_latent_inducing_component_id", None)
+            comp_off = state.params.get("_shared_event_latent_inducing_component_offsets", None)
+            inducing_event_idx = state.params.get("_shared_event_latent_inducing_event_idx", None)
+            inducing_xyz_km = state.params.get("_shared_event_latent_inducing_xyz_km", None)
+            if comp_ids is not None and comp_off is not None and inducing_event_idx is not None:
+                comp_ids = np.asarray(comp_ids, dtype=np.int64)
+                comp_off = np.asarray(comp_off, dtype=np.int64)
+                inducing_event_idx = np.asarray(inducing_event_idx, dtype=np.int64)
+                if inducing_xyz_km is not None:
+                    inducing_xyz_km = np.asarray(inducing_xyz_km, dtype=np.float32)
+        except Exception:
+            comp_ids = None
+            comp_off = None
+            inducing_event_idx = None
+            inducing_xyz_km = None
+        try:
+            have_interp_mem = bool(
+                isinstance(getattr(state, "shared_event_latent_inducing_neighbor_idx", None), torch.Tensor)
+                and int(getattr(state, "shared_event_latent_inducing_neighbor_idx").shape[0]) == int(state.X_src.shape[0])
+                and (
+                    (mode == "slowness_inducing_gp")
+                    or isinstance(getattr(state, "shared_event_latent_inducing_neighbor_k", None), torch.Tensor)
+                )
+            )
+        except Exception:
+            have_interp_mem = False
 
         # Resolve selection/interpolation file paths (relative to checkpoint_dir)
         def _resolve_path(v):
@@ -3223,67 +4047,86 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
         if interp_path_rt:
             interp_path = str(interp_path_rt)
 
-        if not sel_path or not os.path.exists(sel_path):
-            raise ValueError(
-                "shared_event_latent.parameterization='inducing_gp' requires an inducing selection NPZ. "
-                "Enable model.likelihood.shared_event_latent.inducing_plan.select=true (Stage 2) or provide the file. "
-                f"Expected at: {sel_path}"
-            )
-        if not interp_path or not os.path.exists(interp_path):
-            raise ValueError(
-                "shared_event_latent.parameterization='inducing_gp' requires an inducing interpolation NPZ. "
-                "Enable model.likelihood.shared_event_latent.inducing_plan.interpolation.enabled=true (Stage 3) or provide the file. "
-                f"Expected at: {interp_path}"
-            )
+        # Load selection if not already available in memory
+        if comp_ids is None or comp_off is None or inducing_event_idx is None:
+            if not sel_path or not os.path.exists(sel_path):
+                raise ValueError(
+                    f"shared_event_latent.mode='{mode}' requires an inducing selection. "
+                    "Either run Stage 2 (inducing_plan.select=true) in this run or provide the NPZ. "
+                    f"Expected at: {sel_path}"
+                )
+            try:
+                sel = np.load(sel_path, allow_pickle=True)
+                comp_ids = np.asarray(sel["component_id"], dtype=np.int64)
+                comp_off = np.asarray(sel["component_offsets"], dtype=np.int64)
+                inducing_event_idx = np.asarray(sel["inducing_event_idx"], dtype=np.int64)
+                if "inducing_xyz_km" in sel:
+                    try:
+                        inducing_xyz_km = np.asarray(sel["inducing_xyz_km"], dtype=np.float32)
+                    except Exception:
+                        inducing_xyz_km = None
+                use_xyz = False
+                if "use_xyz" in sel:
+                    try:
+                        use_xyz = bool(int(np.asarray(sel["use_xyz"]).reshape(-1)[0]))
+                    except Exception:
+                        use_xyz = False
+            except Exception as e:
+                raise ValueError(f"Failed to load inducing selection NPZ '{sel_path}': {e}")
 
-        # Load selection
-        try:
-            sel = np.load(sel_path, allow_pickle=True)
-            comp_ids = np.asarray(sel["component_id"], dtype=np.int64)
-            comp_off = np.asarray(sel["component_offsets"], dtype=np.int64)
-            inducing_event_idx = np.asarray(sel["inducing_event_idx"], dtype=np.int64)
-            use_xyz = False
-            if "use_xyz" in sel:
-                try:
-                    use_xyz = bool(int(np.asarray(sel["use_xyz"]).reshape(-1)[0]))
-                except Exception:
-                    use_xyz = False
-        except Exception as e:
-            raise ValueError(f"Failed to load inducing selection NPZ '{sel_path}': {e}")
+        if mode == "slowness_inducing_gp":
+            # Force XYZ geometry for slowness-vector GP.
+            use_xyz = True
 
-        if comp_ids.size == 0 or comp_off.size != comp_ids.size + 1:
-            raise ValueError(f"Invalid inducing selection NPZ '{sel_path}': bad component_offsets/component_id")
-        if inducing_event_idx.size == 0:
-            raise ValueError(f"Invalid inducing selection NPZ '{sel_path}': empty inducing_event_idx")
+        if comp_ids is None or comp_off is None or inducing_event_idx is None:
+            raise ValueError("Missing inducing selection arrays (component_id/component_offsets/inducing_event_idx).")
+        if int(comp_ids.size) == 0 or int(comp_off.size) != int(comp_ids.size) + 1:
+            raise ValueError("Invalid inducing selection arrays: bad component_offsets/component_id.")
+        if int(inducing_event_idx.size) == 0:
+            raise ValueError("Invalid inducing selection arrays: empty inducing_event_idx.")
 
-        # Load interpolation
-        try:
-            itp = np.load(interp_path, allow_pickle=True)
-            neigh_idx_np = np.asarray(itp["neighbor_inducing_global_idx"], dtype=np.int64)
-            neigh_k_np = np.asarray(itp["neighbor_kernel"], dtype=np.float32)
-        except Exception as e:
-            raise ValueError(f"Failed to load inducing interpolation NPZ '{interp_path}': {e}")
+        # Interpolation: if in-memory neighbor tensors exist, keep them; otherwise load from NPZ
+        if not have_interp_mem:
+            if not interp_path or not os.path.exists(interp_path):
+                raise ValueError(
+                    f"shared_event_latent.mode='{mode}' requires an inducing interpolation. "
+                    "Either run Stage 3 (inducing_plan.interpolation.enabled=true) in this run or provide the NPZ. "
+                    f"Expected at: {interp_path}"
+                )
+            try:
+                itp = np.load(interp_path, allow_pickle=True)
+                neigh_idx_np = np.asarray(itp["neighbor_inducing_global_idx"], dtype=np.int64)
+                neigh_k_np = np.asarray(itp["neighbor_kernel"], dtype=np.float32)
+            except Exception as e:
+                raise ValueError(f"Failed to load inducing interpolation NPZ '{interp_path}': {e}")
 
         n_events = int(state.X_src.shape[0])
-        if neigh_idx_np.ndim != 2 or neigh_k_np.shape != neigh_idx_np.shape:
-            raise ValueError(f"Invalid inducing interpolation NPZ '{interp_path}': neighbor arrays shape mismatch")
-        if int(neigh_idx_np.shape[0]) != int(n_events):
-            raise ValueError(
-                f"Invalid inducing interpolation NPZ '{interp_path}': n_events mismatch "
-                f"(file has {int(neigh_idx_np.shape[0])}, run has {n_events})"
-            )
         M_total = int(inducing_event_idx.size)
-        if int(neigh_idx_np.max(initial=-1)) >= M_total:
-            raise ValueError(
-                f"Invalid inducing interpolation NPZ '{interp_path}': neighbor indices exceed inducing list "
-                f"(max idx {int(neigh_idx_np.max())} vs M_total {M_total})"
-            )
+        if not have_interp_mem:
+            if neigh_idx_np.ndim != 2 or neigh_k_np.shape != neigh_idx_np.shape:
+                raise ValueError(f"Invalid inducing interpolation NPZ '{interp_path}': neighbor arrays shape mismatch")
+            if int(neigh_idx_np.shape[0]) != int(n_events):
+                raise ValueError(
+                    f"Invalid inducing interpolation NPZ '{interp_path}': n_events mismatch "
+                    f"(file has {int(neigh_idx_np.shape[0])}, run has {n_events})"
+                )
+            if int(neigh_idx_np.max(initial=-1)) >= M_total:
+                raise ValueError(
+                    f"Invalid inducing interpolation NPZ '{interp_path}': neighbor indices exceed inducing list "
+                    f"(max idx {int(neigh_idx_np.max())} vs M_total {M_total})"
+                )
+            # Store interpolation tensors on device
+            state.shared_event_latent_inducing_neighbor_idx = torch.from_numpy(neigh_idx_np).to(device=dev, dtype=torch.int64)
+            state.shared_event_latent_inducing_neighbor_k = torch.from_numpy(neigh_k_np).to(device=dev, dtype=torch.float32)
+        # Store inducing event indices (needed for slowness_inducing_gp runtime kernel weights).
+        try:
+            state.shared_event_latent_inducing_event_idx = torch.from_numpy(inducing_event_idx).to(device=dev, dtype=torch.int64)
+        except Exception:
+            state.shared_event_latent_inducing_event_idx = None
 
-        # Store interpolation tensors on device
-        state.shared_event_latent_inducing_neighbor_idx = torch.from_numpy(neigh_idx_np).to(device=dev, dtype=torch.int64)
-        state.shared_event_latent_inducing_neighbor_k = torch.from_numpy(neigh_k_np).to(device=dev, dtype=torch.float32)
-
-        # Build per-component K_UU blocks on device (RBF kernel with ell_km + small jitter)
+        # Build per-component K_UU blocks on device (kernel + small jitter)
+        # - inducing_gp: RBF
+        # - slowness_inducing_gp: Matérn(3/2)
         # MAP coordinates in km
         X_map = (state.X_src.detach() + state.dX_src.detach())[:, :3].to(torch.float32).cpu().numpy()
         if use_xyz:
@@ -3292,6 +4135,38 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
         else:
             P = X_map[:, :2].astype(np.float32, copy=False)
             dim_label = "xy"
+
+        # Resolve fixed inducing XYZ locations (km) from selection, if available.
+        # For Option-B (fixed_xyz), we treat these as fixed inducing points U in space.
+        inducing_xyz_np = None
+        try:
+            if inducing_xyz_km is not None and getattr(inducing_xyz_km, "ndim", 0) == 2 and int(inducing_xyz_km.shape[0]) == int(inducing_event_idx.size) and int(inducing_xyz_km.shape[1]) >= 3:
+                inducing_xyz_np = np.asarray(inducing_xyz_km, dtype=np.float32).astype(np.float32, copy=False)
+        except Exception:
+            inducing_xyz_np = None
+        if inducing_xyz_np is None:
+            # Backward-compatible: derive inducing XYZ from the MAP positions of inducing event indices.
+            try:
+                inducing_xyz_np = X_map[inducing_event_idx, :3].astype(np.float32, copy=False)
+            except Exception:
+                inducing_xyz_np = None
+        # Keep inducing XYZ on device for runtime kernels (especially slowness_inducing_gp).
+        try:
+            if inducing_xyz_np is not None:
+                state.shared_event_latent_inducing_xyz_km = torch.from_numpy(inducing_xyz_np).to(device=dev, dtype=torch.float32)
+            else:
+                state.shared_event_latent_inducing_xyz_km = None
+        except Exception:
+            state.shared_event_latent_inducing_xyz_km = None
+
+        def _kernel_from_dist(D: torch.Tensor) -> torch.Tensor:
+            if mode == "slowness_inducing_gp":
+                # Matérn ν=3/2: (1 + √3 r/ℓ) exp(-√3 r/ℓ)
+                a = (math.sqrt(3.0) / float(ell_km))
+                x = (a * D).to(torch.float32)
+                return (1.0 + x) * torch.exp(-x)
+            # RBF: exp(-0.5 (r/ℓ)^2)
+            return torch.exp(-0.5 * (D / float(ell_km)).square())
 
         jitter = float(state.params.get("_shared_event_latent_inducing_jitter", 1e-6))
         # Require at least tiny numerical jitter so K_UU is strictly PD (proper prior over inducing coeffs).
@@ -3311,11 +4186,15 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
             if i1 <= i0:
                 K_blocks.append(torch.zeros((0, 0), device=dev, dtype=torch.float32))
                 continue
-            U_ev = inducing_event_idx[i0:i1]
-            Uc = torch.from_numpy(P[U_ev]).to(device=dev, dtype=torch.float32)
+            if fixed_xyz and inducing_xyz_np is not None:
+                Uc_np = inducing_xyz_np[i0:i1, : int(P.shape[1])]
+                Uc = torch.from_numpy(Uc_np).to(device=dev, dtype=torch.float32)
+            else:
+                U_ev = inducing_event_idx[i0:i1]
+                Uc = torch.from_numpy(P[U_ev]).to(device=dev, dtype=torch.float32)
             # Pairwise distances (M,M)
             D = torch.cdist(Uc, Uc).to(torch.float32)
-            K0 = torch.exp(-0.5 * (D / float(ell_km)).square())
+            K0 = _kernel_from_dist(D)
             # Enforce symmetry explicitly (GPU cdist can be slightly asymmetric in float32).
             K0 = 0.5 * (K0 + K0.transpose(0, 1))
             mK = int(K0.shape[0])
@@ -3396,53 +4275,131 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
 
         # Stage 5 (FITC): compute diagonal residual Λ_ee = max(0, 1 - Q_ee) where
         # Q_ee ≈ K_eU K_UU^{-1} K_Ue, approximated using the same m-neighbor subset as interpolation.
+        #
+        # Notes:
+        # - For inducing_gp, interpolation NPZ stores RBF kernel values; we reuse them here.
+        # - For slowness_inducing_gp, we use Matérn(3/2) in XYZ and recompute k(e,U) at MAP because
+        #   the interpolation NPZ kernel values are RBF (and slowness mode uses a different kernel).
         fitc_enable = bool(state.params.get("_shared_event_latent_inducing_fitc_enable", False))
         if fitc_enable:
-            try:
-                t_fitc0 = time.time()
-                idx_np = state.shared_event_latent_inducing_neighbor_idx.detach().cpu().numpy().astype(np.int64, copy=False)
-                k_np = state.shared_event_latent_inducing_neighbor_k.detach().cpu().numpy().astype(np.float32, copy=False)
-                offs_np = comp_off.astype(np.int64, copy=False)
-                K_np = [Kb.detach().cpu().numpy().astype(np.float32, copy=False) for Kb in K_blocks]
-                n_ev = int(idx_np.shape[0])
-                q_diag_np = np.zeros((n_ev,), dtype=np.float32)
-                for e in range(n_ev):
-                    idx_row = idx_np[e]
-                    k_row = k_np[e]
-                    m = idx_row >= 0
-                    if not bool(m.any()):
-                        q = 0.0
+            # DDP optimization: compute FITC diag once on rank0, then broadcast to all ranks.
+            ddp_on = _ddp_enabled(state.params)
+            ddp_main = (not ddp_on) or _ddp_is_main(state.params)
+            dist_ok = False
+            dist = None
+            if ddp_on:
+                try:
+                    import torch.distributed as dist  # type: ignore
+                    dist_ok = bool(dist.is_available()) and bool(dist.is_initialized())
+                except Exception:
+                    dist_ok = False
+                    dist = None
+
+            if ddp_on and dist_ok and (not ddp_main):
+                # Non-rank0: receive and skip the CPU loop entirely.
+                try:
+                    n_ev = int(state.shared_event_latent_inducing_neighbor_idx.shape[0])
+                    q_t = torch.empty((n_ev,), device=dev, dtype=torch.float32)
+                    r_t = torch.empty((n_ev,), device=dev, dtype=torch.float32)
+                    dist.broadcast(q_t, src=0)  # type: ignore[union-attr]
+                    dist.broadcast(r_t, src=0)  # type: ignore[union-attr]
+                    state.shared_event_latent_inducing_fitc_q_diag = q_t
+                    state.shared_event_latent_inducing_fitc_resid = r_t
+                except Exception as e:
+                    # If broadcast fails for some reason, fall back to local compute on this rank.
+                    warn(f"FITC diag residual broadcast failed on non-main rank (shared_event_latent {mode}): {e}", section="LIKELIHOOD")
+                    ddp_main = True
+                    dist_ok = False
+
+            if (not ddp_on) or ddp_main:
+                try:
+                    t_fitc0 = time.time()
+                    idx_np = state.shared_event_latent_inducing_neighbor_idx.detach().cpu().numpy().astype(np.int64, copy=False)
+                    offs_np = comp_off.astype(np.int64, copy=False)
+                    K_np = [Kb.detach().cpu().numpy().astype(np.float32, copy=False) for Kb in K_blocks]
+                    n_ev = int(idx_np.shape[0])
+                    q_diag_np = np.zeros((n_ev,), dtype=np.float32)
+
+                    # MAP coordinates for events (XYZ) used for slowness_inducing_gp kernel eval
+                    P_ev = None
+                    P_ind = None
+                    if mode == "slowness_inducing_gp":
+                        try:
+                            X_map = (state.X_src.detach() + state.dX_src.detach())[:, :3].to(torch.float32).cpu().numpy()
+                            P_ev = X_map.astype(np.float32, copy=False)
+                            # Prefer fixed inducing XYZ locations (Option-B) if available; otherwise fall back to inducing_event_idx at MAP.
+                            Ux = getattr(state, "shared_event_latent_inducing_xyz_km", None)
+                            if bool(state.params.get("_shared_event_latent_inducing_fixed_xyz", False)) and isinstance(Ux, torch.Tensor) and Ux.ndim == 2 and int(Ux.shape[1]) >= 3:
+                                P_ind = Ux.detach().cpu().numpy().astype(np.float32, copy=False)
+                            else:
+                                P_ind = P_ev[inducing_event_idx].astype(np.float32, copy=False)
+                        except Exception:
+                            P_ev = None
+                            P_ind = None
                     else:
-                        idxv = idx_row[m]
-                        kv = k_row[m]
-                        g0 = int(idxv[0])
-                        bi = int(np.searchsorted(offs_np[1:], g0, side="right"))
-                        if bi < 0 or bi >= len(K_np):
+                        k_np = state.shared_event_latent_inducing_neighbor_k.detach().cpu().numpy().astype(np.float32, copy=False)
+
+                    for e in range(n_ev):
+                        idx_row = idx_np[e]
+                        m = idx_row >= 0
+                        if not bool(m.any()):
                             q = 0.0
                         else:
-                            i0 = int(offs_np[bi])
-                            loc = (idxv - i0).astype(np.int64, copy=False)
-                            try:
-                                Kmm = K_np[bi][np.ix_(loc, loc)]
-                                sol = np.linalg.solve(Kmm, kv)
-                                q = float(kv.dot(sol))
-                            except Exception:
+                            idxv = idx_row[m]
+                            if mode == "slowness_inducing_gp":
+                                if P_ev is None or P_ind is None:
+                                    kv = np.ones((int(idxv.size),), dtype=np.float32)
+                                else:
+                                    # Matérn ν=3/2 kernel values k(||x_e - x_u||) at MAP
+                                    xe = P_ev[int(e)]
+                                    xu = P_ind[idxv].astype(np.float32, copy=False)
+                                    d = np.linalg.norm(xu - xe[None, :], axis=1).astype(np.float32, copy=False)
+                                    a = np.float32(np.sqrt(3.0) / float(ell_km))
+                                    x = a * d
+                                    kv = ((1.0 + x) * np.exp(-x)).astype(np.float32, copy=False)
+                            else:
+                                k_row = k_np[e]
+                                kv = k_row[m]
+                            g0 = int(idxv[0])
+                            bi = int(np.searchsorted(offs_np[1:], g0, side="right"))
+                            if bi < 0 or bi >= len(K_np):
                                 q = 0.0
-                    q_diag_np[e] = float(q)
-                q_diag_np = np.clip(q_diag_np, 0.0, 1.0).astype(np.float32, copy=False)
-                resid_np = np.maximum(0.0, 1.0 - q_diag_np).astype(np.float32, copy=False)
-                state.shared_event_latent_inducing_fitc_q_diag = torch.from_numpy(q_diag_np).to(device=dev, dtype=torch.float32)
-                state.shared_event_latent_inducing_fitc_resid = torch.from_numpy(resid_np).to(device=dev, dtype=torch.float32)
-                dt_fitc = time.time() - t_fitc0
-                info(
-                    "FITC diag residual (shared_event_latent inducing_gp): "
-                    f"q_diag[min/mean/max]={float(q_diag_np.min()):.3g}/{float(q_diag_np.mean()):.3g}/{float(q_diag_np.max()):.3g} "
-                    f"resid[min/mean/max]={float(resid_np.min()):.3g}/{float(resid_np.mean()):.3g}/{float(resid_np.max()):.3g} "
-                    f"(dt={dt_fitc:.2f}s)",
-                    section="LIKELIHOOD",
-                )
-            except Exception as e:
-                warn(f"FITC diag residual computation failed (shared_event_latent inducing_gp): {e}", section="LIKELIHOOD")
+                            else:
+                                i0 = int(offs_np[bi])
+                                loc = (idxv - i0).astype(np.int64, copy=False)
+                                try:
+                                    Kmm = K_np[bi][np.ix_(loc, loc)]
+                                    sol = np.linalg.solve(Kmm, kv)
+                                    q = float(kv.dot(sol))
+                                except Exception:
+                                    q = 0.0
+                        q_diag_np[e] = float(q)
+
+                    q_diag_np = np.clip(q_diag_np, 0.0, 1.0).astype(np.float32, copy=False)
+                    resid_np = np.maximum(0.0, 1.0 - q_diag_np).astype(np.float32, copy=False)
+                    q_t = torch.from_numpy(q_diag_np).to(device=dev, dtype=torch.float32)
+                    r_t = torch.from_numpy(resid_np).to(device=dev, dtype=torch.float32)
+                    state.shared_event_latent_inducing_fitc_q_diag = q_t
+                    state.shared_event_latent_inducing_fitc_resid = r_t
+
+                    # Broadcast results to the other ranks (so they can skip the loop).
+                    if ddp_on and dist_ok:
+                        try:
+                            dist.broadcast(q_t, src=0)  # type: ignore[union-attr]
+                            dist.broadcast(r_t, src=0)  # type: ignore[union-attr]
+                        except Exception:
+                            pass
+
+                    dt_fitc = time.time() - t_fitc0
+                    info(
+                        f"FITC diag residual (shared_event_latent {mode}): "
+                        f"q_diag[min/mean/max]={float(q_diag_np.min()):.3g}/{float(q_diag_np.mean()):.3g}/{float(q_diag_np.max()):.3g} "
+                        f"resid[min/mean/max]={float(resid_np.min()):.3g}/{float(resid_np.mean()):.3g}/{float(resid_np.max()):.3g} "
+                        f"(dt={dt_fitc:.2f}s)",
+                        section="LIKELIHOOD",
+                    )
+                except Exception as e:
+                    warn(f"FITC diag residual computation failed (shared_event_latent {mode}): {e}", section="LIKELIHOOD")
 
         # Allocate inducing coefficients (sampled). This represents K_UU^{-1} g in a predictive-process GP.
         # Default: per-station coefficients c[station, M_total, 2].
@@ -3501,10 +4458,17 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
                 state.shared_event_latent_station_basis_W = None
                 state.shared_event_latent_station_basis_r = 0
 
-        if use_sta_basis and int(r_sta) > 0 and isinstance(getattr(state, "shared_event_latent_station_basis_W", None), torch.Tensor):
-            c0 = torch.zeros((int(r_sta), M_total, 2), dtype=torch.float32, device=dev)
+        if mode == "slowness_inducing_gp":
+            # Slowness-vector coefficients: c[..., inducing, phase, xyz]
+            if use_sta_basis and int(r_sta) > 0 and isinstance(getattr(state, "shared_event_latent_station_basis_W", None), torch.Tensor):
+                c0 = torch.zeros((int(r_sta), M_total, 2, 3), dtype=torch.float32, device=dev)
+            else:
+                c0 = torch.zeros((n_stations, M_total, 2, 3), dtype=torch.float32, device=dev)
         else:
-            c0 = torch.zeros((n_stations, M_total, 2), dtype=torch.float32, device=dev)
+            if use_sta_basis and int(r_sta) > 0 and isinstance(getattr(state, "shared_event_latent_station_basis_W", None), torch.Tensor):
+                c0 = torch.zeros((int(r_sta), M_total, 2), dtype=torch.float32, device=dev)
+            else:
+                c0 = torch.zeros((n_stations, M_total, 2), dtype=torch.float32, device=dev)
         state.shared_event_latent_b = torch.nn.Parameter(c0)
 
         # Clear full-mode graph keys
@@ -3521,9 +4485,15 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
             coeff_shape = tuple(state.shared_event_latent_b.shape) if state.shared_event_latent_b is not None else ()
         except Exception:
             coeff_shape = ()
+        # neighbor_m can come from either NPZ load path (neigh_idx_np) or in-memory tensors.
+        try:
+            neigh_idx_t = getattr(state, "shared_event_latent_inducing_neighbor_idx", None)
+            neighbor_m = int(neigh_idx_t.shape[1]) if isinstance(neigh_idx_t, torch.Tensor) and neigh_idx_t.ndim == 2 else -1
+        except Exception:
+            neighbor_m = -1
         info(
-            f"Initialized shared_event_latent (inducing_gp): coeff shape={coeff_shape} "
-            f"neighbor_m={int(neigh_idx_np.shape[1])} comps={int(comp_ids.size)} ell_km={ell_km:g} dims={dim_label} "
+            f"Initialized shared_event_latent ({mode}): coeff shape={coeff_shape} "
+            f"neighbor_m={int(neighbor_m)} comps={int(comp_ids.size)} ell_km={ell_km:g} dims={dim_label} "
             f"jitter={float(jitter):.3g} (FITC={'on' if fitc_enable else 'off'}) "
             f"station_basis_r={int(getattr(state, 'shared_event_latent_station_basis_r', 0))}",
             section="LIKELIHOOD",
@@ -3547,6 +4517,17 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
             lam = float(state.params.get("_shared_event_latent_graph_lambda", 1.0))
         except Exception:
             lam = 1.0
+        # Optional DD-edge pruning: keep only top-k DD neighbors per node (and/or within max_edge_km).
+        max_deg = int(state.params.get("_shared_event_latent_graph_max_degree", 0) or 0)
+        max_edge_km = state.params.get("_shared_event_latent_graph_max_edge_km", None)
+        try:
+            max_edge_km_f = float(max_edge_km) if max_edge_km is not None else None
+            if max_edge_km_f is not None and (not math.isfinite(max_edge_km_f) or max_edge_km_f <= 0.0):
+                max_edge_km_f = None
+        except Exception:
+            max_edge_km_f = None
+        if max_deg < 0:
+            max_deg = 0
         if not math.isfinite(q_diag) or q_diag < 0.0:
             q_diag = 1.0
         if not math.isfinite(lam) or lam < 0.0:
@@ -3646,6 +4627,7 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
         # Compute edge weights w_ij = lambda * exp(-||xi-xj||/ell_km)
         E = int(u.size)
         w_np = np.empty((E,), dtype=np.float32)
+        d_np = np.empty((E,), dtype=np.float32) if (max_deg > 0 or max_edge_km_f is not None) else None
         chunk = 1_000_000
         for i0 in range(0, E, chunk):
             i1 = min(i0 + chunk, E)
@@ -3653,6 +4635,64 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
             dv = X_map[v[i0:i1]]
             d = np.linalg.norm(du - dv, axis=1).astype(np.float32, copy=False)
             w_np[i0:i1] = (float(lam) * np.exp(-d / float(ell_km))).astype(np.float32, copy=False)
+            if d_np is not None:
+                d_np[i0:i1] = d
+
+        # Optional sparsification on the DD-edge set:
+        # - If max_edge_km is set, drop long edges first.
+        # - If max_deg>0, cap degree by keeping the closest max_deg DD-neighbors per node (kNN on DD graph).
+        # We do this on the undirected DD graph by selecting directed top-k per source, then symmetrizing (union).
+        if d_np is not None:
+            if max_edge_km_f is not None:
+                m = d_np <= float(max_edge_km_f)
+                if not bool(np.all(m)):
+                    u = u[m]
+                    v = v[m]
+                    w_np = w_np[m]
+                    d_np = d_np[m]
+                    E = int(u.size)
+
+            if max_deg > 0 and E > 0:
+                # Build directed edge list
+                src = np.concatenate([u, v]).astype(np.int64, copy=False)
+                dst = np.concatenate([v, u]).astype(np.int64, copy=False)
+                dd = np.concatenate([d_np, d_np]).astype(np.float32, copy=False)
+                ww = np.concatenate([w_np, w_np]).astype(np.float32, copy=False)
+
+                # Sort by (src, dd) so closest neighbors come first per node
+                order = np.lexsort((dd, src))
+                src = src[order]
+                dst = dst[order]
+                ww = ww[order]
+
+                # Keep first max_deg per src
+                # Compute start indices of each src group
+                starts = np.empty((src.size,), dtype=bool)
+                starts[0] = True
+                starts[1:] = (src[1:] != src[:-1])
+                group_ids = np.cumsum(starts) - 1  # 0..n_groups-1
+                # position within each group (0,1,2,...)
+                idx_in_group = np.arange(src.size, dtype=np.int64) - np.maximum.accumulate(np.where(starts, np.arange(src.size, dtype=np.int64), 0))
+                keep_dir = idx_in_group < int(max_deg)
+                src_k = src[keep_dir]
+                dst_k = dst[keep_dir]
+                ww_k = ww[keep_dir]
+
+                # Symmetrize by union and coalesce to unique undirected edges
+                uu = np.minimum(src_k, dst_k)
+                vv = np.maximum(src_k, dst_k)
+                pairs = np.stack([uu, vv], axis=1).astype(np.int64, copy=False)
+                uniq, inv = np.unique(pairs, axis=0, return_inverse=True)
+                # combine weights: take max (preserve strongest link if both directions kept)
+                w_out = np.zeros((uniq.shape[0],), dtype=np.float32)
+                np.maximum.at(w_out, inv, ww_k.astype(np.float32, copy=False))
+                m2 = (uniq[:, 0] != uniq[:, 1])
+                uniq = uniq[m2]
+                w_out = w_out[m2]
+                u = uniq[:, 0].astype(np.int64, copy=False)
+                v = uniq[:, 1].astype(np.int64, copy=False)
+                w_np = w_out.astype(np.float32, copy=False)
+                E = int(u.size)
 
         # Move to device
         u_t = torch.from_numpy(u).to(device=dev, dtype=torch.int64)
@@ -3673,6 +4713,7 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
             "Initialized shared_event_latent (graph_gmrf): "
             f"b_shape={tuple(state.shared_event_latent_b.shape)} edges={int(E)} "
             f"ell_km={float(ell_km):g} lambda={float(lam):g} q_diag={float(q_diag):g} "
+            f"max_degree={int(max_deg)} max_edge_km={(float(max_edge_km_f) if max_edge_km_f is not None else 'None')} "
             f"station_basis_r={int(getattr(state, 'shared_event_latent_station_basis_r', 0))} "
             f"(dt={dt_s:.2f}s)",
             section="LIKELIHOOD",
@@ -3773,6 +4814,378 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
     return
 
 
+def _maybe_estimate_eikonet_v1d_speed(state: "LocateState") -> None:
+    """
+    Optional diagnostic: estimate an effective 1D reference speed curve v(z) from EikoNet.
+
+    Idea:
+      For isotropic media, ||∂T/∂x_src|| has units s/km and is approximately the slowness magnitude 1/v.
+      EikoNet is a learned surrogate in a 3D model; averaging ||∂T/∂x_src|| over many source/receiver
+      directions at the same depth yields a useful *effective* v(z) reference curve.
+
+    This is primarily useful to map fractional velocity perturbations (dimensionless, e.g. 1–2%)
+    into slowness amplitudes (s/km) via tau_u(z) ≈ vel_frac / v(z).
+
+    Config (optional; new schema allows extra keys under inference.diagnostics):
+      inference:
+        diagnostics:
+          eikonet_v1d:
+            enabled: bool
+            n_depth_bins: int
+            n_events_per_bin: int
+            n_stations_per_event: int
+            batch_size: int
+            seed: int
+            outfile: str|null   # relative to checkpoint_dir if not abs
+    """
+    # We run this automatically when the slowness_inducing_gp model is configured in "fraction" mode,
+    # because we need v(z) to map a dimensionless vel_frac field into slowness units (s/km).
+    # Timer (helps users diagnose "hangs" in torchrun mode where non-rank0 appears silent).
+    try:
+        import time as _time
+        _t0 = float(_time.time())
+    except Exception:
+        _t0 = None
+
+    cfg = None
+    try:
+        want_auto = False
+        if bool(state.params.get("_shared_event_latent_enabled", False)):
+            mode = str(state.params.get("_shared_event_latent_parameterization", "")).strip().lower()
+            units = str(state.params.get("_shared_event_latent_slowness_tau_units", "abs")).strip().lower()
+            want_auto = bool(mode == "slowness_inducing_gp" and units == "vel_frac")
+        # Also enable auto v(z) estimation for the collapsed slowness covariance likelihood when it uses vel_frac.
+        if bool(state.params.get("_slowness_re_enabled", False)):
+            units2 = str(state.params.get("_slowness_re_tau_units", "abs")).strip().lower()
+            want_auto = bool(want_auto or (units2 == "vel_frac"))
+        # Optional user override (legacy): inference.diagnostics.eikonet_v1d.enabled=true
+        inf = state.params.get("inference", None)
+        dg = inf.get("diagnostics", None) if isinstance(inf, dict) else None
+        cfg0 = dg.get("eikonet_v1d", None) if isinstance(dg, dict) else None
+        # If the user explicitly sets enabled=false, treat it as a hard override even in auto mode.
+        if isinstance(cfg0, dict) and ("enabled" in cfg0) and (cfg0.get("enabled", None) is False):
+            return
+        want_cfg = bool(isinstance(cfg0, dict) and bool(cfg0.get("enabled", False)))
+        if not (want_auto or want_cfg):
+            return
+        cfg = cfg0 if isinstance(cfg0, dict) else {}
+    except Exception:
+        return
+
+    # DDP support: compute on rank0 then broadcast arrays to all ranks so vel_frac scaling is consistent.
+    ddp_on = _ddp_enabled(state.params)
+    ddp_main = (not ddp_on) or _ddp_is_main(state.params)
+    dist_ok = False
+    dist = None
+    if ddp_on:
+        try:
+            import torch.distributed as dist  # type: ignore
+            dist_ok = bool(dist.is_available()) and bool(dist.is_initialized())
+        except Exception:
+            dist_ok = False
+            dist = None
+
+    # Run once (per process)
+    if bool(state.params.get("_eikonet_v1d_done", False)):
+        return
+
+    if ddp_on and dist_ok and (not ddp_main):
+        # Non-main ranks: receive the arrays from rank0.
+        try:
+            # 1) sizes
+            sz = torch.zeros((1,), device=state.device, dtype=torch.int64)
+            dist.broadcast(sz, src=0)  # type: ignore[union-attr]
+            K = int(sz.item())
+            # 2) tensors (depth centers + vp + vs)
+            zc = torch.empty((K,), device=state.device, dtype=torch.float32)
+            vp = torch.empty((K,), device=state.device, dtype=torch.float32)
+            vs = torch.empty((K,), device=state.device, dtype=torch.float32)
+            dist.broadcast(zc, src=0)  # type: ignore[union-attr]
+            dist.broadcast(vp, src=0)  # type: ignore[union-attr]
+            dist.broadcast(vs, src=0)  # type: ignore[union-attr]
+            # Store to params (as Python lists, matching the main-rank storage convention)
+            state.params["_eikonet_v1d_depth_centers_km"] = zc.detach().cpu().tolist()
+            state.params["_eikonet_v1d_vp_km_s"] = vp.detach().cpu().tolist()
+            state.params["_eikonet_v1d_vs_km_s"] = vs.detach().cpu().tolist()
+            state.params["_eikonet_v1d_done"] = True
+        except Exception:
+            # If broadcast fails, just continue without v(z); epoch_runner will fall back to constants.
+            return
+        return
+
+    try:
+        import os
+        import math
+        import numpy as np
+        import torch
+        import polars as pl
+    except Exception:
+        return
+
+    # Parse config (auto mode uses defaults; cfg mode can override)
+    try:
+        n_depth_bins = int((cfg or {}).get("n_depth_bins", 20))
+        n_events_per_bin = int((cfg or {}).get("n_events_per_bin", 64))
+        n_stations_per_event = int((cfg or {}).get("n_stations_per_event", 8))
+        batch_size = int((cfg or {}).get("batch_size", 2048))
+        seed = int((cfg or {}).get("seed", 0))
+        # For huge dtimes tables, building a unique station table can be expensive.
+        # We only need a representative station pool for v(z); cap the number of rows we scan.
+        max_station_rows = int((cfg or {}).get("max_station_rows", 5_000_000))
+        # Default: do NOT write a file unless explicitly requested (avoid clutter).
+        out_path = (cfg or {}).get("outfile", None)
+    except Exception:
+        n_depth_bins = 20
+        n_events_per_bin = 64
+        n_stations_per_event = 8
+        batch_size = 2048
+        seed = 0
+        max_station_rows = 5_000_000
+        out_path = None
+
+    n_depth_bins = max(2, n_depth_bins)
+    n_events_per_bin = max(1, n_events_per_bin)
+    n_stations_per_event = max(1, n_stations_per_event)
+    batch_size = max(32, batch_size)
+    if max_station_rows < 0:
+        max_station_rows = 0
+
+    # Resolve output path
+    try:
+        out_path_s = str(out_path) if out_path is not None else ""
+    except Exception:
+        out_path_s = ""
+    if not out_path_s:
+        out_path_s = ""
+    try:
+        if out_path_s:
+            if not os.path.isabs(out_path_s):
+                base = str(state.params.get("checkpoint_dir", "."))
+                out_path_s = os.path.join(base, out_path_s)
+            os.makedirs(os.path.dirname(out_path_s) or ".", exist_ok=True)
+    except Exception:
+        pass
+
+    # Build station XYZ table (km) in sta_idx order
+    try:
+        dt = state.dtimes
+        if not isinstance(dt, pl.DataFrame):
+            raise ValueError("missing dtimes DF")
+        if "sta_idx" not in dt.columns:
+            raise ValueError("dtimes missing sta_idx")
+        # Optional cap for performance on huge tables
+        if isinstance(max_station_rows, int) and max_station_rows > 0 and int(dt.shape[0]) > int(max_station_rows):
+            dt = dt.head(int(max_station_rows))
+        # Prefer XYZ columns if present; fallback to YY receiver columns (less robust).
+        if ("X" in dt.columns) and ("Y" in dt.columns) and ("Z" in dt.columns):
+            sta_xyz = (
+                dt.select([pl.col("sta_idx"), pl.col("X"), pl.col("Y"), pl.col("Z")])
+                .unique(subset=["sta_idx"], maintain_order=True)
+                .sort("sta_idx")
+            )
+            xyz_np = sta_xyz.select([pl.col("X"), pl.col("Y"), pl.col("Z")]).to_numpy().astype(np.float32, copy=False)
+        else:
+            # YY is (dt, x_rec, y_rec, z_rec, phase); need station index mapping
+            raise ValueError("dtimes missing station XYZ columns X,Y,Z")
+        sta_xyz_t = torch.from_numpy(xyz_np).to(device=state.device, dtype=torch.float32)  # (S,3)
+        n_st = int(sta_xyz_t.shape[0])
+        if n_st <= 0:
+            return
+    except Exception as e:
+        warn(f"EikoNet v1d: could not build station XYZ table: {e}", section="LIKELIHOOD")
+        return
+
+    # Current event locations (km)
+    try:
+        Xcur = (state.X_src + state.dX_src)[:, :3].detach().to(torch.float32)
+        z = Xcur[:, 2].detach().cpu().numpy().astype(np.float32, copy=False)
+        if z.size < 2:
+            return
+        zmin = float(np.nanmin(z))
+        zmax = float(np.nanmax(z))
+        if not (math.isfinite(zmin) and math.isfinite(zmax)) or zmax <= zmin:
+            return
+    except Exception:
+        return
+
+    # Depth bins (equal-width)
+    edges = np.linspace(zmin, zmax, num=int(n_depth_bins) + 1, dtype=np.float32)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    rng = np.random.default_rng(seed)
+    # Pre-choose a station pool for sampling
+    sta_all = np.arange(n_st, dtype=np.int64)
+
+    # Model in eval mode for stability
+    model = state.model
+    try:
+        was_training = bool(model.training)
+    except Exception:
+        was_training = False
+    try:
+        model.eval()
+    except Exception:
+        pass
+
+    # Accumulators
+    stats = {
+        "P": {"sum": np.zeros((n_depth_bins,), dtype=np.float64), "sum2": np.zeros((n_depth_bins,), dtype=np.float64), "n": np.zeros((n_depth_bins,), dtype=np.int64)},
+        "S": {"sum": np.zeros((n_depth_bins,), dtype=np.float64), "sum2": np.zeros((n_depth_bins,), dtype=np.float64), "n": np.zeros((n_depth_bins,), dtype=np.int64)},
+    }
+
+    def _accum(bin_idx: int, phase_key: str, gnorm: torch.Tensor) -> None:
+        if gnorm.numel() <= 0:
+            return
+        g = gnorm.detach().cpu().to(torch.float64).numpy()
+        stats[phase_key]["sum"][bin_idx] += float(g.sum())
+        stats[phase_key]["sum2"][bin_idx] += float((g * g).sum())
+        stats[phase_key]["n"][bin_idx] += int(g.size)
+
+    # Iterate depth bins
+    with torch.enable_grad():
+        for bi in range(int(n_depth_bins)):
+            lo = float(edges[bi]); hi = float(edges[bi + 1])
+            mask = (z >= lo) & (z < hi if bi < (n_depth_bins - 1) else z <= hi)
+            ev_idx = np.flatnonzero(mask).astype(np.int64, copy=False)
+            if ev_idx.size == 0:
+                continue
+            k_ev = int(min(int(n_events_per_bin), int(ev_idx.size)))
+            chosen_ev = rng.choice(ev_idx, size=k_ev, replace=False)
+
+            # For each chosen event, choose stations and build batches for P and S
+            # Build endpoint lists
+            ev_rep = np.repeat(chosen_ev, repeats=int(n_stations_per_event)).astype(np.int64, copy=False)
+            sta_rep = rng.choice(sta_all, size=int(ev_rep.size), replace=True).astype(np.int64, copy=False)
+            if ev_rep.size == 0:
+                continue
+
+            ev_t = torch.from_numpy(ev_rep).to(device=state.device, dtype=torch.int64)
+            sta_t = torch.from_numpy(sta_rep).to(device=state.device, dtype=torch.int64)
+            src0 = Xcur.index_select(0, ev_t).detach()
+            rec0 = sta_xyz_t.index_select(0, sta_t).detach()
+
+            for phase_key, ph_val in (("P", 0.0), ("S", 1.0)):
+                # Process in minibatches
+                for i0 in range(0, int(src0.shape[0]), int(batch_size)):
+                    i1 = min(i0 + int(batch_size), int(src0.shape[0]))
+                    src = src0[i0:i1].clone().detach().requires_grad_(True)
+                    rec = rec0[i0:i1]
+                    ph = torch.full((int(i1 - i0), 1), float(ph_val), device=state.device, dtype=torch.float32)
+                    coords = torch.cat([src, rec, ph], dim=1)
+                    T = model(coords).reshape(-1)
+                    g = torch.autograd.grad(T.sum(), src, retain_graph=False, create_graph=False, allow_unused=False)[0]
+                    gnorm = torch.linalg.norm(g.to(torch.float32), dim=1).clamp_min(1e-12)
+                    _accum(bi, phase_key, gnorm)
+
+    # Restore training state
+    try:
+        if was_training:
+            model.train()
+    except Exception:
+        pass
+
+    # Compute means and v(z)
+    vP = np.full((n_depth_bins,), np.nan, dtype=np.float32)
+    vS = np.full((n_depth_bins,), np.nan, dtype=np.float32)
+    sP = np.full((n_depth_bins,), np.nan, dtype=np.float32)
+    sS = np.full((n_depth_bins,), np.nan, dtype=np.float32)
+    for bi in range(int(n_depth_bins)):
+        nP = int(stats["P"]["n"][bi])
+        nS = int(stats["S"]["n"][bi])
+        if nP > 0:
+            m = float(stats["P"]["sum"][bi]) / float(nP)
+            sP[bi] = float(m)
+            vP[bi] = float(1.0 / max(m, 1e-12))
+        if nS > 0:
+            m = float(stats["S"]["sum"][bi]) / float(nS)
+            sS[bi] = float(m)
+            vS[bi] = float(1.0 / max(m, 1e-12))
+
+    # Store to params for downstream use / notebooks
+    try:
+        state.params["_eikonet_v1d_depth_edges_km"] = edges.tolist()
+        state.params["_eikonet_v1d_depth_centers_km"] = centers.tolist()
+        state.params["_eikonet_v1d_slowness_p_s_per_km"] = sP.tolist()
+        state.params["_eikonet_v1d_slowness_s_s_per_km"] = sS.tolist()
+        state.params["_eikonet_v1d_vp_km_s"] = vP.tolist()
+        state.params["_eikonet_v1d_vs_km_s"] = vS.tolist()
+        state.params["_eikonet_v1d_outfile"] = str(out_path_s)
+        state.params["_eikonet_v1d_done"] = True
+    except Exception:
+        pass
+
+    # If DDP is active, broadcast the key arrays to other ranks (so vel_frac scaling is identical everywhere).
+    if ddp_on and dist_ok and ddp_main:
+        try:
+            zc_t = torch.tensor(np.asarray(centers, dtype=np.float32).reshape(-1), device=state.device, dtype=torch.float32)
+            vp_t = torch.tensor(np.asarray(vP, dtype=np.float32).reshape(-1), device=state.device, dtype=torch.float32)
+            vs_t = torch.tensor(np.asarray(vS, dtype=np.float32).reshape(-1), device=state.device, dtype=torch.float32)
+            K = int(zc_t.numel())
+            sz = torch.tensor([K], device=state.device, dtype=torch.int64)
+            dist.broadcast(sz, src=0)  # type: ignore[union-attr]
+            dist.broadcast(zc_t, src=0)  # type: ignore[union-attr]
+            dist.broadcast(vp_t, src=0)  # type: ignore[union-attr]
+            dist.broadcast(vs_t, src=0)  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+    # Always log a brief summary once (even if we don't write an NPZ),
+    # because these values directly set the scaling for vel_frac slowness models.
+    try:
+        vp_med = float(np.nanmedian(vP)) if np.isfinite(np.nanmedian(vP)) else float("nan")
+        vs_med = float(np.nanmedian(vS)) if np.isfinite(np.nanmedian(vS)) else float("nan")
+        sp_med = float(np.nanmedian(sP)) if np.isfinite(np.nanmedian(sP)) else float("nan")
+        ss_med = float(np.nanmedian(sS)) if np.isfinite(np.nanmedian(sS)) else float("nan")
+        dt_s = None
+        try:
+            if _t0 is not None:
+                dt_s = float(_time.time() - float(_t0))
+        except Exception:
+            dt_s = None
+        info(
+            "EikoNet v1d speed estimated: "
+            f"z[km]=[{zmin:.3g},{zmax:.3g}] bins={int(n_depth_bins)} "
+            f"vp_med≈{vp_med:.3g}km/s vs_med≈{vs_med:.3g}km/s "
+            f"(slowness_med P≈{sp_med:.3g}s/km S≈{ss_med:.3g}s/km) "
+            + (f"outfile={out_path_s}" if out_path_s else "outfile=<none>")
+            + (f" dt={dt_s:.1f}s" if (dt_s is not None and np.isfinite(dt_s)) else ""),
+            section="LIKELIHOOD",
+        )
+        # Heuristic sanity check: flag wildly implausible speeds (often indicates unit mismatch).
+        if (np.isfinite(vp_med) and (vp_med > 100.0 or vp_med < 0.1)) or (np.isfinite(vs_med) and (vs_med > 100.0 or vs_med < 0.05)):
+            warn(
+                "EikoNet v1d: estimated speeds look implausible. "
+                "This can cause vel_frac models to rescale latents incorrectly. "
+                "Double-check coordinate units (km) and the EikoNet checkpoint/domain scale.",
+                section="LIKELIHOOD",
+            )
+    except Exception:
+        pass
+
+    # Optional: save NPZ (best-effort) only if outfile was provided
+    if out_path_s:
+        try:
+            np.savez_compressed(
+                out_path_s,
+                depth_edges_km=edges,
+                depth_centers_km=centers,
+                slowness_p_s_per_km=sP,
+                slowness_s_s_per_km=sS,
+                vp_km_s=vP,
+                vs_km_s=vS,
+                n_samples_p=stats["P"]["n"],
+                n_samples_s=stats["S"]["n"],
+            )
+            info(
+                "EikoNet v1d speed estimated: "
+                f"z[km]=[{zmin:.3g},{zmax:.3g}] bins={int(n_depth_bins)} "
+                f"vp_med~{float(np.nanmedian(vP)):.3g} vs_med~{float(np.nanmedian(vS)):.3g} "
+                f"outfile={out_path_s}",
+                section="LIKELIHOOD",
+            )
+        except Exception as e:
+            warn(f"EikoNet v1d save failed: {e}", section="LIKELIHOOD")
+
 
 def locate_all(
     params: dict,
@@ -3811,6 +5224,11 @@ def locate_all(
     _maybe_select_shared_event_latent_inducing_points(state)
     _maybe_build_shared_event_latent_inducing_interpolation(state)
     _maybe_init_shared_event_latent(state)
+    # Build inducing artifacts for the collapsed slowness covariance likelihood (if enabled).
+    _maybe_select_slowness_re_inducing_points(state)
+    _maybe_build_slowness_re_inducing_interpolation(state)
+    _maybe_init_slowness_re(state)
+    _maybe_estimate_eikonet_v1d_speed(state)
 
     # Set up sampler and optionally load state if resuming from sampling phases
     sampler = _setup_sampler(state)
@@ -3884,7 +5302,8 @@ def locate_all(
             try:
                 from spider.optim.backends import transplant_from_adam_if_supported
                 transplant_from_adam_if_supported(state.optimizer, sampler)
-                print("Transferred preconditioning state from Adam to sampler (if supported)")
+                if (not _ddp_enabled(state.params)) or _ddp_is_main(state.params):
+                    print("Transferred preconditioning state from Adam to sampler (if supported)")
             except Exception as e:
                 print(f"Warning: could not transplant preconditioner from Adam (backend): {e}")
         # Receiver-centric sigma_scale computation removed
@@ -3951,11 +5370,24 @@ def locate_map(
         _pre_filter_outlier_residuals(state)
         _print_initial_residual_stats(state)
 
+    # Always print a pre-optimization residual sanity check at the *initial* catalog locations
+    # (ΔX=0), even when the residual filter was already applied during data prep.
+    # This is useful for quickly comparing datasets/configs and spotting busted inputs.
+    try:
+        if ckpt is None and start_epoch == 0:
+            ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+            if ddp_main:
+                _print_initial_residual_stats(state)
+    except Exception:
+        pass
+
     if wandb_logger:
         wandb_logger.start_phase("phase1")
     _phase1_map_warmup(state, start_epoch=start_epoch, wandb_logger=wandb_logger)
 
-    if bundle_out:
+    # In torchrun/DDP mode, only rank0 writes bundle outputs.
+    ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+    if bundle_out and ddp_main:
         # Dump "exact input to Phase 2": post-phase1 filtered dtimes/origins, MAP ΔX, and Adam state
         try:
             save_phase2_bundle(
@@ -3992,16 +5424,11 @@ def locate_sample_from_bundle(
     """
     bun = load_phase2_bundle(path=str(bundle_path))
 
-    # Use bundle dataset; keep current run params (but overwrite with bundled materialized params if desired)
-    # For safety, we keep the *current* params dict but allow the bundle to carry the materialized keys
-    # that core code expects (e.g., flat materializations).
+    # IMPORTANT: Phases 2–4 must ALWAYS use the current run config (JSON → schema materialization),
+    # not whatever params happened to be stored inside the Phase-2 bundle.
+    #
+    # The bundle is used only for its dataset payload (origins0/dtimes) and initial MAP state.
     run_params = params
-    try:
-        if isinstance(bun.params, dict):
-            # Prefer current runtime flags (device, wandb) but keep bundle materializations.
-            run_params = {**bun.params, **params}
-    except Exception:
-        run_params = params
 
     state = _build_initial_state(run_params, bun.origins0, bun.dtimes, model, device)
 
@@ -4014,12 +5441,36 @@ def locate_sample_from_bundle(
             info("Resetting batch numbers to 0 (reset_batch_numbers=True)", section="RUN")
             clear_checkpoint_files(state.params)
             if clear_samples_on_reset:
-                clear_samples_file(state.params)
+                ok = clear_samples_file(state.params)
+                if ok:
+                    try:
+                        sp = str(state.params.get("samples_outfile", state.params.get("io", {}).get("samples_outfile", "samples.h5")))
+                    except Exception:
+                        sp = "samples.h5"
+                    info(f"Deleted samples file '{sp}' (clear_samples_on_reset=True)", section="SAMPLES")
+                if not ok:
+                    try:
+                        sp = str(state.params.get("samples_outfile", state.params.get("io", {}).get("samples_outfile", "samples.h5")))
+                    except Exception:
+                        sp = "samples.h5"
+                    warn(f"Failed to delete samples file '{sp}' (clear_samples_on_reset=True). New batches may append.", section="SAMPLES")
             state.sample_count = 0
         else:
             if clear_samples_on_reset:
                 info("Clearing samples file (clear_samples_on_reset=True)", section="SAMPLES")
-                clear_samples_file(state.params)
+                ok = clear_samples_file(state.params)
+                if ok:
+                    try:
+                        sp = str(state.params.get("samples_outfile", state.params.get("io", {}).get("samples_outfile", "samples.h5")))
+                    except Exception:
+                        sp = "samples.h5"
+                    info(f"Deleted samples file '{sp}' (clear_samples_on_reset=True)", section="SAMPLES")
+                if not ok:
+                    try:
+                        sp = str(state.params.get("samples_outfile", state.params.get("io", {}).get("samples_outfile", "samples.h5")))
+                    except Exception:
+                        sp = "samples.h5"
+                    warn(f"Failed to delete samples file '{sp}' (clear_samples_on_reset=True). New batches may append.", section="SAMPLES")
             # Continue batch numbering if samples file exists
             state.sample_count = get_next_sample_count(state.params)
             if state.sample_count > 0:
@@ -4054,6 +5505,10 @@ def locate_sample_from_bundle(
     _maybe_select_shared_event_latent_inducing_points(state)
     _maybe_build_shared_event_latent_inducing_interpolation(state)
     _maybe_init_shared_event_latent(state)
+    _maybe_select_slowness_re_inducing_points(state)
+    _maybe_build_slowness_re_inducing_interpolation(state)
+    _maybe_init_slowness_re(state)
+    _maybe_estimate_eikonet_v1d_speed(state)
 
     sampler = _setup_sampler(state)
 
@@ -4063,7 +5518,8 @@ def locate_sample_from_bundle(
     try:
         from spider.optim.backends import transplant_from_adam_if_supported
         transplant_from_adam_if_supported(state.optimizer, sampler)
-        print("Transferred preconditioning state from Adam to sampler (if supported)")
+        if (not _ddp_enabled(state.params)) or _ddp_is_main(state.params):
+            print("Transferred preconditioning state from Adam to sampler (if supported)")
     except Exception as e:
         print(f"Warning: could not transplant preconditioner from Adam (backend): {e}")
 

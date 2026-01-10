@@ -3,16 +3,127 @@ import time
 import torch
 import math
 import numpy as np
+import torch.distributed as dist
 from spider.core.hierarchy import update_precision_hyperparameter
 from spider.utils.console import info, warn
-from spider.core.state import LocateState, _current_noise_scales, _clamp_dX_inplace
+from spider.core.state import LocateState, _current_noise_scales, _clamp_dX_inplace, _apply_shared_event_latent_constraints_inplace
 from spider.core.batching import _ensure_owner_buckets, _iter_event_batches
 from spider.core.modeling import (
     posterior_loss,
+    compute_likelihood_loss,
+    compute_prior_loss,
     compute_residuals,
     write_output,
 )
 from spider.utils.wandb_gates import want_wandb_group as _want_wandb_group
+
+
+def _ddp_info(params: dict) -> tuple[bool, int, int, bool]:
+    """
+    Returns (enabled, rank, world_size, is_main) for torchrun/DDP mode.
+    We treat DDP as enabled only when torch.distributed is initialized and world_size>1.
+    """
+    try:
+        ws = int(params.get("_ddp_world_size", 1) or 1)
+        rk = int(params.get("_ddp_rank", 0) or 0)
+    except Exception:
+        ws, rk = 1, 0
+    enabled = bool(ws > 1) and bool(dist.is_available()) and bool(dist.is_initialized())
+    if enabled:
+        try:
+            # Trust the runtime communicator if available.
+            ws = int(dist.get_world_size())
+            rk = int(dist.get_rank())
+        except Exception:
+            pass
+    is_main = (int(rk) == 0)
+    return enabled, int(rk), int(ws), bool(is_main)
+
+
+def _ddp_allreduce_grads(optimizer: torch.optim.Optimizer) -> None:
+    """All-reduce gradients (SUM) across ranks. Assumes dist is initialized."""
+    grads = []
+    for g in optimizer.param_groups:  # type: ignore[attr-defined]
+        for p in g.get("params", []):
+            if p is None:
+                continue
+            gg = getattr(p, "grad", None)
+            if gg is None:
+                continue
+            if not isinstance(gg, torch.Tensor) or gg.numel() <= 0:
+                continue
+            grads.append(gg)
+    if not grads:
+        return
+
+    # Coalesce into a single buffer to reduce per-parameter allreduce overhead.
+    # This matters a lot on systems without fast GPU interconnect, where many small allreduces
+    # can dominate the step time.
+    dev0 = grads[0].device
+    dt0 = grads[0].dtype
+    same = True
+    total = 0
+    for gg in grads:
+        total += int(gg.numel())
+        if gg.device != dev0 or gg.dtype != dt0:
+            same = False
+            break
+    if (not same) or total <= 0:
+        # Fallback: allreduce each grad separately.
+        for gg in grads:
+            dist.all_reduce(gg, op=dist.ReduceOp.SUM)
+        return
+
+    # Reuse a persistent buffer attached to the optimizer to avoid allocating every step.
+    buf = getattr(optimizer, "_ddp_grad_buffer", None)
+    try:
+        if not isinstance(buf, torch.Tensor) or int(buf.numel()) != int(total) or buf.device != dev0 or buf.dtype != dt0:
+            buf = torch.empty((int(total),), device=dev0, dtype=dt0)
+            setattr(optimizer, "_ddp_grad_buffer", buf)
+    except Exception:
+        buf = torch.empty((int(total),), device=dev0, dtype=dt0)
+        try:
+            setattr(optimizer, "_ddp_grad_buffer", buf)
+        except Exception:
+            pass
+
+    # Pack
+    off = 0
+    for gg in grads:
+        n = int(gg.numel())
+        buf[off : off + n].copy_(gg.reshape(-1))
+        off += n
+
+    # Allreduce once
+    dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+
+    # Unpack
+    off = 0
+    for gg in grads:
+        n = int(gg.numel())
+        gg.copy_(buf[off : off + n].view_as(gg))
+        off += n
+
+
+def _ddp_set_step_seed(params: dict, step: int, *, device: torch.device) -> None:
+    """
+    Make sampler noise deterministic across ranks by resetting RNG state per step.
+    This is critical for SGHMC/pSGLD because the optimizer step injects random noise.
+    """
+    try:
+        base = int(params.get("runtime_seed", 0))
+    except Exception:
+        base = 0
+    s = int(base + 10000019 * int(step))
+    try:
+        torch.manual_seed(s)
+    except Exception:
+        pass
+    try:
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(s)
+    except Exception:
+        pass
 
 
 def _maybe_write_map_csv(state: LocateState, epoch: int) -> None:
@@ -22,6 +133,13 @@ def _maybe_write_map_csv(state: LocateState, epoch: int) -> None:
     NOTE: This is intentionally a lightweight side-effect used only when `write_map_csv=True`
     is passed to `_run_epoch` (Phase 1).
     """
+    # In torchrun/DDP mode, only rank0 should emit files.
+    try:
+        ddp_enabled, _rk, _ws, ddp_is_main = _ddp_info(state.params)
+        if ddp_enabled and not ddp_is_main:
+            return
+    except Exception:
+        pass
     if epoch % 100 != 0:
         return
     try:
@@ -62,108 +180,30 @@ def _update_svrg_snapshot(state: LocateState, batch_size: int, optimizer: torch.
     # Store snapshot of parameters
     state.svrg_dX_snapshot = state.dX_src.detach().clone()
     
-    # Compute full gradient
-    # We accumulate gradients over batches to avoid memory overflow
+    # Compute full gradient as an *average-gradient* consistent with our minibatch convention.
+    # IMPORTANT:
+    # - Do NOT call posterior_loss in a per-batch loop: it includes the prior term scaled by 1/N,
+    #   which would get counted multiple times.
+    # - Instead: add the prior ONCE, and add likelihood contributions as a weighted sum of batch means.
+    from spider.core.modeling import compute_likelihood_loss, compute_prior_loss
+    
+    # Clear any existing grads
+    optimizer.zero_grad(set_to_none=True)
     if state.dX_src.grad is not None:
         state.dX_src.grad.zero_()
     
-    # Use standard batch iterator for full pass
-    N = state.N
-    bs = max(batch_size, 10000) # Use large batch for efficiency if possible
+    N = int(state.N)
+    bs = max(int(batch_size), 10000)  # use a large batch for efficiency if possible
     
-    # Temporarily disable noise scales learning or special handling?
-    # posterior_loss handles it.
-    
-    total_loss = 0.0
-    
-    # Iterate
-    # Note: We must ensure we cover all data exactly once.
-    optimizer.zero_grad(set_to_none=True)
-    
-    for i in range(0, N, bs):
-        i_end = min(i + bs, N)
-        
-        # Data slices
-        # Use II/YY directly (no shuffling needed for gradient sum)
-        II_b = state.II[i:i_end]
-        YY_b = state.YY[i:i_end]
-        
-        # Noise scales
-        σp, σs = _current_noise_scales(state)
-             
-        # Compute loss
-        loss = posterior_loss(
-            idx=II_b,
-            y=YY_b,
-            X_src=state.X_src,
-            ΔX_src=state.dX_src,
-            model=state.model,
-            prior_event=state.prior_event,
-            prior_centroid=state.prior_centroid,
-            σ_p=σp,
-            σ_s=σs,
-            N_total=state.N, # Scale by N to get mean, but gradients add up?
-            # posterior_loss returns Average Loss (1/N).
-            # We want Sum of Gradients = N * Grad(AvgLoss).
-            # Or we want Mean Gradient?
-            # SGLD update usually is: g_batch * N. 
-            # If we compute full gradient, we want the equivalent of that.
-            # If posterior_loss is (1/N)*Sum(Likelihood), then Grad is (1/N)*Sum(Grad).
-            # If we sum this over batches, we get Sum(Grad) / N * (N/bs)? No.
-            #
-            # Let's standardize:
-            # We want the Full Gradient G_full = \sum_i \nabla \log P(x_i | \theta) + \nabla \log P(\theta).
-            # posterior_loss = (1/N) * \sum NLL + (1/N) * Prior.
-            # So posterior_loss.backward() gives (1/N) * G_full.
-            #
-            # To get G_full, we can scale by N.
-            # However, we must accumulate carefully.
-            # Since posterior_loss includes (1/N)*Prior, summing it over batches would sum the prior multiple times.
-            # WE MUST NOT use posterior_loss in a loop naively if it includes the prior!
-            #
-            # Solution: Use compute_likelihood_loss for batches, and add prior once.
-            params=state.params,
-            nuisance_delta=nuisance_delta,
-            cluster_ids=state.cluster_ids,
-            cluster_counts=state.cluster_counts,
-            event_precision_matrix=state.event_precision_matrix,
-        )
-        
-        # Wait, posterior_loss adds the prior scaled by 1/N.
-        # If we sum this over all batches (covering N samples), we effectively sum (Prior/N) * (N/bs) times?
-        # No, if we just call backward() on each batch, gradients accumulate.
-        # But each batch call adds Grad(Prior)/N.
-        # If we have N/bs batches, we add Grad(Prior)/N * (N/bs) = Grad(Prior)/bs.
-        # This sums to Grad(Prior) * (number_of_batches) / N = Grad(Prior)/bs.
-        # This is WRONG. We end up with Grad(Prior) * (number_of_batches) / N.
-        # If bs=1, we add Grad(Prior)/N N times = Grad(Prior). Correct.
-        # If bs=N, we add Grad(Prior)/N 1 time = Grad(Prior)/N. Incorrect scaling?
-        #
-        # Let's check posterior_loss implementation.
-        # loss_prior = compute_prior_loss(...) # returns -logP / N.
-        #
-        # If we process the whole dataset in one go (bs=N), we get Grad(Likelihood)/N + Grad(Prior)/N.
-        # This is the Gradient of the Average Posterior.
-        #
-        # SVRG requires consistent scaling across (g_batch, g_snap, g_full).
-        #
-        # SPIDER sampler convention:
-        # - Autograd on our mean-reduced likelihood returns minibatch-mean gradients ḡ.
-        # - Samplers use "sum-loglik" drift by multiplying drift by N (n_obs): drift ∝ N * ḡ.
-        #
-        # For SVRG bookkeeping, we store/compute "average-gradient" quantities (ḡ) consistently,
-        # and the sampler handles the N scaling at the drift application step.
-        pass
-
-    # Correct Loop implementation
-    from spider.core.modeling import compute_likelihood_loss, compute_prior_loss
+    # Current noise scales (constant during this snapshot computation)
+    σp, σs = _current_noise_scales(state)
     
     # 1. Prior
     l_prior = compute_prior_loss(
         ΔX_src=state.dX_src,
         prior_event=state.prior_event,
         prior_centroid=state.prior_centroid,
-        σ_p=σp, # Using last updated sigmas
+        σ_p=σp,
         σ_s=σs,
         N_total=state.N,
         params=state.params,
@@ -223,8 +263,13 @@ def _set_backend_noise(optimizer: torch.optim.Optimizer, *, enabled: bool, scale
     """Set noise flags consistently for any sampler backend."""
     if not hasattr(optimizer, "param_groups"):
         return
-    # BOHAMIANN-style AdaptiveSGHMC always injects noise (its update is not staged via a ramp).
-    # We detect it via the param-group preconditioner tag set by the backend factory.
+    # AdaptiveSGHMC uses a BOHAMIANN-style update which *can* inject noise, but in SPIDER we
+    # still want consistent Phase semantics:
+    # - Phase 2: noise_scale_factor=0 => effectively deterministic drift (no injected noise)
+    # - Phase 3: ramp noise_scale_factor up
+    # - Phase 4: full sampling noise
+    #
+    # We detect AdaptiveSGHMC via the param-group preconditioner tag set by the backend factory.
     force_on = False
     try:
         if len(optimizer.param_groups) > 0:  # type: ignore[attr-defined]
@@ -237,14 +282,14 @@ def _set_backend_noise(optimizer: torch.optim.Optimizer, *, enabled: bool, scale
     for g in optimizer.param_groups:  # type: ignore[attr-defined]
         if force_on:
             g["add_noise"] = True
-            # For AdaptiveSGHMC, keep noise enabled and set noise_scale to the caller-provided scale
-            # (SPIDER sets this to 1.0 for adaptive backends), falling back to 1.0.
+            # For AdaptiveSGHMC, keep `add_noise=True` but allow `noise_scale` to be 0.0 to
+            # match Phase 2 (deterministic) behavior.
             try:
                 s = float(scale)
-                if not math.isfinite(s) or s <= 0.0:
-                    s = 1.0
+                if not math.isfinite(s) or s < 0.0:
+                    s = 0.0
             except Exception:
-                s = 1.0
+                s = 0.0
             g["noise_scale"] = s
         else:
             g["add_noise"] = bool(enabled and (scale > 0.0))
@@ -287,12 +332,36 @@ def _run_epoch(
     state.params["_prior_event_runtime_enable"] = bool(state.params.get("prior_event_enable", True))
     state.params["_prior_centroid_runtime_enable"] = bool(state.params.get("prior_centroid_enable", True))
     state.params["_prior_noise_runtime_enable"] = bool(state.params.get("prior_noise_enable", True))
+
+    ddp_enabled, ddp_rank, ddp_world_size, ddp_is_main = _ddp_info(state.params)
     
     use_event_batches = bool(state.params.get("event_batch_enable", False))
+    if ddp_enabled and use_event_batches:
+        raise ValueError(
+            "torchrun/DDP mode for `spider sample` currently supports only standard batching "
+            "(inference.batching.standard.*). Disable inference.batching.event_batches.enabled."
+        )
+    permute_time_s = 0.0
     if not use_event_batches:
         # Allow a per-run seed offset (e.g. for multi-GPU independent chains).
         seed0 = int(state.params.get("runtime_seed", 0))
-        state.begin_epoch_rr(seed=int(seed0 + epoch_index))
+        shuffle = bool(state.params.get("batch_shuffle", True))
+        # Optional: timing + one-line confirmation (helps diagnose big-N performance).
+        t_perm0 = time.time()
+        state.begin_epoch_rr(seed=int(seed0 + epoch_index), shuffle=shuffle)
+        permute_time_s = float(time.time() - t_perm0)
+        if epoch_index == 0:
+            try:
+                if (not ddp_enabled) or ddp_is_main:
+                    print(
+                        f"[spider][INFO][BATCH] standard.shuffle={int(shuffle)} "
+                        f"permute_s={permute_time_s:.3f} "
+                        f"batch_size={int(state.params.get('batch_size_sgld', 0) or 0)} "
+                        f"N={int(getattr(state, 'N', 0) or 0)}",
+                        flush=True,
+                    )
+            except Exception:
+                pass
 
     # Expose epoch index to lower-level code paths (e.g., likelihood caching / refresh schedules).
     # This is an internal implementation detail, not a user-facing config key.
@@ -318,6 +387,13 @@ def _run_epoch(
     b_end_sumsq_s = None
     b_end_count_p = None
     b_end_count_s = None
+    # slowness_inducing_gp: track RMS of the *event-level u vectors* at endpoints (more interpretable than dual coeffs).
+    u_end_sumsq_p = None
+    u_end_sumsq_s = None
+    u_end_count_p = None
+    u_end_count_s = None
+    u_end_maxnorm_p = None
+    u_end_maxnorm_s = None
     # Online ESS metrics are computed only when enough *saved samples* exist and the cadence triggers.
     # To avoid gaps in W&B time series (epochs where ESS isn't recomputed), we cache the last metrics
     # on the state object and re-log them each epoch.
@@ -391,6 +467,8 @@ def _run_epoch(
 
     # SVRG Snapshot Update (only if SVRG enabled and we are sampling)
     svrg_enabled = state.svrg_enable and is_sampling
+    if ddp_enabled and svrg_enabled:
+        raise ValueError("SVRG is not supported in torchrun/DDP mode (it requires extra full-gradient bookkeeping). Disable inference.diagnostics.svrg.enabled.")
     if svrg_enabled:
         # Check if we need to update snapshot (e.g. every epoch)
         # For simplicity, update at start of every epoch for now if enabled
@@ -402,11 +480,45 @@ def _run_epoch(
         if isinstance(diag0, dict) and bool(diag0.get("profile_shared_event_latent", False)):
             state.params["_se_lat_time_ms_sum"] = 0.0
             state.params["_se_lat_time_ms_count"] = 0
+        # Optional profiling: collapsed shared_event_re likelihood (PCG) cost + workload stats.
+        # Expected config location: inference.diagnostics.profile_shared_event_re (bool).
+        if isinstance(diag0, dict) and bool(diag0.get("profile_shared_event_re", False)):
+            state.params["_se_re_time_ms_sum"] = 0.0
+            state.params["_se_re_time_ms_count"] = 0
+            state.params["_se_re_groups_sum"] = 0
+            state.params["_se_re_groups_pcg_sum"] = 0
+            state.params["_se_re_groups_fallback_sum"] = 0
+            state.params["_se_re_max_rows_max"] = 0
+            state.params["_se_re_max_nodes_max"] = 0
     except Exception:
         pass
 
+    # Optional: batch-level progress heartbeat (especially helpful in torchrun/DDP where only rank0 prints).
+    # This prevents "looks hung" confusion on very large datasets.
+    batch_progress_every = 0
+    try:
+        if bool(state.params.get("verbose", False)):
+            diag = _get_diagnostics_cfg(state.params)
+            if isinstance(diag, dict):
+                # Default: in DDP, print every 10 batches when verbose=true.
+                if ddp_enabled:
+                    batch_progress_every = int(diag.get("ddp_batch_progress_every", 10))
+                else:
+                    batch_progress_every = int(diag.get("batch_progress_every", 0))
+    except Exception:
+        batch_progress_every = 0
+    if batch_progress_every < 0:
+        batch_progress_every = 0
+    # Best-effort: total batches (works for standard batching / ranges)
+    total_batches = None
+    try:
+        if isinstance(batch_iter, range):
+            total_batches = int(len(batch_iter))
+    except Exception:
+        total_batches = None
+
     # Inner Loop
-    for batch_item in batch_iter:
+    for bi, batch_item in enumerate(batch_iter):
         optimizer.zero_grad(set_to_none=True)
         
         # Prepare batch data
@@ -549,6 +661,7 @@ def _run_epoch(
             i_end = min(i_start + batch_size, state.N)
             II_b = state.II_epoch[i_start:i_end, :]
             YY_b = state.YY_epoch[i_start:i_end]
+            global_bsz = int(i_end - i_start)
             # indices for SSST
             # If using standard batching, we assume contiguous indices in epoch permutation
             rows = None 
@@ -572,6 +685,40 @@ def _run_epoch(
                     state.params["_runtime_bucket_station_index"] = None
             except Exception:
                 state.params["_runtime_bucket_station_index"] = None
+
+        # --- DDP shard: split *this batch* across ranks (global batch size is the configured batch size) ---
+        if ddp_enabled:
+            try:
+                # We only support standard batching here (event-batch path returns earlier).
+                B = int(II_b.shape[0]) if isinstance(II_b, torch.Tensor) else 0
+                if B != int(global_bsz):
+                    global_bsz = int(B)
+                # Deterministic contiguous shard per rank.
+                s = int((global_bsz * ddp_rank) // ddp_world_size)
+                e = int((global_bsz * (ddp_rank + 1)) // ddp_world_size)
+                II_b = II_b[s:e, :]
+                YY_b = YY_b[s:e]
+                sta_rt = state.params.get("_runtime_bucket_station_index", None)
+                if isinstance(sta_rt, torch.Tensor) and int(sta_rt.shape[0]) == int(global_bsz):
+                    state.params["_runtime_bucket_station_index"] = sta_rt[s:e]
+            except Exception:
+                # Leave batch unsharded if something goes wrong; better than crashing mid-run.
+                pass
+
+        # Optional progress heartbeat at the start of the batch (rank0 only under torchrun).
+        try:
+            if batch_progress_every > 0 and ((bi % batch_progress_every) == 0) and ((not ddp_enabled) or ddp_is_main):
+                done = int(bi)
+                tot = int(total_batches) if total_batches is not None else -1
+                elapsed = float(time.time() - epoch_start_time)
+                if tot > 0:
+                    rate = float(done) / max(1e-9, elapsed)
+                    eta = float(tot - done) / max(1e-9, rate)
+                    print(f"[spider][INFO][BATCH] epoch={epoch_index} batch={done}/{tot} elapsed_s={elapsed:.1f} eta_s={eta:.1f}", flush=True)
+                else:
+                    print(f"[spider][INFO][BATCH] epoch={epoch_index} batch={done} elapsed_s={elapsed:.1f}", flush=True)
+        except Exception:
+            pass
 
         # Noise scales for loss
         σp, σs = _current_noise_scales(state)
@@ -790,6 +937,304 @@ def _run_epoch(
                                     delta_b = None
                         else:
                             delta_b = None
+                    elif mode == "slowness_inducing_gp":
+                        # Station×phase slowness-vector inducing GP (pair-shared approximation):
+                        #
+                        # For each station×phase, we model a 3D slowness perturbation vector field u(x) (units s/km)
+                        # with a Matérn(3/2) kernel in XYZ (km). We store inducing coefficients c such that:
+                        #   u(e) ≈ Σ_j k(||x_e - x_u||) * c_u_j
+                        # where c has prior c ~ N(0, K_UU^{-1}) and K_UU is the Matérn kernel matrix.
+                        #
+                        # Under the "pair-shared" approximation for DD pairs separated by <=~1 km, the DD correction is:
+                        #   δt_ij ≈ 0.5*(u(e1)+u(e2)) · (x1 - x2)
+                        #
+                        # IMPORTANT: we use current locations (X_src + ΔX_src) so gradients flow through geometry.
+                        try:
+                            nei_idx = getattr(state, "shared_event_latent_inducing_neighbor_idx", None)
+                            ind_ev = getattr(state, "shared_event_latent_inducing_event_idx", None)
+                            U_xyz = getattr(state, "shared_event_latent_inducing_xyz_km", None)
+                            fixed_xyz = bool(state.params.get("_shared_event_latent_inducing_fixed_xyz", False))
+                            if not isinstance(nei_idx, torch.Tensor):
+                                raise RuntimeError("missing inducing_gp neighbor tensors")
+                            if fixed_xyz:
+                                if not (isinstance(U_xyz, torch.Tensor) and U_xyz.ndim == 2 and int(U_xyz.shape[1]) >= 3):
+                                    raise RuntimeError("slowness_inducing_gp fixed_xyz requires shared_event_latent_inducing_xyz_km")
+                            else:
+                                if not isinstance(ind_ev, torch.Tensor):
+                                    raise RuntimeError("missing inducing_gp inducing_event_idx tensor")
+                            if not (isinstance(b_lat, torch.Tensor) and b_lat.ndim == 4 and int(b_lat.shape[2]) == 2 and int(b_lat.shape[3]) == 3):
+                                raise RuntimeError("invalid slowness_inducing_gp shared_event_latent_b shape")
+
+                            # Current event coords (km) for endpoints and inducing points (subset of events).
+                            Xcur = (state.X_src + state.dX_src)[:, :3].to(torch.float32)
+                            x1 = Xcur.index_select(0, e1)  # (B,3)
+                            x2 = Xcur.index_select(0, e2)  # (B,3)
+                            dx = (x1 - x2).to(torch.float32)  # (B,3)
+                            dx_norm2 = (dx * dx).sum(dim=1).to(torch.float32)  # (B,)
+
+                            # Neighbor lists per endpoint
+                            idx1 = nei_idx.index_select(0, e1)  # (B,m)
+                            idx2 = nei_idx.index_select(0, e2)  # (B,m)
+                            m1 = (idx1 >= 0)
+                            m2 = (idx2 >= 0)
+                            idx1c = idx1.clamp_min(0)
+                            idx2c = idx2.clamp_min(0)
+
+                            # Kernel weights: Matérn ν=3/2 in XYZ at current positions.
+                            ell = float(state.params.get("_shared_event_latent_ell_km", 0.0))
+                            if not (ell > 0.0):
+                                raise RuntimeError("slowness_inducing_gp requires ell_km > 0")
+                            a = float(np.sqrt(3.0) / float(ell))
+
+                            def _weights(endpoint_x: torch.Tensor, idxc: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+                                # endpoint_x: (B,3), idxc: (B,m) global inducing idx, mask: (B,m)
+                                if fixed_xyz and isinstance(U_xyz, torch.Tensor):
+                                    u_xyz = U_xyz.index_select(0, idxc.reshape(-1)).reshape(idxc.shape[0], idxc.shape[1], 3)  # (B,m,3)
+                                else:
+                                    u_ev = ind_ev.index_select(0, idxc.reshape(-1)).reshape(idxc.shape)  # (B,m) event ids
+                                    u_xyz = Xcur.index_select(0, u_ev.reshape(-1)).reshape(idxc.shape[0], idxc.shape[1], 3)  # (B,m,3)
+                                d = torch.linalg.norm(endpoint_x.unsqueeze(1) - u_xyz, dim=2).to(torch.float32)  # (B,m)
+                                x = (a * d).to(torch.float32)
+                                w = (1.0 + x) * torch.exp(-x)
+                                return w * mask.to(torch.float32)
+
+                            w1 = _weights(x1, idx1c, m1)  # (B,m)
+                            w2 = _weights(x2, idx2c, m2)  # (B,m)
+
+                            W_sta = getattr(state, "shared_event_latent_station_basis_W", None)
+                            n_stations_rt = int(getattr(state, "n_stations", 0))
+                            is_per_station = (n_stations_rt > 0) and (int(b_lat.shape[0]) == int(n_stations_rt))
+                            is_basis = (
+                                isinstance(W_sta, torch.Tensor)
+                                and W_sta.ndim == 2
+                                and int(W_sta.shape[0]) == int(n_stations_rt)
+                                and int(b_lat.shape[0]) == int(W_sta.shape[1])
+                            )
+                            if (not is_per_station) and (not is_basis):
+                                raise RuntimeError("slowness_inducing_gp: expected per-station or station-basis coefficients")
+
+                            # Gather coefficients at neighbor indices, returning (B,m,2,3) for each endpoint.
+                            if is_per_station:
+                                # IMPORTANT: avoid advanced indexing b_lat[sta, idx] here.
+                                # On large batches this can be extremely slow due to non-coalesced gather kernels.
+                                # Instead, flatten (station, inducing_idx) into a single axis and use index_select.
+                                try:
+                                    S = int(b_lat.shape[0])
+                                    M_total = int(b_lat.shape[1])
+                                    flat = b_lat.reshape(S * M_total, 2, 3).to(torch.float32)  # (S*M,2,3)
+                                    sta0 = sta_bi.to(torch.int64).clamp_min(0).clamp_max(max(S - 1, 0))
+                                    lin1 = (sta0.unsqueeze(1) * M_total + idx1c.to(torch.int64)).reshape(-1)
+                                    lin2 = (sta0.unsqueeze(1) * M_total + idx2c.to(torch.int64)).reshape(-1)
+                                    C1 = flat.index_select(0, lin1).reshape(idx1c.shape[0], idx1c.shape[1], 2, 3)  # (B,m,2,3)
+                                    C2 = flat.index_select(0, lin2).reshape(idx2c.shape[0], idx2c.shape[1], 2, 3)  # (B,m,2,3)
+                                except Exception:
+                                    # Fallback (should be rare): keep old behavior.
+                                    C1 = b_lat[sta_bi.unsqueeze(1), idx1c].to(torch.float32)  # (B,m,2,3)
+                                    C2 = b_lat[sta_bi.unsqueeze(1), idx2c].to(torch.float32)  # (B,m,2,3)
+                            else:
+                                # Basis: reconstruct station-specific coefficients by weighting basis ranks.
+                                # A6: (R,M,6) where last dim packs phase×xyz.
+                                A = b_lat.to(torch.float32)
+                                R = int(A.shape[0]); M = int(A.shape[1])
+                                A6 = A.reshape(R, M, 6)
+                                Wb = W_sta.index_select(0, sta_bi).to(torch.float32)  # (B,R)
+                                Wr = Wb.transpose(0, 1).unsqueeze(-1).unsqueeze(-1)  # (R,B,1,1)
+
+                                def _gather_station_coeffs(idxc: torch.Tensor) -> torch.Tensor:
+                                    # idxc: (B,m) -> (B,m,2,3)
+                                    B0, m0 = int(idxc.shape[0]), int(idxc.shape[1])
+                                    Aexp = A6.unsqueeze(1).expand(R, B0, M, 6)  # (R,B,M,6)
+                                    idxe = idxc.unsqueeze(0).unsqueeze(-1).expand(R, B0, m0, 6)  # (R,B,m,6)
+                                    g = torch.gather(Aexp, 2, idxe)  # (R,B,m,6)
+                                    g = g.reshape(R, B0, m0, 2, 3)
+                                    return (g * Wr.unsqueeze(-1)).sum(dim=0)  # (B,m,2,3)
+
+                                C1 = _gather_station_coeffs(idx1c)
+                                C2 = _gather_station_coeffs(idx2c)
+
+                            # Interpolate endpoint u vectors (B,2,3)
+                            u1 = (C1 * w1.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)  # (B,2,3)
+                            u2 = (C2 * w2.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)  # (B,2,3)
+                            u_avg = 0.5 * (u1 + u2)  # (B,2,3)
+
+                            # Convert to time using configured units for tau:
+                            # - abs: u_avg is interpreted as slowness vector (s/km) -> seconds = u·dx
+                            # - vel_frac: u_avg is interpreted as dimensionless ε (≈ δv/v) -> seconds ≈ (ε·dx) / v(z)
+                            units = str(state.params.get("_shared_event_latent_slowness_tau_units", "abs")).strip().lower()
+                            if units == "vel_frac":
+                                # Lookup vP(z), vS(z) via *GPU* linear interpolation over depth centers.
+                                #
+                                # IMPORTANT: avoid GPU->CPU numpy round-trips here; with large batches this
+                                # can dominate runtime and cause DDP/NCCL timeouts (one rank finishes much later).
+                                #
+                                # We cache torch tensors in `state.params` so this setup happens once per process.
+                                zavg = (0.5 * (x1[:, 2] + x2[:, 2])).to(torch.float32)  # (B,)
+
+                                def _get_v1d_tensors() -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+                                    # Cached tensors
+                                    zc_t = state.params.get("_runtime_eikonet_v1d_z_cent_km_t", None)
+                                    vp_t = state.params.get("_runtime_eikonet_v1d_vp_km_s_t", None)
+                                    vs_t = state.params.get("_runtime_eikonet_v1d_vs_km_s_t", None)
+                                    dev0 = dx.device
+                                    try:
+                                        if (
+                                            isinstance(zc_t, torch.Tensor)
+                                            and isinstance(vp_t, torch.Tensor)
+                                            and isinstance(vs_t, torch.Tensor)
+                                            and zc_t.ndim == 1
+                                            and vp_t.ndim == 1
+                                            and vs_t.ndim == 1
+                                            and int(zc_t.numel()) == int(vp_t.numel()) == int(vs_t.numel())
+                                            and int(zc_t.numel()) >= 2
+                                            and zc_t.device == dev0
+                                            and vp_t.device == dev0
+                                            and vs_t.device == dev0
+                                        ):
+                                            return zc_t, vp_t, vs_t
+                                    except Exception:
+                                        pass
+
+                                    # Build from config arrays (usually stored by EikoNet loading)
+                                    try:
+                                        z_cent = np.asarray(state.params.get("_eikonet_v1d_depth_centers_km", []), dtype=np.float32).reshape(-1)
+                                        vp = np.asarray(state.params.get("_eikonet_v1d_vp_km_s", []), dtype=np.float32).reshape(-1)
+                                        vs = np.asarray(state.params.get("_eikonet_v1d_vs_km_s", []), dtype=np.float32).reshape(-1)
+                                    except Exception:
+                                        z_cent = np.zeros((0,), dtype=np.float32)
+                                        vp = np.zeros((0,), dtype=np.float32)
+                                        vs = np.zeros((0,), dtype=np.float32)
+                                    if z_cent.size < 2 or vp.size != z_cent.size or vs.size != z_cent.size:
+                                        return None, None, None
+
+                                    zc = torch.from_numpy(z_cent).to(device=dev0, dtype=torch.float32)
+                                    vp0 = torch.from_numpy(vp).to(device=dev0, dtype=torch.float32)
+                                    vs0 = torch.from_numpy(vs).to(device=dev0, dtype=torch.float32)
+                                    # Enforce sorted z-centers for bucketize/searchsorted
+                                    try:
+                                        if not bool(torch.all(zc[1:] >= zc[:-1]).item()):
+                                            perm = torch.argsort(zc)
+                                            zc = zc.index_select(0, perm)
+                                            vp0 = vp0.index_select(0, perm)
+                                            vs0 = vs0.index_select(0, perm)
+                                    except Exception:
+                                        pass
+                                    # Replace any invalid values with reasonable fallbacks (keeps interpolation stable)
+                                    vp0 = torch.where(torch.isfinite(vp0) & (vp0 > 0.0), vp0, torch.full_like(vp0, 6.0))
+                                    vs0 = torch.where(torch.isfinite(vs0) & (vs0 > 0.0), vs0, torch.full_like(vs0, 3.5))
+
+                                    # Cache for future batches
+                                    state.params["_runtime_eikonet_v1d_z_cent_km_t"] = zc
+                                    state.params["_runtime_eikonet_v1d_vp_km_s_t"] = vp0
+                                    state.params["_runtime_eikonet_v1d_vs_km_s_t"] = vs0
+                                    return zc, vp0, vs0
+
+                                def _interp_torch(zq: torch.Tensor, zc: torch.Tensor, vv: torch.Tensor, v_fallback: float) -> torch.Tensor:
+                                    # zq: (B,), zc/vv: (K,) sorted ascending. Clamp to endpoints outside range.
+                                    K = int(zc.numel())
+                                    if K < 2:
+                                        return torch.full_like(zq, float(v_fallback), dtype=torch.float32)
+                                    idx = torch.bucketize(zq, zc)  # 0..K
+                                    idx0 = (idx - 1).clamp(min=0, max=K - 2)
+                                    idx1 = idx0 + 1
+                                    z0 = zc.index_select(0, idx0)
+                                    z1 = zc.index_select(0, idx1)
+                                    v0 = vv.index_select(0, idx0)
+                                    v1 = vv.index_select(0, idx1)
+                                    denom = (z1 - z0).clamp_min(1e-12)
+                                    w = ((zq - z0) / denom).clamp(0.0, 1.0)
+                                    out = v0 + w * (v1 - v0)
+                                    out = torch.where(torch.isfinite(out) & (out > 0.0), out, torch.full_like(out, float(v_fallback)))
+                                    return out.to(torch.float32)
+
+                                zc, vp0, vs0 = _get_v1d_tensors()
+                                if zc is None or vp0 is None or vs0 is None:
+                                    vP = torch.full_like(zavg, 6.0, dtype=torch.float32)
+                                    vS = torch.full_like(zavg, 3.5, dtype=torch.float32)
+                                else:
+                                    vP = _interp_torch(zavg, zc, vp0, 6.0)
+                                    vS = _interp_torch(zavg, zc, vs0, 3.5)
+                                vP = vP.clamp_min(1e-6)
+                                vS = vS.clamp_min(1e-6)
+
+                                # Optional Stage-5 FITC diagonal correction (variance inflation).
+                                # Var(0.5(u1+u2)·dx / v)^approx ≈ 0.25*(r1+r2) * ||dx||^2 * tau^2 / v^2
+                                try:
+                                    if bool(state.params.get("_shared_event_latent_inducing_fitc_enable", False)):
+                                        resid = getattr(state, "shared_event_latent_inducing_fitc_resid", None)
+                                        if isinstance(resid, torch.Tensor) and resid.ndim == 1:
+                                            r1 = resid.index_select(0, e1).to(torch.float32)
+                                            r2 = resid.index_select(0, e2).to(torch.float32)
+                                            rsum = (0.25 * (r1 + r2)).clamp_min(0.0)
+                                            tau_ps = state.params.get("_shared_event_latent_tau_s", [0.0, 0.0])
+                                            tau_p = float(tau_ps[0]); tau_s = float(tau_ps[1])
+                                            extraP = rsum * dx_norm2 * (tau_p * tau_p) / (vP * vP)
+                                            extraS = rsum * dx_norm2 * (tau_s * tau_s) / (vS * vS)
+                                            extra = torch.where(is_s, extraS, extraP).to(torch.float32)
+                                            sigma_extra_var = extra if sigma_extra_var is None else (sigma_extra_var + extra)
+                                except Exception:
+                                    pass
+
+                                dP = (u_avg[:, 0, :] * dx).sum(dim=1) / vP
+                                dS = (u_avg[:, 1, :] * dx).sum(dim=1) / vS
+                                delta_b = torch.where(is_s, dS, dP)
+                            else:
+                                # Dot with event separation vector: seconds = (s/km)·(km)
+                                # Optional Stage-5 FITC diagonal correction (variance inflation).
+                                # Var(0.5(u1+u2)·dx)^approx ≈ 0.25*(r1+r2) * ||dx||^2 * tau^2
+                                try:
+                                    if bool(state.params.get("_shared_event_latent_inducing_fitc_enable", False)):
+                                        resid = getattr(state, "shared_event_latent_inducing_fitc_resid", None)
+                                        if isinstance(resid, torch.Tensor) and resid.ndim == 1:
+                                            r1 = resid.index_select(0, e1).to(torch.float32)
+                                            r2 = resid.index_select(0, e2).to(torch.float32)
+                                            rsum = (0.25 * (r1 + r2)).clamp_min(0.0)
+                                            tau_ps = state.params.get("_shared_event_latent_tau_s", [0.0, 0.0])
+                                            tau_p = float(tau_ps[0]); tau_s = float(tau_ps[1])
+                                            extraP = rsum * dx_norm2 * (tau_p * tau_p)
+                                            extraS = rsum * dx_norm2 * (tau_s * tau_s)
+                                            extra = torch.where(is_s, extraS, extraP).to(torch.float32)
+                                            sigma_extra_var = extra if sigma_extra_var is None else (sigma_extra_var + extra)
+                                except Exception:
+                                    pass
+                                dP = (u_avg[:, 0, :] * dx).sum(dim=1)
+                                dS = (u_avg[:, 1, :] * dx).sum(dim=1)
+                                delta_b = torch.where(is_s, dS, dP)
+
+                            # Diagnostics: log physical u-field magnitudes at endpoints (per-phase).
+                            # This is much more interpretable than raw inducing coefficients, especially in the dual/K^{-1} parameterization.
+                            try:
+                                if want_lat_diag:
+                                    u1P = u1[:, 0, :]
+                                    u2P = u2[:, 0, :]
+                                    u1S = u1[:, 1, :]
+                                    u2S = u2[:, 1, :]
+                                    # per-row endpoint norms
+                                    n1P = torch.linalg.norm(u1P, dim=1).to(torch.float32)
+                                    n2P = torch.linalg.norm(u2P, dim=1).to(torch.float32)
+                                    n1S = torch.linalg.norm(u1S, dim=1).to(torch.float32)
+                                    n2S = torch.linalg.norm(u2S, dim=1).to(torch.float32)
+                                    is_p_f = (~is_s).to(torch.float32)
+                                    is_s_f = is_s.to(torch.float32)
+
+                                    if u_end_sumsq_p is None:
+                                        u_end_sumsq_p = torch.zeros((), device=delta_b.device, dtype=torch.float32)
+                                        u_end_sumsq_s = torch.zeros((), device=delta_b.device, dtype=torch.float32)
+                                        u_end_count_p = torch.zeros((), device=delta_b.device, dtype=torch.float32)
+                                        u_end_count_s = torch.zeros((), device=delta_b.device, dtype=torch.float32)
+                                        u_end_maxnorm_p = torch.zeros((), device=delta_b.device, dtype=torch.float32)
+                                        u_end_maxnorm_s = torch.zeros((), device=delta_b.device, dtype=torch.float32)
+
+                                    u_end_sumsq_p = u_end_sumsq_p + ((n1P * n1P + n2P * n2P) * is_p_f).sum()
+                                    u_end_sumsq_s = u_end_sumsq_s + ((n1S * n1S + n2S * n2S) * is_s_f).sum()
+                                    u_end_count_p = u_end_count_p + (2.0 * is_p_f.sum())
+                                    u_end_count_s = u_end_count_s + (2.0 * is_s_f.sum())
+                                    # Max endpoint norm (helps detect a small number of pathological events)
+                                    u_end_maxnorm_p = torch.maximum(u_end_maxnorm_p, torch.maximum(n1P, n2P).max())
+                                    u_end_maxnorm_s = torch.maximum(u_end_maxnorm_s, torch.maximum(n1S, n2S).max())
+                            except Exception:
+                                pass
+                        except Exception:
+                            delta_b = None
                     else:
                         # Explicit event-latent parameterization (full / graph_gmrf):
                         # - per-station: b_lat shape (n_stations, n_events, 2)
@@ -883,31 +1328,323 @@ def _run_epoch(
                 except Exception:
                     pass
 
-        loss = posterior_loss(
-            idx=II_b,
-            y=YY_b,
-            X_src=state.X_src,
-            ΔX_src=state.dX_src,
-            model=state.model,
-            prior_event=state.prior_event,
-            prior_centroid=state.prior_centroid,
-            σ_p=σp,
-            σ_s=σs,
-            N_total=state.N,
-            params=state.params,
-            nuisance_delta=nuisance_delta,
-            sigma_extra_var=sigma_extra_var,
-            cluster_ids=state.cluster_ids,
-            cluster_counts=state.cluster_counts,
-            event_precision_matrix=state.event_precision_matrix,
-            shared_event_latent_b=(getattr(state, "shared_event_latent_b", None) if bool(state.params.get("_shared_event_latent_enabled", False)) else None),
-        )
+        # Optional: heteroscedastic likelihood inflation (no latent term).
+        # Adds extra per-observation variance in quadrature with the base phase noise:
+        #   sigma_eff^2 = sigma_phase^2 + sigma_extra_var
+        #
+        # IMPORTANT: we detach the distance computation from gradients w.r.t. event locations to avoid
+        # a perverse incentive to increase inter-event distances to reduce likelihood weight.
+        try:
+            if bool(state.params.get("_likelihood_sigma_inflation_enabled", False)) and isinstance(II_b, torch.Tensor) and II_b.numel() > 0:
+                mode = str(state.params.get("_likelihood_sigma_inflation_mode", "vel_frac_linear_dd")).strip().lower()
+                if mode == "vel_frac_linear_dd":
+                    vel_frac = state.params.get("_likelihood_sigma_inflation_vel_frac", [0.0, 0.0])
+                    v_km_s = state.params.get("_likelihood_sigma_inflation_v_km_s", [6.0, 3.5])
+                    max_d_km = state.params.get("_likelihood_sigma_inflation_max_d_km", None)
+                    use_3d = bool(state.params.get("_likelihood_sigma_inflation_use_3d", True))
+                    try:
+                        f_p = float(vel_frac[0]); f_s = float(vel_frac[1])
+                    except Exception:
+                        f_p = float(vel_frac); f_s = float(vel_frac)
+                    try:
+                        v_p = float(v_km_s[0]); v_s = float(v_km_s[1])
+                    except Exception:
+                        v_p = float(v_km_s); v_s = float(v_km_s)
+                    if (f_p > 0.0 or f_s > 0.0) and (v_p > 0.0 and v_s > 0.0):
+                        e1 = II_b[:, 0].to(torch.int64)
+                        e2 = II_b[:, 1].to(torch.int64)
+                        # Current event coordinates (km); detach to avoid gradients through sigma.
+                        Xcur = (state.X_src[:, :3] + state.dX_src[:, :3].detach()).to(torch.float32)
+                        x1 = Xcur.index_select(0, e1)
+                        x2 = Xcur.index_select(0, e2)
+                        dxyz = (x2 - x1)
+                        if not use_3d:
+                            dxyz = dxyz[:, :2]
+                        d_km = torch.linalg.norm(dxyz, dim=1).clamp_min(0.0)
+                        if max_d_km is not None:
+                            try:
+                                md = float(max_d_km)
+                                if md > 0.0 and math.isfinite(md):
+                                    d_km = d_km.clamp_max(md)
+                            except Exception:
+                                pass
+                        ph = YY_b[:, 4]
+                        is_s = (ph >= 0.5)
+                        # sigma_struct(d) = (f / v) * d  [seconds]
+                        slope_p = float(f_p) / float(v_p)
+                        slope_s = float(f_s) / float(v_s)
+                        sigma_struct = torch.where(is_s, d_km * float(slope_s), d_km * float(slope_p)).to(torch.float32)
+                        extra_var = sigma_struct.square().clamp_min(0.0)
+                        sigma_extra_var = extra_var if sigma_extra_var is None else (sigma_extra_var + extra_var)
+
+                        # Accumulate per-epoch summary stats (cheap; means only).
+                        try:
+                            if "_sigma_infl_vel_sum_ms" not in state.params:
+                                state.params["_sigma_infl_vel_sum_ms"] = 0.0
+                                state.params["_sigma_infl_vel_count"] = 0
+                                state.params["_sigma_infl_vel_sum_ms_P"] = 0.0
+                                state.params["_sigma_infl_vel_count_P"] = 0
+                                state.params["_sigma_infl_vel_sum_ms_S"] = 0.0
+                                state.params["_sigma_infl_vel_count_S"] = 0
+                                state.params["_sigma_infl_vel_d_km_sum"] = 0.0
+                                state.params["_sigma_infl_vel_d_km_count"] = 0
+                            ms = (1000.0 * sigma_struct.detach()).to(torch.float32)
+                            state.params["_sigma_infl_vel_sum_ms"] = float(state.params.get("_sigma_infl_vel_sum_ms", 0.0) or 0.0) + float(ms.sum().item())
+                            state.params["_sigma_infl_vel_count"] = int(state.params.get("_sigma_infl_vel_count", 0) or 0) + int(ms.numel())
+                            msP = ms[~is_s]
+                            msS = ms[is_s]
+                            if int(msP.numel()) > 0:
+                                state.params["_sigma_infl_vel_sum_ms_P"] = float(state.params.get("_sigma_infl_vel_sum_ms_P", 0.0) or 0.0) + float(msP.sum().item())
+                                state.params["_sigma_infl_vel_count_P"] = int(state.params.get("_sigma_infl_vel_count_P", 0) or 0) + int(msP.numel())
+                            if int(msS.numel()) > 0:
+                                state.params["_sigma_infl_vel_sum_ms_S"] = float(state.params.get("_sigma_infl_vel_sum_ms_S", 0.0) or 0.0) + float(msS.sum().item())
+                                state.params["_sigma_infl_vel_count_S"] = int(state.params.get("_sigma_infl_vel_count_S", 0) or 0) + int(msS.numel())
+                            dk = d_km.detach()
+                            state.params["_sigma_infl_vel_d_km_sum"] = float(state.params.get("_sigma_infl_vel_d_km_sum", 0.0) or 0.0) + float(dk.sum().item())
+                            state.params["_sigma_infl_vel_d_km_count"] = int(state.params.get("_sigma_infl_vel_d_km_count", 0) or 0) + int(dk.numel())
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        b_lat_for_prior = (getattr(state, "shared_event_latent_b", None) if bool(state.params.get("_shared_event_latent_enabled", False)) else None)
+        if ddp_enabled:
+            # DDP-safe loss construction:
+            # - Likelihood term is the *global batch mean* across all ranks: (1/B) Σ_i NLL_i.
+            #   Each rank computes a local mean and scales by (B_r / B).
+            # - Prior term is already scaled by 1/N_total in compute_prior_loss(); we want it included once,
+            #   so we add it as (1/world_size) per rank.
+            try:
+                local_bsz = int(II_b.shape[0]) if isinstance(II_b, torch.Tensor) else 0
+            except Exception:
+                local_bsz = 0
+            try:
+                B_global = int(global_bsz) if "global_bsz" in locals() else int(local_bsz)
+            except Exception:
+                B_global = int(local_bsz)
+            B_global = max(1, int(B_global))
+
+            if local_bsz > 0:
+                # Optional profiling: time the shared_event_re likelihood computation.
+                try:
+                    diag = _get_diagnostics_cfg(state.params)
+                    prof_se_re = bool(diag.get("profile_shared_event_re", False)) if isinstance(diag, dict) else False
+                except Exception:
+                    prof_se_re = False
+                se_re_t0 = None
+                sl_re_t0 = None
+                try:
+                    diag = _get_diagnostics_cfg(state.params)
+                    prof_sl_re = bool(diag.get("profile_slowness_re", False)) if isinstance(diag, dict) else False
+                except Exception:
+                    prof_sl_re = False
+                if prof_se_re and bool(state.params.get("_shared_event_re_enabled", False)):
+                    try:
+                        import time as _time
+                        se_re_t0 = _time.perf_counter()
+                    except Exception:
+                        se_re_t0 = None
+                if prof_sl_re and bool(state.params.get("_slowness_re_enabled", False)):
+                    try:
+                        import time as _time
+                        sl_re_t0 = _time.perf_counter()
+                    except Exception:
+                        sl_re_t0 = None
+                loss_like = compute_likelihood_loss(
+                    idx=II_b,
+                    y=YY_b,
+                    X_src=state.X_src,
+                    ΔX_src=state.dX_src,
+                    model=state.model,
+                    σ_p=σp,
+                    σ_s=σs,
+                    params=state.params,
+                    nuisance_delta=nuisance_delta,
+                    sigma_extra_var=sigma_extra_var,
+                )
+                if prof_se_re and (se_re_t0 is not None) and bool(state.params.get("_shared_event_re_enabled", False)):
+                    try:
+                        import time as _time
+                        if state.device.type == "cuda":
+                            try:
+                                torch.cuda.synchronize()
+                            except Exception:
+                                pass
+                        dt_ms = 1000.0 * float(_time.perf_counter() - se_re_t0)
+                        state.params["_se_re_time_ms_sum"] = float(state.params.get("_se_re_time_ms_sum", 0.0) or 0.0) + float(dt_ms)
+                        state.params["_se_re_time_ms_count"] = int(state.params.get("_se_re_time_ms_count", 0) or 0) + 1
+                        # Workload stats from modeling.py (set per-call)
+                        g = int(state.params.get("_shared_event_re_runtime_last_groups", 0) or 0)
+                        g_pcg = int(state.params.get("_shared_event_re_runtime_last_groups_pcg", 0) or 0)
+                        g_fb = int(state.params.get("_shared_event_re_runtime_last_groups_fallback_diag", 0) or 0)
+                        mr = int(state.params.get("_shared_event_re_runtime_last_max_rows", 0) or 0)
+                        mn = int(state.params.get("_shared_event_re_runtime_last_max_nodes", 0) or 0)
+                        state.params["_se_re_groups_sum"] = int(state.params.get("_se_re_groups_sum", 0) or 0) + g
+                        state.params["_se_re_groups_pcg_sum"] = int(state.params.get("_se_re_groups_pcg_sum", 0) or 0) + g_pcg
+                        state.params["_se_re_groups_fallback_sum"] = int(state.params.get("_se_re_groups_fallback_sum", 0) or 0) + g_fb
+                        state.params["_se_re_max_rows_max"] = max(int(state.params.get("_se_re_max_rows_max", 0) or 0), mr)
+                        state.params["_se_re_max_nodes_max"] = max(int(state.params.get("_se_re_max_nodes_max", 0) or 0), mn)
+                    except Exception:
+                        pass
+                if prof_sl_re and (sl_re_t0 is not None) and bool(state.params.get("_slowness_re_enabled", False)):
+                    try:
+                        import time as _time
+                        if state.device.type == "cuda":
+                            try:
+                                torch.cuda.synchronize()
+                            except Exception:
+                                pass
+                        dt_ms = 1000.0 * float(_time.perf_counter() - sl_re_t0)
+                        state.params["_slowness_re_time_ms_sum"] = float(state.params.get("_slowness_re_time_ms_sum", 0.0) or 0.0) + float(dt_ms)
+                        state.params["_slowness_re_time_ms_count"] = int(state.params.get("_slowness_re_time_ms_count", 0) or 0) + 1
+                        # Workload stats from modeling.py (set per-call)
+                        g = int(state.params.get("_slowness_re_runtime_last_groups", 0) or 0)
+                        g_w = int(state.params.get("_slowness_re_runtime_last_groups_woodbury", 0) or 0)
+                        g_fb = int(state.params.get("_slowness_re_runtime_last_groups_fallback_diag", 0) or 0)
+                        mr = int(state.params.get("_slowness_re_runtime_last_max_rows", 0) or 0)
+                        mn = int(state.params.get("_slowness_re_runtime_last_max_nodes", 0) or 0)
+                        state.params["_slowness_re_groups_sum"] = int(state.params.get("_slowness_re_groups_sum", 0) or 0) + g
+                        state.params["_slowness_re_groups_woodbury_sum"] = int(state.params.get("_slowness_re_groups_woodbury_sum", 0) or 0) + g_w
+                        state.params["_slowness_re_groups_fallback_sum"] = int(state.params.get("_slowness_re_groups_fallback_sum", 0) or 0) + g_fb
+                        state.params["_slowness_re_max_rows_max"] = max(int(state.params.get("_slowness_re_max_rows_max", 0) or 0), mr)
+                        state.params["_slowness_re_max_nodes_max"] = max(int(state.params.get("_slowness_re_max_nodes_max", 0) or 0), mn)
+                    except Exception:
+                        pass
+            else:
+                loss_like = torch.tensor(0.0, device=state.device, dtype=torch.float32)
+
+            loss_prior = compute_prior_loss(
+                ΔX_src=state.dX_src,
+                prior_event=state.prior_event,
+                prior_centroid=state.prior_centroid,
+                σ_p=σp,
+                σ_s=σs,
+                N_total=state.N,
+                params=state.params,
+                cluster_ids=state.cluster_ids,
+                cluster_counts=state.cluster_counts,
+                event_precision_matrix=state.event_precision_matrix,
+                shared_event_latent_b=b_lat_for_prior,
+            )
+
+            loss = loss_like * (float(local_bsz) / float(B_global)) + (loss_prior / float(ddp_world_size))
+        else:
+            # Non-DDP path: compute likelihood + prior explicitly (same math as posterior_loss),
+            # so we can reuse shared_event_re profiling/timing.
+            try:
+                local_bsz = int(II_b.shape[0]) if isinstance(II_b, torch.Tensor) else 0
+            except Exception:
+                local_bsz = 0
+
+            if local_bsz > 0:
+                # Optional profiling: time the shared_event_re likelihood computation.
+                try:
+                    diag = _get_diagnostics_cfg(state.params)
+                    prof_se_re = bool(diag.get("profile_shared_event_re", False)) if isinstance(diag, dict) else False
+                    prof_sl_re = bool(diag.get("profile_slowness_re", False)) if isinstance(diag, dict) else False
+                except Exception:
+                    prof_se_re = False
+                    prof_sl_re = False
+                se_re_t0 = None
+                sl_re_t0 = None
+                if prof_se_re and bool(state.params.get("_shared_event_re_enabled", False)):
+                    try:
+                        import time as _time
+                        se_re_t0 = _time.perf_counter()
+                    except Exception:
+                        se_re_t0 = None
+                if prof_sl_re and bool(state.params.get("_slowness_re_enabled", False)):
+                    try:
+                        import time as _time
+                        sl_re_t0 = _time.perf_counter()
+                    except Exception:
+                        sl_re_t0 = None
+
+                loss_like = compute_likelihood_loss(
+                idx=II_b,
+                y=YY_b,
+                X_src=state.X_src,
+                ΔX_src=state.dX_src,
+                model=state.model,
+                    σ_p=σp,
+                    σ_s=σs,
+                    params=state.params,
+                    nuisance_delta=nuisance_delta,
+                    sigma_extra_var=sigma_extra_var,
+                )
+
+                if prof_se_re and (se_re_t0 is not None) and bool(state.params.get("_shared_event_re_enabled", False)):
+                    try:
+                        import time as _time
+                        if state.device.type == "cuda":
+                            try:
+                                torch.cuda.synchronize()
+                            except Exception:
+                                pass
+                        dt_ms = 1000.0 * float(_time.perf_counter() - se_re_t0)
+                        state.params["_se_re_time_ms_sum"] = float(state.params.get("_se_re_time_ms_sum", 0.0) or 0.0) + float(dt_ms)
+                        state.params["_se_re_time_ms_count"] = int(state.params.get("_se_re_time_ms_count", 0) or 0) + 1
+                        # Workload stats from modeling.py (set per-call)
+                        g = int(state.params.get("_shared_event_re_runtime_last_groups", 0) or 0)
+                        g_pcg = int(state.params.get("_shared_event_re_runtime_last_groups_pcg", 0) or 0)
+                        g_fb = int(state.params.get("_shared_event_re_runtime_last_groups_fallback_diag", 0) or 0)
+                        mr = int(state.params.get("_shared_event_re_runtime_last_max_rows", 0) or 0)
+                        mn = int(state.params.get("_shared_event_re_runtime_last_max_nodes", 0) or 0)
+                        state.params["_se_re_groups_sum"] = int(state.params.get("_se_re_groups_sum", 0) or 0) + g
+                        state.params["_se_re_groups_pcg_sum"] = int(state.params.get("_se_re_groups_pcg_sum", 0) or 0) + g_pcg
+                        state.params["_se_re_groups_fallback_sum"] = int(state.params.get("_se_re_groups_fallback_sum", 0) or 0) + g_fb
+                        state.params["_se_re_max_rows_max"] = max(int(state.params.get("_se_re_max_rows_max", 0) or 0), mr)
+                        state.params["_se_re_max_nodes_max"] = max(int(state.params.get("_se_re_max_nodes_max", 0) or 0), mn)
+                    except Exception:
+                        pass
+                if prof_sl_re and (sl_re_t0 is not None) and bool(state.params.get("_slowness_re_enabled", False)):
+                    try:
+                        import time as _time
+                        if state.device.type == "cuda":
+                            try:
+                                torch.cuda.synchronize()
+                            except Exception:
+                                pass
+                        dt_ms = 1000.0 * float(_time.perf_counter() - sl_re_t0)
+                        state.params["_slowness_re_time_ms_sum"] = float(state.params.get("_slowness_re_time_ms_sum", 0.0) or 0.0) + float(dt_ms)
+                        state.params["_slowness_re_time_ms_count"] = int(state.params.get("_slowness_re_time_ms_count", 0) or 0) + 1
+                        g = int(state.params.get("_slowness_re_runtime_last_groups", 0) or 0)
+                        g_w = int(state.params.get("_slowness_re_runtime_last_groups_woodbury", 0) or 0)
+                        g_fb = int(state.params.get("_slowness_re_runtime_last_groups_fallback_diag", 0) or 0)
+                        mr = int(state.params.get("_slowness_re_runtime_last_max_rows", 0) or 0)
+                        mn = int(state.params.get("_slowness_re_runtime_last_max_nodes", 0) or 0)
+                        state.params["_slowness_re_groups_sum"] = int(state.params.get("_slowness_re_groups_sum", 0) or 0) + g
+                        state.params["_slowness_re_groups_woodbury_sum"] = int(state.params.get("_slowness_re_groups_woodbury_sum", 0) or 0) + g_w
+                        state.params["_slowness_re_groups_fallback_sum"] = int(state.params.get("_slowness_re_groups_fallback_sum", 0) or 0) + g_fb
+                        state.params["_slowness_re_max_rows_max"] = max(int(state.params.get("_slowness_re_max_rows_max", 0) or 0), mr)
+                        state.params["_slowness_re_max_nodes_max"] = max(int(state.params.get("_slowness_re_max_nodes_max", 0) or 0), mn)
+                    except Exception:
+                        pass
+            else:
+                loss_like = torch.tensor(0.0, device=state.device, dtype=torch.float32)
+
+            loss_prior = compute_prior_loss(
+                ΔX_src=state.dX_src,
+                prior_event=state.prior_event,
+                prior_centroid=state.prior_centroid,
+                σ_p=σp,
+                σ_s=σs,
+                N_total=state.N,
+                params=state.params,
+                cluster_ids=state.cluster_ids,
+                cluster_counts=state.cluster_counts,
+                event_precision_matrix=state.event_precision_matrix,
+                shared_event_latent_b=b_lat_for_prior,
+            )
+            loss = loss_like + loss_prior
 
         # L2 Reg (Phase 1/General)
         if state.nuisance_enable and state.nuisance_alpha is not None:
              lam = float(state.params.get("nuisance_alpha_l2", 0.0))
              if lam > 0.0:
-                 loss = loss + lam * (state.nuisance_alpha.square().mean())
+                 # In DDP mode, treat this like a prior/regularizer (include once).
+                 reg = lam * (state.nuisance_alpha.square().mean())
+                 loss = loss + (reg / float(ddp_world_size) if ddp_enabled else reg)
 
         # Minibatch graph Laplacian penalty (suppresses internal floppy deformation modes)
         # Uses the same observed event pairs (II_b) that define the DD graph.
@@ -925,6 +1662,33 @@ def _run_epoch(
             continue
             
         loss.backward()
+
+        # DDP: all-reduce gradients (SUM) so all ranks take identical optimizer steps.
+        if ddp_enabled:
+            _ddp_allreduce_grads(optimizer)
+            # Abort step if any rank produced non-finite gradients
+            bad = 0
+            try:
+                for g in optimizer.param_groups:  # type: ignore[attr-defined]
+                    for p in g.get("params", []):
+                        if p is None or getattr(p, "grad", None) is None:
+                            continue
+                        if not torch.isfinite(p.grad).all():
+                            bad = 1
+                            break
+                    if bad:
+                        break
+            except Exception:
+                bad = 1
+            try:
+                bad_t = torch.tensor([bad], device=state.device, dtype=torch.int32)
+                dist.all_reduce(bad_t, op=dist.ReduceOp.MAX)
+                bad = int(bad_t.item())
+            except Exception:
+                bad = 1
+            if bad:
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
         # SVRG Correction
         if svrg_enabled and state.svrg_grad_full is not None and state.svrg_dX_snapshot is not None:
@@ -979,6 +1743,17 @@ def _run_epoch(
         if state.dX_src.grad is not None and not torch.isfinite(state.dX_src.grad).all():
             optimizer.zero_grad(set_to_none=True)
             continue
+
+        # Optional: per-dimension learning-rate multiplier for ΔT (origin time correction).
+        # This is implemented as a gradient scaler so it works for Adam and our SGLD/SGHMC backends.
+        try:
+            dt_lr_mult = float(state.params.get("dt_lr_mult", 1.0))
+            if math.isfinite(dt_lr_mult) and dt_lr_mult > 0.0 and (dt_lr_mult != 1.0):
+                g = state.dX_src.grad
+                if isinstance(g, torch.Tensor) and g.ndim == 2 and int(g.shape[1]) >= 4:
+                    g[:, 3].mul_(dt_lr_mult)
+        except Exception:
+            pass
             
         # Clipping
         if grad_clip_norm > 0.0:
@@ -987,6 +1762,9 @@ def _run_epoch(
                 params_to_clip.append(state.nuisance_alpha)
             torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=grad_clip_norm)
             
+        # Ensure sampler noise is identical across ranks (SGHMC/pSGLD inject noise in optimizer.step()).
+        if ddp_enabled:
+            _ddp_set_step_seed(state.params, int(state.global_step_count), device=state.device)
         optimizer.step()
         
         # Safety Check
@@ -995,12 +1773,15 @@ def _run_epoch(
                  state.dX_src.data = torch.nan_to_num(state.dX_src.data, nan=0.0, posinf=0.0, neginf=0.0)
         
         _clamp_dX_inplace(state)
+        _apply_shared_event_latent_constraints_inplace(state)
         
         # Sampling (Phase 4)
         if is_sampling:
             with torch.no_grad():
-                # Save every N steps
-                if state.global_step_count % state.params["save_every_n"] == 0:
+                # Save every N steps (to in-memory buffer; flushing to disk is handled elsewhere).
+                write_samples = bool(state.params.get("write_samples", True))
+                save_every_n = int(state.params.get("save_every_n", 1))
+                if write_samples and save_every_n > 0 and ddp_is_main and (state.global_step_count % save_every_n == 0):
                     # Initialize sampling wall-clock start time on first saved sample.
                     # This is used for online ESS/sec diagnostics (independent of GPU timings).
                     try:
@@ -1097,16 +1878,30 @@ def _run_epoch(
                         torch.cuda.empty_cache()
 
         # Stats
-        loss_f = float(loss.item())
-        total_loss_vals.append(loss_f)
+        # In DDP mode, the per-rank loss is constructed so that SUM across ranks equals the true global loss.
+        # Only rank0 logs/aggregates to avoid duplicated histories.
+        if ddp_enabled:
+            try:
+                loss_sum = loss.detach().clone()
+                dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+                loss_f = float(loss_sum.item())
+            except Exception:
+                loss_f = float("nan")
+        else:
+            loss_f = float(loss.item())
+        if (not ddp_enabled) or ddp_is_main:
+            total_loss_vals.append(loss_f)
         try:
             # Weight by number of rows/edges in this batch.
             # NOTE: must use the current batch tensor (II_b); other locals named `idx` exist in this function
             # for ESS diagnostics and are unrelated to batch size.
-            bsz = int(II_b.shape[0]) if isinstance(II_b, torch.Tensor) else 0
+            if ddp_enabled:
+                bsz = int(global_bsz) if "global_bsz" in locals() else int(II_b.shape[0])
+            else:
+                bsz = int(II_b.shape[0]) if isinstance(II_b, torch.Tensor) else 0
         except Exception:
             bsz = 0
-        if bsz > 0:
+        if bsz > 0 and ((not ddp_enabled) or ddp_is_main):
             total_loss_weighted_sum += loss_f * float(bsz)
             total_loss_weighted_denom += int(bsz)
         state.global_step_count += 1
@@ -1209,10 +2004,56 @@ def _run_epoch(
         st[7] = torch.quantile(torch.sqrt(state.dX_src[:, 0]**2 + state.dX_src[:, 1]**2 + state.dX_src[:, 2]**2), 0.90).item()
         
         stats_cpu = st.detach().cpu().numpy()
+
+        # Time component (ΔT / origin-time correction) stats are not stored in stats_tensor
+        # to preserve checkpoint/backward compatibility. Compute separately for logging.
+        #
+        # IMPORTANT interpretability note:
+        # In a pure differential-time likelihood, adding a constant to *all* origin times does not
+        # change dt_pred (only differences matter). That can make raw dt_* metrics drift slowly.
+        # To diagnose meaningful relative-time mixing, also compute "centered" stats where we
+        # subtract the per-component (cluster) mean if clusters exist, else the global mean.
+        try:
+            dT = state.dX_src[:, 3].to(torch.float32)
+            dt_mean = float(dT.mean().detach().cpu().item())
+            dt_med_abs = float(torch.abs(dT).median().detach().cpu().item())
+            dt_max_abs = float(torch.abs(dT).max().detach().cpu().item())
+            dt_p90_abs = float(torch.quantile(torch.abs(dT), 0.90).detach().cpu().item())
+            # Centered ΔT (remove per-connected-component mean when available)
+            try:
+                dT0 = None
+                cid = getattr(state, "cluster_ids", None)
+                cc = getattr(state, "cluster_counts", None)
+                if isinstance(cid, torch.Tensor) and isinstance(cc, torch.Tensor) and cid.numel() == dT.numel():
+                    K = int(cc.numel())
+                    if K > 0:
+                        sums = torch.zeros((K,), device=dT.device, dtype=dT.dtype)
+                        sums.index_add_(0, cid.to(torch.int64), dT)
+                        denom = cc.to(device=dT.device, dtype=dT.dtype).view(-1).clamp_min(1.0)
+                        means = sums / denom
+                        dT0 = dT - means.index_select(0, cid.to(torch.int64))
+                if dT0 is None:
+                    dT0 = dT - dT.mean()
+                dt_centered_std = float(dT0.std(unbiased=False).detach().cpu().item())
+                dt_centered_med_abs = float(torch.abs(dT0).median().detach().cpu().item())
+                dt_centered_p90_abs = float(torch.quantile(torch.abs(dT0), 0.90).detach().cpu().item())
+            except Exception:
+                dt_centered_std = float("nan")
+                dt_centered_med_abs = float("nan")
+                dt_centered_p90_abs = float("nan")
+        except Exception:
+            dt_mean = float("nan")
+            dt_med_abs = float("nan")
+            dt_max_abs = float("nan")
+            dt_p90_abs = float("nan")
+            dt_centered_std = float("nan")
+            dt_centered_med_abs = float("nan")
+            dt_centered_p90_abs = float("nan")
         
         metrics = {
             "loss": total_loss_mean,
             "epoch_time": epoch_time,
+            "permute_time": float(permute_time_s),
             "dx_mean": stats_cpu[0],
             "dy_mean": stats_cpu[1],
             "dz_mean": stats_cpu[2],
@@ -1221,7 +2062,32 @@ def _run_epoch(
             "dz_med_abs": stats_cpu[5],
             "dr_max": stats_cpu[6],
             "dr_90": stats_cpu[7],
+            # ΔT (seconds)
+            "dt_mean": dt_mean,
+            "dt_med_abs": dt_med_abs,
+            "dt_max_abs": dt_max_abs,
+            "dt_p90_abs": dt_p90_abs,
+            "dt_centered_std": dt_centered_std,
+            "dt_centered_med_abs": dt_centered_med_abs,
+            "dt_centered_p90_abs": dt_centered_p90_abs,
         }
+        # Optional: per-epoch summary for likelihood sigma_inflation (distance/%vel dependent).
+        try:
+            if bool(state.params.get("_likelihood_sigma_inflation_enabled", False)):
+                c = int(state.params.get("_sigma_infl_vel_count", 0) or 0)
+                if c > 0:
+                    metrics["likelihood/sigma_inflation_struct_mean_ms"] = float(state.params.get("_sigma_infl_vel_sum_ms", 0.0) or 0.0) / float(c)
+                cP = int(state.params.get("_sigma_infl_vel_count_P", 0) or 0)
+                if cP > 0:
+                    metrics["likelihood/sigma_inflation_struct_P_mean_ms"] = float(state.params.get("_sigma_infl_vel_sum_ms_P", 0.0) or 0.0) / float(cP)
+                cS = int(state.params.get("_sigma_infl_vel_count_S", 0) or 0)
+                if cS > 0:
+                    metrics["likelihood/sigma_inflation_struct_S_mean_ms"] = float(state.params.get("_sigma_infl_vel_sum_ms_S", 0.0) or 0.0) / float(cS)
+                cd = int(state.params.get("_sigma_infl_vel_d_km_count", 0) or 0)
+                if cd > 0:
+                    metrics["likelihood/sigma_inflation_d_km_mean"] = float(state.params.get("_sigma_infl_vel_d_km_sum", 0.0) or 0.0) / float(cd)
+        except Exception:
+            pass
         # Optional: timing summary for shared_event_latent nuisance reconstruction (per epoch).
         try:
             diag = _get_diagnostics_cfg(state.params)
@@ -1232,6 +2098,24 @@ def _run_epoch(
                     metrics["shared_event_latent/time_ms_mean"] = float(s / float(c))
                     metrics["shared_event_latent/time_ms_sum"] = float(s)
                     metrics["shared_event_latent/time_batches"] = float(c)
+        except Exception:
+            pass
+        # Optional: timing + workload summary for collapsed shared_event_re likelihood (per epoch).
+        try:
+            diag = _get_diagnostics_cfg(state.params)
+            if isinstance(diag, dict) and bool(diag.get("profile_shared_event_re", False)) and bool(state.params.get("_shared_event_re_enabled", False)):
+                c = int(state.params.get("_se_re_time_ms_count", 0) or 0)
+                s = float(state.params.get("_se_re_time_ms_sum", 0.0) or 0.0)
+                if c > 0:
+                    metrics["shared_event_re/time_ms_mean"] = float(s / float(c))
+                    metrics["shared_event_re/time_ms_sum"] = float(s)
+                    metrics["shared_event_re/time_batches"] = float(c)
+                    # Workload (means over batches + max over epoch)
+                    metrics["shared_event_re/groups_mean"] = float(int(state.params.get("_se_re_groups_sum", 0) or 0) / float(c))
+                    metrics["shared_event_re/groups_pcg_mean"] = float(int(state.params.get("_se_re_groups_pcg_sum", 0) or 0) / float(c))
+                    metrics["shared_event_re/groups_fallback_diag_mean"] = float(int(state.params.get("_se_re_groups_fallback_sum", 0) or 0) / float(c))
+                    metrics["shared_event_re/max_rows_max"] = float(int(state.params.get("_se_re_max_rows_max", 0) or 0))
+                    metrics["shared_event_re/max_nodes_max"] = float(int(state.params.get("_se_re_max_nodes_max", 0) or 0))
         except Exception:
             pass
         # Optional uncollapsed shared-event latent diagnostics.
@@ -1261,6 +2145,32 @@ def _run_epoch(
                     # Global mean drift (should be ~0 under Q with q_diag>0)
                     metrics["shared_event_latent/bP_mean"] = float(bP.mean().item())
                     metrics["shared_event_latent/bS_mean"] = float(bS.mean().item())
+                    # Direct check of the *station-common mode* constraint:
+                    # We care about mean over stations *per event* (K,2), not just global mean.
+                    try:
+                        n_stations = int(getattr(state, "n_stations", 0) or 0)
+                        if n_stations > 0:
+                            if int(b.shape[0]) == int(n_stations):
+                                mu = b.to(torch.float32).mean(dim=0)  # (K,2)
+                            else:
+                                W_sta = getattr(state, "shared_event_latent_station_basis_W", None)
+                                if (
+                                    isinstance(W_sta, torch.Tensor)
+                                    and W_sta.ndim == 2
+                                    and int(W_sta.shape[0]) == int(n_stations)
+                                    and int(b.shape[0]) == int(W_sta.shape[1])
+                                ):
+                                    W = W_sta.to(device=b.device, dtype=torch.float32)
+                                    ones = torch.ones((n_stations,), device=b.device, dtype=torch.float32)
+                                    r = (W.transpose(0, 1).matmul(ones)) / float(max(1, n_stations))  # (R,)
+                                    mu = torch.tensordot(r, b.to(torch.float32), dims=([0], [0]))  # (K,2)
+                                else:
+                                    mu = None
+                            if isinstance(mu, torch.Tensor) and mu.numel() > 0:
+                                metrics["shared_event_latent/station_common_P_rms"] = float(torch.sqrt((mu[:, 0] * mu[:, 0]).mean()).item())
+                                metrics["shared_event_latent/station_common_S_rms"] = float(torch.sqrt((mu[:, 1] * mu[:, 1]).mean()).item())
+                    except Exception:
+                        pass
                     # If station_basis is enabled, b is in basis space (R,M,2). The physically relevant
                     # station-field inducing coefficients are C_sta = W_sta @ A, shape (n_stations,M,2).
                     # Log their scale as well so we can tell if the station field is actually “big” even
@@ -1381,7 +2291,6 @@ def _run_epoch(
         # Decompose total loss into avg likelihood term + (1/N_total) prior term (prior is constant across minibatches).
         try:
             if bool(state.params.get("_shared_event_latent_enabled", False)) and _want_wandb_group(state.params, "shared_event_latent"):
-                from spider.core.modeling import compute_prior_loss
                 σp_now, σs_now = _current_noise_scales(state)
                 l_prior = compute_prior_loss(
                     state.dX_src,
@@ -1424,6 +2333,84 @@ def _run_epoch(
                     if cnts > 0.0:
                         brms_s = torch.sqrt(b_end_sumsq_s / b_end_count_s)
                         metrics["shared_event_latent/bS_endpoint_rms"] = float(brms_s.detach().cpu().item())
+                # slowness_inducing_gp: endpoint u-field RMS (per-phase)
+                if (u_end_count_p is not None) and (u_end_sumsq_p is not None):
+                    cntp = float(u_end_count_p.detach().cpu().item())
+                    if cntp > 0.0:
+                        urms_p = torch.sqrt(u_end_sumsq_p / u_end_count_p)
+                        metrics["shared_event_latent/uP_endpoint_rms"] = float(urms_p.detach().cpu().item())
+                if (u_end_count_s is not None) and (u_end_sumsq_s is not None):
+                    cnts = float(u_end_count_s.detach().cpu().item())
+                    if cnts > 0.0:
+                        urms_s = torch.sqrt(u_end_sumsq_s / u_end_count_s)
+                        metrics["shared_event_latent/uS_endpoint_rms"] = float(urms_s.detach().cpu().item())
+                if u_end_maxnorm_p is not None:
+                    metrics["shared_event_latent/uP_endpoint_maxnorm"] = float(u_end_maxnorm_p.detach().cpu().item())
+                if u_end_maxnorm_s is not None:
+                    metrics["shared_event_latent/uS_endpoint_maxnorm"] = float(u_end_maxnorm_s.detach().cpu().item())
+        except Exception:
+            pass
+
+        # For inducing-point shared_event_latent modes, also log coefficient magnitudes.
+        # This is the highest-signal debug aid when users report "latents blowing up".
+        try:
+            if want_lat_diag and bool(state.params.get("_shared_event_latent_enabled", False)) and _want_wandb_group(state.params, "shared_event_latent"):
+                mode = str(state.params.get("_shared_event_latent_parameterization", "full")).strip().lower()
+                tau_units = str(state.params.get("_shared_event_latent_slowness_tau_units", "abs")).strip().lower()
+                tau_ps = state.params.get("_shared_event_latent_tau_s", [0.0, 0.0])
+                try:
+                    tau_p = float(tau_ps[0]); tau_s = float(tau_ps[1])
+                except Exception:
+                    tau_p = float(tau_ps) if tau_ps is not None else 0.0
+                    tau_s = float(tau_ps) if tau_ps is not None else 0.0
+                metrics["shared_event_latent/tau_units"] = float(1.0 if tau_units == "vel_frac" else 0.0)
+                metrics["shared_event_latent/tau_p_config"] = float(tau_p)
+                metrics["shared_event_latent/tau_s_config"] = float(tau_s)
+                # Flag whether EikoNet v(z) arrays are available (vel_frac scaling depends on this).
+                try:
+                    vp_arr = np.asarray(state.params.get("_eikonet_v1d_vp_km_s", []), dtype=np.float64).reshape(-1)
+                    vs_arr = np.asarray(state.params.get("_eikonet_v1d_vs_km_s", []), dtype=np.float64).reshape(-1)
+                    ok = bool(vp_arr.size >= 2 and vs_arr.size == vp_arr.size and np.isfinite(np.nanmedian(vp_arr)) and np.isfinite(np.nanmedian(vs_arr)))
+                    metrics["shared_event_latent/eikonet_v1d_available"] = float(1.0 if ok else 0.0)
+                except Exception:
+                    metrics["shared_event_latent/eikonet_v1d_available"] = float(0.0)
+
+                b = getattr(state, "shared_event_latent_b", None)
+                if mode in {"inducing_gp", "slowness_inducing_gp"} and isinstance(b, torch.Tensor):
+                    bb = b.detach()
+                    # Scalar inducing_gp: (S_or_R, M_total, 2)
+                    if bb.ndim == 3 and int(bb.shape[2]) == 2:
+                        rms_p = torch.sqrt((bb[:, :, 0] * bb[:, :, 0]).mean().to(torch.float32))
+                        rms_s = torch.sqrt((bb[:, :, 1] * bb[:, :, 1]).mean().to(torch.float32))
+                        maxabs = bb.abs().max().to(torch.float32)
+                        metrics["shared_event_latent/b_coeff_rms_p"] = float(rms_p.cpu().item())
+                        metrics["shared_event_latent/b_coeff_rms_s"] = float(rms_s.cpu().item())
+                        metrics["shared_event_latent/b_coeff_maxabs"] = float(maxabs.cpu().item())
+                    # Vector slowness_inducing_gp: (S_or_R, M_total, 2, 3)
+                    elif bb.ndim == 4 and int(bb.shape[2]) == 2 and int(bb.shape[3]) == 3:
+                        # RMS across stations/ranks, inducing points, and xyz components
+                        rms_p = torch.sqrt((bb[:, :, 0, :] * bb[:, :, 0, :]).mean().to(torch.float32))
+                        rms_s = torch.sqrt((bb[:, :, 1, :] * bb[:, :, 1, :]).mean().to(torch.float32))
+                        maxabs = bb.abs().max().to(torch.float32)
+                        metrics["shared_event_latent/b_coeff_rms_p"] = float(rms_p.cpu().item())
+                        metrics["shared_event_latent/b_coeff_rms_s"] = float(rms_s.cpu().item())
+                        metrics["shared_event_latent/b_coeff_maxabs"] = float(maxabs.cpu().item())
+
+                    # If we're in vel_frac mode, also log the implied slowness amplitude tau/v (s/km).
+                    if tau_units == "vel_frac":
+                        try:
+                            vp = np.asarray(state.params.get("_eikonet_v1d_vp_km_s", []), dtype=np.float64).reshape(-1)
+                            vs = np.asarray(state.params.get("_eikonet_v1d_vs_km_s", []), dtype=np.float64).reshape(-1)
+                            vp_med = float(np.nanmedian(vp)) if vp.size > 0 else float("nan")
+                            vs_med = float(np.nanmedian(vs)) if vs.size > 0 else float("nan")
+                            if np.isfinite(vp_med) and vp_med > 0:
+                                metrics["shared_event_latent/vp_v1d_med_km_s"] = float(vp_med)
+                                metrics["shared_event_latent/tau_p_over_v_med_s_per_km"] = float(tau_p / vp_med)
+                            if np.isfinite(vs_med) and vs_med > 0:
+                                metrics["shared_event_latent/vs_v1d_med_km_s"] = float(vs_med)
+                                metrics["shared_event_latent/tau_s_over_v_med_s_per_km"] = float(tau_s / vs_med)
+                        except Exception:
+                            pass
         except Exception:
             pass
         # Online ESS: re-log last-known values to avoid W&B gaps (only if we're actually logging ess_online).
@@ -1762,7 +2749,8 @@ def _run_epoch(
                         g_p75 = float(stats.get("p75", float("nan")))
                         g_max = float(stats.get("max", float("nan")))
                         if all([x == x for x in (g_p25, g_med, g_p75)]):  # not NaN
-                            print(f"Preconditioner G stats: p25={g_p25:.3e}, median={g_med:.3e}, p75={g_p75:.3e}")
+                            if (not ddp_enabled) or ddp_is_main:
+                                print(f"Preconditioner G stats: p25={g_p25:.3e}, median={g_med:.3e}, p75={g_p75:.3e}")
                         if g_p25 == g_p25:
                             metrics["precond_g_p25"] = g_p25
                         if g_med == g_med:
@@ -1778,7 +2766,8 @@ def _run_epoch(
                         try:
                             g_min, g_med, g_max = stats  # type: ignore[misc]
                             if all([x == x for x in (g_min, g_med, g_max)]):  # not NaN
-                                print(f"Preconditioner G stats: min={g_min:.3e}, median={g_med:.3e}, max={g_max:.3e}")
+                                if (not ddp_enabled) or ddp_is_main:
+                                    print(f"Preconditioner G stats: min={g_min:.3e}, median={g_med:.3e}, max={g_max:.3e}")
                                 metrics["precond_g_min"] = float(g_min)
                                 metrics["precond_g_med"] = float(g_med)
                                 metrics["precond_g_max"] = float(g_max)
@@ -1786,10 +2775,11 @@ def _run_epoch(
                             pass
                 else:
                     pg0 = optimizer.param_groups[0] if hasattr(optimizer, "param_groups") and len(optimizer.param_groups) > 0 else {}
-                    print(
-                        "Preconditioner G stats: unavailable (preconditioning disabled or not initialized). "
-                        f"preconditioning={pg0.get('preconditioning', None)} preconditioner={pg0.get('preconditioner', None)}"
-                    )
+                    if (not ddp_enabled) or ddp_is_main:
+                        print(
+                            "Preconditioner G stats: unavailable (preconditioning disabled or not initialized). "
+                            f"preconditioning={pg0.get('preconditioning', None)} preconditioner={pg0.get('preconditioner', None)}"
+                        )
             except Exception:
                 pass
 

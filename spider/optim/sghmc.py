@@ -2,6 +2,8 @@ import math
 from typing import Optional
 import torch
 
+from .gauge import project_event_mean_inplace
+
 
 class SGHMC(torch.optim.Optimizer):
     """
@@ -98,6 +100,20 @@ class SGHMC(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 grad = p.grad
+
+                # --- Optional gauge projection: remove translation mode before preconditioner stats update ---
+                try:
+                    gauge_enable = bool(getattr(self, "_gauge_project_enable", False))
+                    gauge_param = getattr(self, "_gauge_project_param", None)
+                    if gauge_enable and (gauge_param is p):
+                        if isinstance(grad, torch.Tensor) and grad.ndim == 2 and int(grad.shape[1]) >= 4:
+                            dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                            mode = str(getattr(self, "_gauge_project_mode", "global"))
+                            cid = getattr(self, "_gauge_cluster_ids", None)
+                            cc = getattr(self, "_gauge_cluster_counts", None)
+                            project_event_mean_inplace(grad, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                except Exception:
+                    pass
                 
                 # Drift always uses N * ḡ
                 grad_for_drift = grad.mul(n_obs)
@@ -197,11 +213,34 @@ class SGHMC(torch.optim.Optimizer):
                     elif G is not None:
                         # Diagonal Noise: sqrt(G) * epsilon
                         noise = torch.randn_like(p) * std * G.sqrt()
+                        # Optional gauge projection of injected noise (prevents centroid random-walk).
+                        try:
+                            if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                                if bool(getattr(self, "_gauge_project_apply_noise", True)):
+                                    dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                                    mode = str(getattr(self, "_gauge_project_mode", "global"))
+                                    cid = getattr(self, "_gauge_cluster_ids", None)
+                                    cc = getattr(self, "_gauge_cluster_counts", None)
+                                    project_event_mean_inplace(noise, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                        except Exception:
+                            pass
                         m.add_(noise)
                     else:
                          # Identity Noise
                         noise = torch.randn_like(p) * std
                         m.add_(noise)
+
+                # Optional: project momentum mean as well (helps in SGHMC where momentum carries drift).
+                try:
+                    if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                        if bool(getattr(self, "_gauge_project_apply_momentum", True)):
+                            dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                            mode = str(getattr(self, "_gauge_project_mode", "global"))
+                            cid = getattr(self, "_gauge_cluster_ids", None)
+                            cc = getattr(self, "_gauge_cluster_counts", None)
+                            project_event_mean_inplace(m, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                except Exception:
+                    pass
 
                 # Parameter update
                 p.add_(m)
@@ -542,62 +581,7 @@ class SGHMC(torch.optim.Optimizer):
         stats = self.grad_vs_noise_stats()
         return stats["gm"]
 
-    @torch.no_grad()
-    def drift_vs_noise_per_dim(self) -> Optional[torch.Tensor]:
-        """
-        Compute the ratio of (Gradient Force)^2 / (Noise Force Variance) per dimension (x, y, z, t).
-        Returns a Tensor of shape (N, 4) containing the ratio for each event.
-        
-        Ratio = (lr * G * grad_drift)^2 / Var(Noise)
-              = (lr * G * grad_drift)^2 / (2 * alpha * lr * T * noise_scale^2 * G)
-              = (lr * G * grad_drift^2) / (2 * alpha * T * noise_scale^2)
-        """
-        for group in self.param_groups:
-            lr = float(group.get("lr", 0.0))
-            alpha = float(group.get("alpha", 0.01))
-            temperature = float(group.get("temperature", 1.0))
-            noise_scale = float(group.get("noise_scale", 1.0))
-            preconditioning = bool(group.get("preconditioning", True))
-            eps = float(group.get("eps", 1e-5))
-            beta = float(group.get("beta", 0.99))
-            n_obs = int(group.get("n_obs", 1))
-
-            if lr <= 0.0 or alpha <= 0.0 or temperature <= 0.0 or noise_scale <= 0.0:
-                continue
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                if p.ndim != 2 or p.shape[1] != 4:
-                    # Only compute for dX_src (N, 4)
-                    continue
-
-                grad = p.grad
-                # Drift always uses N * ḡ
-                grad_for_drift = grad.mul(n_obs)
-                
-                # Reconstruct G
-                state = self.state[p]
-                v = state.get("exp_avg_sq", None)
-                if preconditioning and v is not None:
-                    step = int(state.get("step", 1))
-                    v_hat = v / (1.0 - (beta ** max(step, 1)))
-                    G = 1.0 / (eps + v_hat.sqrt())
-                else:
-                    G = torch.ones_like(p)
-
-                # Compute Ratio
-                # numerator: lr * G * (grad_drift^2)
-                numerator = lr * G * (grad_for_drift ** 2)
-                
-                # denominator: 2 * alpha * T * noise_scale^2
-                denominator = 2.0 * alpha * temperature * (noise_scale ** 2)
-                
-                ratio = numerator / denominator
-                
-                # Return (N, 4)
-                return ratio
-        
-        return None
+    # NOTE: Removed drift_vs_noise_per_dim() diagnostic. We no longer log drift_ratio_* metrics
+    # to W&B (too noisy/expensive), and keeping this method encourages accidental reintroduction.
 
 

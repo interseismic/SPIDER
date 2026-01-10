@@ -25,8 +25,31 @@ def _is_event_samples_summary(x: Any) -> bool:
         hasattr(x, "X")
         and hasattr(x, "Y")
         and hasattr(x, "Z")
+        and hasattr(x, "T")
         and hasattr(x, "cat_dd")
     )
+
+
+_SPATIAL_COORDS = {"X", "Y", "Z"}
+
+
+def _coord_factor(coord: str, *, units: str) -> float:
+    """Scaling for display: spatial coords are km->m when units='meters'; time stays seconds."""
+    c = str(coord)
+    u = str(units).lower()
+    if c in _SPATIAL_COORDS:
+        return 1000.0 if u.startswith("meter") else 1.0
+    return 1.0
+
+
+def _coord_unit_label(coord: str, *, units: str) -> str:
+    c = str(coord)
+    u = str(units).lower()
+    if c in _SPATIAL_COORDS:
+        return "m" if u.startswith("meter") else "km"
+    if c in {"T", "delta_t"}:
+        return "s"
+    return ""
 
 
 def plot_event_distributions(samples_data: Union[dict, Any],
@@ -76,9 +99,9 @@ def plot_event_distributions(samples_data: Union[dict, Any],
     # Support EventSamplesSummary-like objects or legacy dict
     is_summary = _is_event_samples_summary(samples_data)
     if is_summary:
-        invalid = [c for c in coords if c not in ("X", "Y", "Z")]
+        invalid = [c for c in coords if c not in ("X", "Y", "Z", "T")]
         if invalid:
-            raise KeyError(f"When using EventSamplesSummary, only 'X','Y','Z' are supported for coords (got {invalid})")
+            raise KeyError(f"When using EventSamplesSummary, only 'X','Y','Z','T' are supported for coords (got {invalid})")
         # Determine shape from first available coord
         shape_source = None
         for c in coords:
@@ -93,9 +116,11 @@ def plot_event_distributions(samples_data: Union[dict, Any],
     else:
         assert 'event_ids' in samples_data, "samples_data must include 'event_ids'"
         for c in coords:
-            if c not in samples_data:
+            key = "delta_t" if str(c) == "T" else c
+            if key not in samples_data:
                 raise KeyError(f"Coordinate '{c}' not found in samples_data")
-        n_events, n_samples = samples_data[coords[0]].shape
+        c0 = "delta_t" if str(coords[0]) == "T" else coords[0]
+        n_events, n_samples = samples_data[c0].shape
         event_ids = samples_data['event_ids']
     num_to_plot = min(n_rows * n_cols, n_events)
 
@@ -111,11 +136,14 @@ def plot_event_distributions(samples_data: Union[dict, Any],
         if event_indices.size > num_to_plot:
             event_indices = event_indices[:num_to_plot]
 
-    # Units factor
-    factor = 1000.0 if units.lower().startswith('meter') else 1.0
-    default_xlim = (-300, 300) if factor == 1000.0 else (-0.3, 0.3)
-    if xlim is None:
+    # Units/xlim: if user plots non-spatial coords (e.g. 'T'), require an explicit xlim.
+    only_spatial = set([str(c) for c in coords]).issubset(_SPATIAL_COORDS)
+    if xlim is None and only_spatial:
+        factor0 = _coord_factor("X", units=units)
+        default_xlim = (-300, 300) if factor0 == 1000.0 else (-0.3, 0.3)
         xlim = default_xlim
+    if xlim is None and (not only_spatial):
+        raise ValueError("For non-spatial coords (e.g. 'T'), please pass an explicit xlim (units differ).")
 
     _plt = _lazy_import_plt()
     fig, ax = _plt.subplots(nrows=n_rows, ncols=n_cols, sharex=sharex, sharey=sharey, figsize=figsize)
@@ -164,7 +192,7 @@ def plot_event_distributions(samples_data: Union[dict, Any],
 
     coordinates_colors = {"X": "tab:blue", "Y": "tab:orange", "Z": "tab:green",
                            "longitude": "tab:purple", "latitude": "tab:red", "depth": "tab:brown",
-                           "delta_t": "tab:olive"}
+                           "delta_t": "tab:olive", "T": "tab:olive"}
 
     for idx, ev_idx in enumerate(event_indices):
         r = idx // n_cols
@@ -172,13 +200,18 @@ def plot_event_distributions(samples_data: Union[dict, Any],
         axis = ax[r, c]
 
         for coord in coords:
+            coord_s = str(coord)
+            dict_key = "delta_t" if (not is_summary and coord_s == "T") else coord_s
+            f = _coord_factor(coord_s, units=units)
+            unit = _coord_unit_label(coord_s, units=units)
             if is_summary:
-                series = getattr(samples_data, coord)[ev_idx, :]
+                series = getattr(samples_data, coord_s)[ev_idx, :]
             else:
-                series = samples_data[coord][ev_idx, burn_in:]
-            x_vals = (series * factor)
+                series = samples_data[dict_key][ev_idx, burn_in:]
+            x_vals = (series * float(f))
             x_kde, y_kde = _kde_curve(x_vals)
-            axis.plot(x_kde, y_kde, label=coord, color=coordinates_colors.get(coord, None))
+            lab = f"{coord_s} ({unit})" if unit else coord_s
+            axis.plot(x_kde, y_kde, label=lab, color=coordinates_colors.get(coord_s, None))
 
         # Title with event id if available
         try:
@@ -189,7 +222,10 @@ def plot_event_distributions(samples_data: Union[dict, Any],
 
     # Label the bottom row
     for c in range(n_cols):
-        ax[-1, c].set_xlabel(f"Relative Uncertainty ({'meters' if factor==1000.0 else 'km'})")
+        if only_spatial:
+            ax[-1, c].set_xlabel(f"Relative Uncertainty ({'meters' if _coord_factor('X', units=units)==1000.0 else 'km'})")
+        else:
+            ax[-1, c].set_xlabel("Relative Uncertainty")
     # Optional defaults similar to original
     for axes_row in ax:
         for axis in axes_row:
@@ -277,9 +313,9 @@ def plot_event_chains(samples_data: Union[dict, Any],
     # Validate fields
     is_summary = _is_event_samples_summary(samples_data)
     if is_summary:
-        invalid = [c for c in coords if c not in ("X", "Y", "Z")]
+        invalid = [c for c in coords if c not in ("X", "Y", "Z", "T")]
         if invalid:
-            raise KeyError(f"When using EventSamplesSummary, only 'X','Y','Z' are supported for coords (got {invalid})")
+            raise KeyError(f"When using EventSamplesSummary, only 'X','Y','Z','T' are supported for coords (got {invalid})")
         shape_source = None
         for c in coords:
             arr = getattr(samples_data, c, None)
@@ -293,9 +329,11 @@ def plot_event_chains(samples_data: Union[dict, Any],
     else:
         assert 'event_ids' in samples_data, "samples_data must include 'event_ids'"
         for c in coords:
-            if c not in samples_data:
+            key = "delta_t" if str(c) == "T" else c
+            if key not in samples_data:
                 raise KeyError(f"Coordinate '{c}' not found in samples_data")
-        n_events, n_samples = samples_data[coords[0]].shape
+        c0 = "delta_t" if str(coords[0]) == "T" else coords[0]
+        n_events, n_samples = samples_data[c0].shape
         event_ids_resolved = samples_data['event_ids']
     num_panels = min(n_rows * n_cols, n_events)
 
@@ -325,8 +363,7 @@ def plot_event_chains(samples_data: Union[dict, Any],
     if selection.size > num_panels:
         selection = selection[:num_panels]
 
-    # Units factor
-    factor = 1000.0 if units.lower().startswith('meter') else 1.0
+    # Units scaling is per-coordinate (spatial coords can be shown in m/km; time stays seconds)
 
     # Prepare figure
     _plt = _lazy_import_plt()
@@ -336,7 +373,7 @@ def plot_event_chains(samples_data: Union[dict, Any],
     # Colors per coordinate
     coordinates_colors = {"X": "tab:blue", "Y": "tab:orange", "Z": "tab:green",
                            "longitude": "tab:purple", "latitude": "tab:red", "depth": "tab:brown",
-                           "delta_t": "tab:olive"}
+                           "delta_t": "tab:olive", "T": "tab:olive"}
 
     if mean_style is None:
         mean_style = {"linestyle": "--", "color": "k", "linewidth": 1.0, "alpha": 0.7}
@@ -350,16 +387,21 @@ def plot_event_chains(samples_data: Union[dict, Any],
         # x-axis: sample indices after burn-in & thinning
         sample_idx = _np.arange(burn_in, n_samples, thin)
         for coord in coords:
+            coord_s = str(coord)
+            dict_key = "delta_t" if (not is_summary and coord_s == "T") else coord_s
+            f = _coord_factor(coord_s, units=units)
+            unit = _coord_unit_label(coord_s, units=units)
             if is_summary:
-                series = getattr(samples_data, coord)[ev_idx, :]
+                series = getattr(samples_data, coord_s)[ev_idx, :]
             else:
-                series = samples_data[coord][ev_idx, burn_in:]
+                series = samples_data[dict_key][ev_idx, burn_in:]
             if thin > 1:
                 series = series[::thin]
-            y_vals = (series * factor)
+            y_vals = (series * float(f))
             y_vals -= y_vals.mean()
-            axis.plot(sample_idx[: y_vals.shape[0]], y_vals, label=coord,
-                      alpha=alpha, linewidth=linewidth, color=coordinates_colors.get(coord, None))
+            lab = f"{coord_s} ({unit})" if unit else coord_s
+            axis.plot(sample_idx[: y_vals.shape[0]], y_vals, label=lab,
+                      alpha=alpha, linewidth=linewidth, color=coordinates_colors.get(coord_s, None))
             if show_mean and y_vals.size > 0:
                 axis.axhline(y_vals.mean(), **mean_style)
 
@@ -373,10 +415,12 @@ def plot_event_chains(samples_data: Union[dict, Any],
     # Labels and limits
     for c in range(n_cols):
         ax[-1, c].set_xlabel("Sample index")
-    if units.lower().startswith('meter'):
-        ax[0, 0].set_ylabel("Value (m)")
+    coord_units = [_coord_unit_label(str(c), units=units) for c in coords]
+    uniq_units = sorted({u for u in coord_units if u})
+    if len(uniq_units) == 1:
+        ax[0, 0].set_ylabel(f"Value ({uniq_units[0]})")
     else:
-        ax[0, 0].set_ylabel("Value (km)")
+        ax[0, 0].set_ylabel("Value")
 
     if xlim is not None:
         for axes_row in ax:

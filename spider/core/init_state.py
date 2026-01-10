@@ -93,6 +93,12 @@ def _build_initial_state(
     )
     dd_event_degree: Optional[torch.Tensor] = None
     if bool(params.get("dd_prec_enable", False)):
+        dd_prec_dims = params.get("dd_prec_dims", [0, 1, 2, 3])
+        if not isinstance(dd_prec_dims, list) or len(dd_prec_dims) == 0:
+            dd_prec_dims = [0, 1, 2, 3]
+        dd_prec_dims = [int(x) for x in dd_prec_dims if int(x) in (0, 1, 2, 3)]
+        if len(dd_prec_dims) == 0:
+            dd_prec_dims = [0, 1, 2, 3]
         deg_counts = (
             pl.concat(
                 [
@@ -116,6 +122,18 @@ def _build_initial_state(
             if not math.isfinite(mean_degree) or mean_degree <= 0.0:
                 mean_degree = 1.0
             dd_event_degree = dd_event_degree / mean_degree
+        # Optional: apply DD degree scaling only to selected ΔX dims.
+        # Default (backward compatible) is all dims [0,1,2,3].
+        try:
+            if set(dd_prec_dims) != {0, 1, 2, 3}:
+                Ne = int(X_src.shape[0])
+                deg4 = torch.ones((Ne, 4), dtype=torch.float32, device=device)
+                for d in dd_prec_dims:
+                    deg4[:, int(d)] = dd_event_degree
+                dd_event_degree = deg4
+        except Exception:
+            # Best-effort: keep scalar degree vector if shaping fails
+            pass
     II_cpu_np = dtimes[["evid1_idx", "evid2_idx"]].to_numpy().astype(np.int64, copy=False)
     YY = torch.tensor(
         dtimes[["dt", "X", "Y", "Z", "phase"]].to_numpy(),
@@ -123,7 +141,7 @@ def _build_initial_state(
         device=device,
     )
     # Single-device execution: multi-GPU should be achieved via multiple independent processes
-    # (see `python -m spider locate-multi`), not torch.nn.DataParallel.
+    # (see `python -m spider sample-multi` / `python -m spider locate-multi`), not torch.nn.DataParallel.
     model = model.to(device)
 
     batch_size_warmup = params["batch_size_warmup"]
@@ -160,7 +178,13 @@ def _build_initial_state(
     # Noise scales: fixed or learnable
     phase_unc_list = params.get("phase_unc", [0.05, 0.08])
     scale_theta = torch.tensor(phase_unc_list, device=device, dtype=torch.float32)
-    learn_noise = bool(params.get("learn_phase_unc", params.get("learn_noise_scale", False)))
+    # Noise scale learning is controlled only by the hard-break schema key:
+    #   model.likelihood.learn_noise_scale  -> materialized as params["learn_noise_scale"]
+    #
+    # Do NOT honor legacy aliases like `learn_phase_unc` here, because Phase-2 bundles may carry
+    # stale keys from older runs. That can silently re-enable noise learning even when the current
+    # config sets learn_noise_scale=false.
+    learn_noise = bool(params.get("learn_noise_scale", False))
 
     # Optimizer parameters
     opt_params: List[torch.nn.Parameter] = [dX_src]
@@ -168,6 +192,18 @@ def _build_initial_state(
     if learn_noise:
         # log σ parameters (ensure positivity via exp)
         log_scale_init = torch.log(scale_theta.clamp_min(1e-8)).detach()
+        # If a noise prior is enabled, initialize to the *median* of that prior.
+        # For LogNormal(loc, scale): median = exp(loc) ⇒ log(median) = loc.
+        try:
+            if bool(params.get("prior_noise_enable", False)):
+                prior_type = str(params.get("noise_prior", "none")).strip().lower()
+                if prior_type in {"lognormal", "log_normal"}:
+                    loc = params.get("noise_prior_loc", None)
+                    if isinstance(loc, (list, tuple)) and len(loc) == 2:
+                        log_scale_init = torch.tensor(loc, device=device, dtype=torch.float32)
+        except Exception:
+            # Fall back to phase_unc-based initialization.
+            pass
         log_scale_theta = torch.nn.Parameter(log_scale_init.clone())
         opt_params.append(log_scale_theta)
 
@@ -380,6 +416,13 @@ def _build_initial_state(
         hierarchical_prior_enable=hierarchical_prior_enable,
         event_precision_matrix=P0_init,
     )
+    # Expose a few runtime tensors in params so modeling.py can implement component-wise correlated
+    # likelihoods without needing the full LocateState object.
+    try:
+        params["_runtime_event_cluster_ids"] = cluster_ids
+        params["_runtime_n_stations"] = int(n_stations)
+    except Exception:
+        pass
     _attach_dd_preconditioner_metric(state)
     # Initialize event-centric batching flag (mapping is built lazily when used)
     state.event_batch_enable = bool(params.get("event_batch_enable", False))

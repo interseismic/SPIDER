@@ -258,6 +258,9 @@ def save_samples_periodic(
     sample_count: int,
     *,
     noise_log_scales: Optional[List[torch.Tensor]] = None,
+    global_step_count: Optional[int] = None,
+    epoch: Optional[int] = None,
+    phase: Optional[str] = None,
 ) -> int:
     if len(samples) == 0:
         return sample_count
@@ -321,6 +324,19 @@ def save_samples_periodic(
         try:
             batch.attrs["n_events"] = int(n_events)
             batch.attrs["event_ids_json"] = json.dumps(list(event_ids))
+            # Provenance (best-effort): helps diagnose "mode switching" artifacts from appended runs.
+            # These are purely informational and safe to ignore downstream.
+            if global_step_count is not None:
+                batch.attrs["global_step_count"] = int(global_step_count)
+            if epoch is not None:
+                batch.attrs["epoch"] = int(epoch)
+            if phase is not None:
+                batch.attrs["phase"] = str(phase)
+            try:
+                import time as _time
+                batch.attrs["wall_time_s"] = float(_time.time())
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -464,12 +480,14 @@ def read_all_samples(
         map_lat_root = f['map_latitude'][:] if 'map_latitude' in f else None
         map_dep_root = f['map_depth'][:] if 'map_depth' in f else None
 
-        batches = []
+        # Collect batch groups (stable sort by parsed index).
+        # We keep the group name so we can provide boundary metadata to downstream analysis/plotting.
+        batches: list[tuple[int, str, Any]] = []
         for name in f.keys():
             if isinstance(f[name], h5py.Group) and name.startswith('batch_'):
                 try:
                     num = int(name.split('_')[1])
-                    batches.append((num, f[name]))
+                    batches.append((num, str(name), f[name]))
                 except Exception:
                     pass
         if not batches:
@@ -541,7 +559,7 @@ def read_all_samples(
                 ids = [str(i) for i in range(n_events_meta)]
             event_ids = np.asarray(ids, dtype=str)
         except Exception:
-            n_events_meta = batches[0][1]['longitude'].shape[0]
+            n_events_meta = batches[0][2]['longitude'].shape[0]
             event_ids = np.asarray([str(i) for i in range(n_events_meta)], dtype=str)
 
         # Some sample files can contain batches with inconsistent event counts (e.g. resume after filtering).
@@ -552,7 +570,7 @@ def read_all_samples(
             mismatch_mode = "skip"
 
         n_events_per_batch: list[int] = []
-        for _, grp in batches:
+        for _, _, grp in batches:
             try:
                 n_events_per_batch.append(int(grp["longitude"].shape[0]))
             except Exception:
@@ -579,9 +597,9 @@ def read_all_samples(
             n_events = int(canonical_n_events)
             keep: list[tuple[int, Any]] = []
             dropped: list[int] = []
-            for (num, grp), ne in zip(batches, n_events_per_batch):
+            for (num, name, grp), ne in zip(batches, n_events_per_batch):
                 if int(ne) == int(n_events):
-                    keep.append((num, grp))
+                    keep.append((num, name, grp))
                 else:
                     dropped.append(int(ne))
             if dropped:
@@ -595,6 +613,43 @@ def read_all_samples(
                 else:
                     print(f"Warning: {msg}")
             batches = keep if keep else batches
+
+        # --- Provenance filter (default: drop legacy batches when modern batches exist) ---
+        # Older SPIDER versions wrote batch_* groups without provenance attrs (epoch/global_step_count/wall_time_s).
+        # Mixing legacy + modern batches in one concatenated chain often looks like "mode switching" in trace plots.
+        try:
+            legacy_mode = str(params.get("read_samples_legacy_mode", "drop")).strip().lower()
+        except Exception:
+            legacy_mode = "drop"
+        if legacy_mode not in {"drop", "keep", "error"}:
+            legacy_mode = "drop"
+
+        try:
+            has_epoch = [("epoch" in grp.attrs) for _, _, grp in batches]
+        except Exception:
+            has_epoch = []
+
+        if has_epoch and any(has_epoch) and (not all(has_epoch)):
+            legacy_batches = [bname for (_, bname, _), ok in zip(batches, has_epoch) if not ok]
+            modern_batches = [t for t, ok in zip(batches, has_epoch) if ok]
+            msg = (
+                f"Detected legacy sample batches missing provenance attrs (no 'epoch'): "
+                f"{legacy_batches[:5]}{'...' if len(legacy_batches) > 5 else ''} "
+                f"(count={len(legacy_batches)})."
+            )
+            if legacy_mode == "error":
+                raise ValueError(msg + " Set read_samples_legacy_mode='keep' to include them.")
+            if legacy_mode == "drop":
+                try:
+                    print(f"Warning: {msg} Dropping legacy batches (read_samples_legacy_mode='drop').")
+                except Exception:
+                    pass
+                batches = modern_batches
+            else:
+                try:
+                    print(f"Warning: {msg} Keeping legacy batches (read_samples_legacy_mode='keep').")
+                except Exception:
+                    pass
         # Optional MAP datasets at root
         map_lon = map_lon_root
         map_lat = map_lat_root
@@ -602,12 +657,36 @@ def read_all_samples(
         
         # Calculate total samples after thinning (over the selected batches)
         total_samples = 0
-        for _, grp in batches:
+        batch_names: list[str] = []
+        batch_sample_counts: list[int] = []
+        for _, bname, grp in batches:
             n_samples_in_batch = grp['longitude'].shape[1]
             if thin == 1:
-                total_samples += n_samples_in_batch
+                n_keep = int(n_samples_in_batch)
             else:
-                total_samples += len(range(0, n_samples_in_batch, thin))
+                n_keep = int(len(range(0, int(n_samples_in_batch), int(thin))))
+            total_samples += int(n_keep)
+            batch_names.append(str(bname))
+            batch_sample_counts.append(int(n_keep))
+
+        # Helpful warning for a very common footgun:
+        # if the samples file contains multiple batch_* groups, the returned arrays are a concatenation.
+        # This may represent a single long run with periodic flushes, OR multiple appended runs/resets.
+        # Downstream chain plots can look like "mode switching" if batches are not continuous.
+        try:
+            warn_multi = bool(params.get("warn_on_multi_batch", True))
+        except Exception:
+            warn_multi = True
+        if warn_multi and len(batch_names) > 1:
+            try:
+                print(
+                    f"read_all_samples: concatenating {len(batch_names)} batch_* groups "
+                    f"(thin={thin}) from '{store_path}'. "
+                    "If you expected a single continuous chain, ensure you did not append multiple runs. "
+                    "Consider setting `clear_samples_on_reset=true` or using a fresh `samples_outfile` per run."
+                )
+            except Exception:
+                pass
 
         # Align event_ids to chosen n_events
         try:
@@ -626,19 +705,33 @@ def read_all_samples(
             'Y':         np.empty((n_events, total_samples), dtype=np.float32),
             'Z':         np.empty((n_events, total_samples), dtype=np.float32),
         }
+        # Provide batch boundary metadata for plotting/debugging (indices refer to the concatenated sample axis).
+        # - _batch_names: ordered list of group names (e.g., ["batch_0","batch_1",...])
+        # - _batch_sample_counts: number of kept samples per batch after thinning
+        # - _batch_boundaries: sample indices where a new batch starts (excluding 0), e.g. [400, 801, ...]
+        # - _batch_slices: dict[name -> (start, end)] in the concatenated axis
+        try:
+            out["_batch_names"] = list(batch_names)
+            out["_batch_sample_counts"] = np.asarray(batch_sample_counts, dtype=np.int64)
+            csum = np.cumsum(np.asarray(batch_sample_counts, dtype=np.int64))
+            out["_batch_boundaries"] = csum[:-1].astype(np.int64, copy=False)
+            starts = np.concatenate([np.asarray([0], dtype=np.int64), csum[:-1]]).astype(np.int64, copy=False)
+            out["_batch_slices"] = {str(nm): (int(s), int(e)) for nm, s, e in zip(batch_names, starts, csum)}
+        except Exception:
+            pass
         if map_lon is not None and map_lat is not None and map_dep is not None:
             # MAP arrays are per-event; align to chosen n_events
             out['map_longitude'] = map_lon[:n_events].astype(np.float32, copy=False)
             out['map_latitude']  = map_lat[:n_events].astype(np.float32, copy=False)
             out['map_depth']     = map_dep[:n_events].astype(np.float32, copy=False)
         # Optional noise datasets (per sample)
-        have_noise = any('log_sigma_p' in grp and 'log_sigma_s' in grp for _, grp in batches)
+        have_noise = any(('log_sigma_p' in grp and 'log_sigma_s' in grp) for _, _, grp in batches)
         if have_noise:
             out['log_sigma_p'] = np.empty((total_samples,), dtype=np.float32)
             out['log_sigma_s'] = np.empty((total_samples,), dtype=np.float32)
 
         offset = 0
-        for _, grp in batches:
+        for _, _, grp in batches:
             w = grp['longitude'].shape[1]
             # Apply thinning to this batch
             
@@ -710,5 +803,10 @@ def read_all_samples(
             if pin_memory and target_device != 'cpu':
                 t = t.pin_memory()
             out_torch[name] = t.to(target_device, non_blocking=True) if target_device != 'cpu' else t
+
+    # Preserve non-tensor batch metadata (useful for plotting/debugging).
+    for k in ("_batch_names", "_batch_sample_counts", "_batch_boundaries", "_batch_slices"):
+        if k in out:
+            out_torch[k] = out[k]  # type: ignore[index]
 
     return out_torch  # type: ignore[return-value]

@@ -1,6 +1,8 @@
 import torch
 import math
 
+from .gauge import project_event_mean_inplace
+
 class pSGLD(torch.optim.Optimizer):
     """
     Preconditioned Stochastic Gradient Langevin Dynamics (pSGLD) optimizer.
@@ -120,6 +122,21 @@ class pSGLD(torch.optim.Optimizer):
                     continue
 
                 raw_grad = p.grad  # minibatch-mean grad ḡ
+
+                # --- Optional gauge projection: remove translation mode before preconditioner stats update ---
+                try:
+                    gauge_enable = bool(getattr(self, "_gauge_project_enable", False))
+                    gauge_param = getattr(self, "_gauge_project_param", None)
+                    if gauge_enable and (gauge_param is p):
+                        if isinstance(raw_grad, torch.Tensor) and raw_grad.ndim == 2 and int(raw_grad.shape[1]) >= 4:
+                            dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                            mode = str(getattr(self, "_gauge_project_mode", "global"))
+                            cid = getattr(self, "_gauge_cluster_ids", None)
+                            cc = getattr(self, "_gauge_cluster_counts", None)
+                            project_event_mean_inplace(raw_grad, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                except Exception:
+                    pass
+
                 grad_for_drift = raw_grad.mul(n_obs)  # sum-loglik convention (N*ḡ)
                 
                 # Define ḡ for preconditioner stats (minibatch mean, optionally DD-normalized)
@@ -401,7 +418,19 @@ class pSGLD(torch.optim.Optimizer):
                             std = math.sqrt(2.0 * lr * temp) * noise_scale
                             eps_noise = torch.randn_like(grad_for_drift).unsqueeze(-1)
                             corr_noise = torch.matmul(L_fac, eps_noise).squeeze(-1)
-                            update += std * corr_noise
+                            noise_u = std * corr_noise
+                            # Optional gauge projection of injected noise.
+                            try:
+                                if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                                    if bool(getattr(self, "_gauge_project_apply_noise", True)):
+                                        dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                                        mode = str(getattr(self, "_gauge_project_mode", "global"))
+                                        cid = getattr(self, "_gauge_cluster_ids", None)
+                                        cc = getattr(self, "_gauge_cluster_counts", None)
+                                        project_event_mean_inplace(noise_u, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                            except Exception:
+                                pass
+                            update += noise_u
                         
                         # {{ edit }} Update EMA gradient stats (using drift-scaled gradients) even in matrix path
                         ema_g = state.get('ema_g', None)
@@ -415,6 +444,16 @@ class pSGLD(torch.optim.Optimizer):
                         ema_g.mul_(grad_ema_beta).add_(grad_for_drift, alpha=(1.0 - grad_ema_beta))
                         ema_g2.mul_(grad_ema_beta).addcmul_(grad_for_drift, grad_for_drift, value=(1.0 - grad_ema_beta))
 
+                        # Optional gauge projection of total update (protects against drift of translation mode).
+                        try:
+                            if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                                dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                                mode = str(getattr(self, "_gauge_project_mode", "global"))
+                                cid = getattr(self, "_gauge_cluster_ids", None)
+                                cc = getattr(self, "_gauge_cluster_counts", None)
+                                project_event_mean_inplace(update, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                        except Exception:
+                            pass
                         p.add_(-update)
                         continue
                 # ----------------------------------
@@ -467,9 +506,30 @@ class pSGLD(torch.optim.Optimizer):
                     temp = max(0.0, temperature)
                     std = math.sqrt(2.0 * lr * temp) * noise_scale
                     noise = torch.randn_like(p) * std * G.sqrt()
+                    # Optional gauge projection of injected noise.
+                    try:
+                        if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                            if bool(getattr(self, "_gauge_project_apply_noise", True)):
+                                dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                                mode = str(getattr(self, "_gauge_project_mode", "global"))
+                                cid = getattr(self, "_gauge_cluster_ids", None)
+                                cc = getattr(self, "_gauge_cluster_counts", None)
+                                project_event_mean_inplace(noise, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                    except Exception:
+                        pass
                     update += noise
 
                 # Update parameter
+                # Optional gauge projection of total update.
+                try:
+                    if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                        dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                        mode = str(getattr(self, "_gauge_project_mode", "global"))
+                        cid = getattr(self, "_gauge_cluster_ids", None)
+                        cc = getattr(self, "_gauge_cluster_counts", None)
+                        project_event_mean_inplace(update, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                except Exception:
+                    pass
                 p.add_(-update)
 
         return loss

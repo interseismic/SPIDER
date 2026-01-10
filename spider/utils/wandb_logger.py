@@ -239,8 +239,9 @@ def create_wandb_config(params: Dict[str, Any]) -> Dict[str, Any]:
         "phase1_epochs", "phase2_epochs", "phase3_epochs", "phase4_epochs",
         "lr_warmup", "lr_sampler", "sampler_lr_mode", "sampler_backend",
         "sampler_temperature", "sampler_preconditioning", "sampler_preconditioner",
+        "dt_lr_mult",
         "batch_size_warmup", "batch_size_sgld",
-        "save_every_n", "checkpoint_interval", "phase_unc",
+        "save_every_n", "checkpoint_interval", "sample_write_interval", "phase_unc",
         "devices",
         # Nested priors schema (strict)
         "priors",

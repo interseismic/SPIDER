@@ -131,6 +131,7 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
                     g["blockdiag_fisher_block_sizes"] = bs
                     g["blockdiag_fisher_max_cluster_size"] = int(params.get("blockdiag_fisher_max_cluster_size", bm.shape[1]))
 
+        _maybe_attach_gauge_projection(opt, params=params, state=state)
         return "psgld", opt
 
     if backend == "sghmc":
@@ -174,6 +175,8 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         # Ensure alpha exists in groups
         for g in opt.param_groups:
             g.setdefault("alpha", float(params.get("sghmc_alpha", 0.01)))
+        # Attach optional gauge-projection config (hard constraint on translation mode) to optimizer instance.
+        _maybe_attach_gauge_projection(opt, params=params, state=state)
         return "sghmc", opt
 
     if backend == "adaptive_sghmc":
@@ -185,9 +188,15 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         eps = float(params["sampler_eps"])
         lr_eff = lr
         if lr_mode == "per_obs":
-            # AdaptiveSGHMC (like pSGLD) uses minibatch-mean gradients scaled by n_obs internally (via scale_grad).
-            # Interpret lr_sampler as a per-observation knob by scaling lr down by n_obs for stability/knob portability.
-            lr_eff = lr / float(n_obs)
+            # AdaptiveSGHMC's update uses lr^2 in the drift term. SPIDER uses "sum-loglik" convention
+            # by scaling drift gradients by n_obs (scale_grad).
+            #
+            # To make lr_sampler behave like the other backends (i.e., roughly portable across dataset sizes),
+            # choose lr_eff so that:
+            #   (lr_eff^2) * n_obs  ≈  lr_sampler
+            # => lr_eff ≈ sqrt(lr_sampler / n_obs)
+            lr_eff = float(lr / float(n_obs))
+            lr_eff = float(max(lr_eff, 0.0)) ** 0.5
         base_group = {"params": base_params_list, "group_name": "core"}
         param_groups = [base_group]
         if use_b_lat:
@@ -225,6 +234,7 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
             g["preconditioning"] = True
             g["n_obs"] = int(state.N)
             g["scale_grad"] = float(state.N)
+        _maybe_attach_gauge_projection(opt, params=params, state=state)
         return "adaptive_sghmc", opt
 
     if backend in {"sgnht", "sgnht_rmsprop", "psgnht"}:
@@ -257,6 +267,67 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
     raise ValueError(
         f"Unknown sampler backend '{backend}'. Supported: psgld, sghmc, adaptive_sghmc, sgld_simple."
     )
+
+
+def _maybe_attach_gauge_projection(opt: torch.optim.Optimizer, *, params: dict, state) -> None:
+    """
+    Attach gauge-projection configuration to the optimizer instance (not stored in state_dict).
+
+    This allows sampler backends to:
+    - project out the mean gradient before preconditioner updates, and
+    - project injected noise / momentum so the translation mode cannot random-walk.
+    """
+    try:
+        enable = bool(params.get("gauge_project_enable", False))
+    except Exception:
+        enable = False
+    if not enable:
+        return
+    try:
+        dims = params.get("gauge_project_dims", [0, 1, 2])
+        if not isinstance(dims, list) or len(dims) == 0:
+            dims = [0, 1, 2]
+        dims = tuple(int(d) for d in dims)
+    except Exception:
+        dims = (0, 1, 2)
+    try:
+        mode = str(params.get("gauge_project_mode", "global")).strip().lower()
+    except Exception:
+        mode = "global"
+    if mode not in {"global", "cluster"}:
+        mode = "global"
+    try:
+        apply_noise = bool(params.get("gauge_project_apply_noise", True))
+    except Exception:
+        apply_noise = True
+    try:
+        apply_momentum = bool(params.get("gauge_project_apply_momentum", True))
+    except Exception:
+        apply_momentum = True
+
+    # Store on optimizer instance; samplers check these attributes in step().
+    setattr(opt, "_gauge_project_enable", True)
+    setattr(opt, "_gauge_project_dims", dims)
+    setattr(opt, "_gauge_project_mode", mode)
+    setattr(opt, "_gauge_project_apply_noise", apply_noise)
+    setattr(opt, "_gauge_project_apply_momentum", apply_momentum)
+    dX_param = getattr(state, "dX_src", None)
+    cid = getattr(state, "cluster_ids", None)
+    cc = getattr(state, "cluster_counts", None)
+    # Enforce cluster mode if requested: do not silently fall back to global.
+    if mode == "cluster":
+        if not isinstance(cid, torch.Tensor):
+            raise RuntimeError("gauge_projection.mode='cluster' requires state.cluster_ids (Tensor).")
+        if not isinstance(cc, torch.Tensor):
+            raise RuntimeError("gauge_projection.mode='cluster' requires state.cluster_counts (Tensor).")
+        if not isinstance(dX_param, torch.Tensor):
+            raise RuntimeError("gauge_projection requires state.dX_src (Tensor).")
+        if cid.ndim != 1 or int(cid.numel()) != int(dX_param.shape[0]):
+            raise RuntimeError("gauge_projection.mode='cluster': cluster_ids must have shape (n_events,) matching dX_src.")
+    setattr(opt, "_gauge_project_param", dX_param)
+    setattr(opt, "_gauge_cluster_ids", cid)
+    setattr(opt, "_gauge_cluster_counts", cc)
+    return
 
 
 def transplant_from_adam_if_supported(adam_opt: torch.optim.Optimizer, sampler: torch.optim.Optimizer) -> None:

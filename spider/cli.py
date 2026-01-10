@@ -7,6 +7,7 @@ import tempfile
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import numpy as np
 import polars as pl
 from pyproj import Proj
@@ -29,6 +30,50 @@ from spider.core.config_schema import (
 	validate_and_materialize_block5,
 )
 from spider.core.priors_config import validate_and_materialize_priors
+
+
+def _device_from_id(device_id: int) -> torch.device:
+	"""
+	Map an internal device id to a torch.device.
+
+	Convention:
+	  - device_id >= 0 => CUDA device id (if CUDA available), else CPU fallback
+	  - device_id < 0  => force CPU
+	"""
+	try:
+		device_id = int(device_id)
+	except Exception:
+		device_id = -1
+	if device_id < 0:
+		return torch.device("cpu")
+	if torch.cuda.is_available():
+		return torch.device(f"cuda:{device_id}")
+	warn("CUDA is not available; running on CPU.", section="RUN")
+	return torch.device("cpu")
+
+
+def _parse_device_entry(x) -> int:
+	"""
+	Parse a device entry from config into our canonical int representation:
+	  - CUDA device ids: non-negative ints
+	  - CPU: -1 (accepts -1 or 'cpu' or 'cuda:N' or numeric strings)
+	"""
+	if x is None:
+		raise ValueError("Device entry is null")
+	if isinstance(x, int):
+		return int(x)
+	s = str(x).strip().lower()
+	if s == "cpu":
+		return -1
+	if s.startswith("cuda:"):
+		s2 = s.split("cuda:", 1)[1].strip()
+		if not s2.isdigit():
+			raise ValueError(f"Invalid device specifier {x!r} (expected 'cuda:<int>')")
+		return int(s2)
+	# Accept numeric strings
+	if s.lstrip("-").isdigit():
+		return int(s)
+	raise ValueError(f"Invalid device specifier {x!r} (supported: int, -1/'cpu', 'cuda:<int>')")
 
 
 def _load_model(params: dict, device: int | str) -> torch.nn.Module:
@@ -79,18 +124,14 @@ def _cmd_locate_full(args: argparse.Namespace) -> int:
 				f"Config compute.devices has {len(dev_list)} entries but `spider locate` is single-device. "
 				"Use `spider locate-multi` for multi-GPU, or pass --device to pick one GPU."
 			)
-		device_id = int(dev_list[0])
+		device_id = _parse_device_entry(dev_list[0])
 	else:
 		device_id = int(args.device)
 		# Keep the materialized device list consistent with the explicit override.
 		params["devices"] = [device_id]
 
 	# Resolve to an actual torch.device (robust to CPU-only builds).
-	if torch.cuda.is_available():
-		device = torch.device(f"cuda:{device_id}")
-	else:
-		warn("CUDA is not available; running on CPU.", section="RUN")
-		device = torch.device("cpu")
+	device = _device_from_id(int(device_id))
 
 	# Inject optional shift guard settings into params for core pipeline
 	if getattr(args, "shift_guard", False):
@@ -134,20 +175,57 @@ def _cmd_locate_map(args: argparse.Namespace) -> int:
 	params = validate_and_materialize_block5(params)
 	params = validate_and_materialize_priors(params)
 
+	# --- Optional distributed (torchrun) mode ---
+	# This is a *single-chain* multi-GPU mode (data-parallel minibatches) for Phase 1 (MAP).
+	world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+	local_rank = int(os.environ.get("LOCAL_RANK", "0") or "0")
+	rank = int(os.environ.get("RANK", "0") or "0")
+	ddp_enabled = bool(world_size > 1)
+
 	dev_list = list(params.get("devices", []))
 	if not dev_list:
 		raise ValueError("No devices configured. Set compute.devices in the config, or pass --device.")
-	if args.device is None:
-		if len(dev_list) != 1:
+
+	if ddp_enabled:
+		if args.device is not None:
+			raise ValueError("When running under torchrun (WORLD_SIZE>1), do not pass --device. Use inference.compute.devices to map ranks to devices.")
+		if len(dev_list) < int(world_size):
 			raise ValueError(
-				f"Config compute.devices has {len(dev_list)} entries but `spider locate-map` is single-device. "
-				"Use `spider locate-map` with --device to pick one GPU, or run one map per GPU manually."
+				f"Distributed `spider locate-map` requires inference.compute.devices to list >= WORLD_SIZE devices. "
+				f"Got devices={len(dev_list)} WORLD_SIZE={world_size}."
 			)
-		device_id = int(dev_list[0])
-	else:
-		device_id = int(args.device)
+		device_id = _parse_device_entry(dev_list[int(local_rank)])
 		params["devices"] = [device_id]
-	device = torch.device(f"cuda:{device_id}") if torch.cuda.is_available() else torch.device("cpu")
+	else:
+		if args.device is None:
+			if len(dev_list) != 1:
+				raise ValueError(
+					f"Config compute.devices has {len(dev_list)} entries but `spider locate-map` is single-device. "
+					"Use `torchrun -m spider locate-map ...` for single-chain multi-GPU MAP, "
+					"use `spider locate-map --device ...` to pick one device, or run one map per GPU manually."
+				)
+			device_id = _parse_device_entry(dev_list[0])
+		else:
+			device_id = int(args.device)
+			params["devices"] = [device_id]
+	device = _device_from_id(int(device_id))
+	if device.type == "cuda":
+		try:
+			torch.cuda.set_device(device)
+		except Exception:
+			pass
+
+	# Initialize torch.distributed if requested (torchrun).
+	if ddp_enabled:
+		try:
+			backend = "nccl" if (torch.cuda.is_available() and device.type == "cuda") else "gloo"
+			dist.init_process_group(backend=backend, init_method="env://")
+		except Exception as e:
+			raise RuntimeError(f"Failed to init torch.distributed process group (backend={backend}): {e}")
+		# Expose rank info to core code for batching + IO gating.
+		params["_ddp_world_size"] = int(world_size)
+		params["_ddp_rank"] = int(rank)
+		params["_ddp_local_rank"] = int(local_rank)
 
 	if getattr(args, "shift_guard", False):
 		params["shift_guard_enable"] = True
@@ -163,7 +241,9 @@ def _cmd_locate_map(args: argparse.Namespace) -> int:
 	if params["use_wandb"]:
 		params["total_events"] = origins.shape[0]
 		params["total_dtimes"] = dtimes.shape[0]
-	wandb_logger = init_wandb_if_enabled(params)
+	# Only rank0 logs in torchrun mode to avoid duplicate runs.
+	is_main = (int(params.get("_ddp_rank", 0)) == 0) if ddp_enabled else True
+	wandb_logger = init_wandb_if_enabled(params) if is_main else None
 	params["_wandb_runtime_enabled"] = bool(wandb_logger is not None)
 
 	# Default bundle output in checkpoint_dir
@@ -176,7 +256,19 @@ def _cmd_locate_map(args: argparse.Namespace) -> int:
 		bundle_out = os.path.join(ckpt_dir, "phase2_bundle.pth")
 
 	info("Running SPIDER Phase 1 (MAP) only", section="RUN")
-	locate_map(params, origins, dtimes, model, device, wandb_logger, bundle_out=bundle_out)
+	try:
+		locate_map(params, origins, dtimes, model, device, wandb_logger, bundle_out=bundle_out)
+	finally:
+		# Clean shutdown for torchrun
+		if ddp_enabled:
+			try:
+				dist.barrier()
+			except Exception:
+				pass
+			try:
+				dist.destroy_process_group()
+			except Exception:
+				pass
 
 	if wandb_logger:
 		wandb_logger.finish()
@@ -194,20 +286,60 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 	params = validate_and_materialize_block5(params)
 	params = validate_and_materialize_priors(params)
 
+	# --- Optional distributed (torchrun) mode ---
+	# This is a *single-chain* multi-GPU mode (data-parallel minibatches).
+	# It must not change the semantics of `spider sample-multi` (independent chains).
+	world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+	local_rank = int(os.environ.get("LOCAL_RANK", "0") or "0")
+	rank = int(os.environ.get("RANK", "0") or "0")
+	ddp_enabled = bool(world_size > 1)
+
 	dev_list = list(params.get("devices", []))
 	if not dev_list:
 		raise ValueError("No devices configured. Set compute.devices in the config, or pass --device.")
-	if args.device is None:
-		if len(dev_list) != 1:
+
+	if ddp_enabled:
+		if args.device is not None:
+			raise ValueError("When running under torchrun (WORLD_SIZE>1), do not pass --device. Use inference.compute.devices to map ranks to GPUs.")
+		if len(dev_list) < int(world_size):
 			raise ValueError(
-				f"Config compute.devices has {len(dev_list)} entries but `spider sample` is single-device. "
-				"Use `spider sample-multi` for multi-GPU, or pass --device to pick one GPU."
+				f"Distributed `spider sample` requires inference.compute.devices to list >= WORLD_SIZE GPUs. "
+				f"Got devices={len(dev_list)} WORLD_SIZE={world_size}."
 			)
-		device_id = int(dev_list[0])
-	else:
-		device_id = int(args.device)
+		device_id = _parse_device_entry(dev_list[int(local_rank)])
+		# Keep the materialized device list consistent with this rank's device.
 		params["devices"] = [device_id]
-	device = torch.device(f"cuda:{device_id}") if torch.cuda.is_available() else torch.device("cpu")
+	else:
+		if args.device is None:
+			if len(dev_list) != 1:
+				raise ValueError(
+					f"Config compute.devices has {len(dev_list)} entries but `spider sample` is single-device. "
+					"Use `spider sample-multi` for multi-GPU, or pass --device to pick one GPU."
+				)
+			device_id = _parse_device_entry(dev_list[0])
+		else:
+			device_id = int(args.device)
+			params["devices"] = [device_id]
+
+	# Resolve to an actual torch.device (robust to CPU-only builds).
+	device = _device_from_id(int(device_id))
+	if device.type == "cuda":
+		try:
+			torch.cuda.set_device(device)
+		except Exception:
+			pass
+
+	# Initialize torch.distributed if requested (torchrun).
+	if ddp_enabled:
+		try:
+			backend = "nccl" if torch.cuda.is_available() else "gloo"
+			dist.init_process_group(backend=backend, init_method="env://")
+		except Exception as e:
+			raise RuntimeError(f"Failed to init torch.distributed process group (backend={backend}): {e}")
+		# Expose rank info to core code for batching + IO gating.
+		params["_ddp_world_size"] = int(world_size)
+		params["_ddp_rank"] = int(rank)
+		params["_ddp_local_rank"] = int(local_rank)
 
 	if getattr(args, "shift_guard", False):
 		params["shift_guard_enable"] = True
@@ -235,12 +367,26 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 	except Exception:
 		pass
 
-	wandb_logger = init_wandb_if_enabled(params)
+	# W&B: only rank0 logs in torchrun mode to avoid duplicate runs.
+	is_main = (int(params.get("_ddp_rank", 0)) == 0) if ddp_enabled else True
+	wandb_logger = init_wandb_if_enabled(params) if is_main else None
 	params["_wandb_runtime_enabled"] = bool(wandb_logger is not None)
 
 	model = _load_model(params, device)
 	info(f"Running SPIDER sampling from bundle={bundle_path}", section="RUN")
-	locate_sample_from_bundle(params=params, bundle_path=bundle_path, model=model, device=device, wandb_logger=wandb_logger)
+	try:
+		locate_sample_from_bundle(params=params, bundle_path=bundle_path, model=model, device=device, wandb_logger=wandb_logger)
+	finally:
+		# Clean shutdown for torchrun
+		if ddp_enabled:
+			try:
+				dist.barrier()
+			except Exception:
+				pass
+			try:
+				dist.destroy_process_group()
+			except Exception:
+				pass
 
 	if wandb_logger:
 		wandb_logger.finish()
@@ -258,6 +404,56 @@ def _cmd_analyze_resid(args: argparse.Namespace) -> int:
 	params = validate_and_materialize_block5(params)
 	params = validate_and_materialize_priors(params)
 
+	# Optional CLI overrides for shared_event_latent tau estimation inside analyze-resid.
+	# analyze_resid_from_bundle() already calls maybe_estimate_shared_event_latent_tau_after_phase1(state=...),
+	# which reads inference.diagnostics.shared_event_latent_tau_estimate.* from params.
+	try:
+		inf = params.setdefault("inference", {})
+		if not isinstance(inf, dict):
+			inf = {}
+			params["inference"] = inf
+		dg = inf.setdefault("diagnostics", {})
+		if not isinstance(dg, dict):
+			dg = {}
+			inf["diagnostics"] = dg
+		tau_cfg = dg.setdefault("shared_event_latent_tau_estimate", {})
+		if not isinstance(tau_cfg, dict):
+			tau_cfg = {}
+			dg["shared_event_latent_tau_estimate"] = tau_cfg
+
+		# Only override keys when the CLI flag was provided.
+		if getattr(args, "tau_method", None) is not None:
+			tau_cfg["method"] = str(getattr(args, "tau_method")).strip().lower()
+		if getattr(args, "tau_apply", None) is not None:
+			tau_cfg["apply"] = bool(getattr(args, "tau_apply"))
+		if getattr(args, "tau_apply_scale", None) is not None:
+			tau_cfg["apply_scale"] = float(getattr(args, "tau_apply_scale"))
+		if getattr(args, "tau_n_rows", None) is not None:
+			tau_cfg["n_rows"] = int(getattr(args, "tau_n_rows"))
+		if getattr(args, "tau_seed", None) is not None:
+			tau_cfg["seed"] = int(getattr(args, "tau_seed"))
+		if getattr(args, "tau_batch_size", None) is not None:
+			tau_cfg["batch_size"] = int(getattr(args, "tau_batch_size"))
+		if getattr(args, "tau_holdout_frac", None) is not None:
+			tau_cfg["holdout_frac"] = float(getattr(args, "tau_holdout_frac"))
+		if getattr(args, "tau_min_edges_per_group", None) is not None:
+			tau_cfg["min_edges_per_group"] = int(getattr(args, "tau_min_edges_per_group"))
+		if getattr(args, "tau_max_edges_per_group", None) is not None:
+			tau_cfg["max_edges_per_group"] = int(getattr(args, "tau_max_edges_per_group"))
+		if getattr(args, "tau_max_groups_per_phase", None) is not None:
+			tau_cfg["max_groups_per_phase"] = int(getattr(args, "tau_max_groups_per_phase"))
+		if getattr(args, "tau_grid_decades", None) is not None:
+			tau_cfg["grid_decades"] = float(getattr(args, "tau_grid_decades"))
+		if getattr(args, "tau_grid_size", None) is not None:
+			tau_cfg["grid_size"] = int(getattr(args, "tau_grid_size"))
+		if getattr(args, "tau_cg_rtol", None) is not None:
+			tau_cfg["cg_rtol"] = float(getattr(args, "tau_cg_rtol"))
+		if getattr(args, "tau_cg_maxiter", None) is not None:
+			tau_cfg["cg_maxiter"] = int(getattr(args, "tau_cg_maxiter"))
+	except Exception:
+		# Best-effort only; analyze-resid should still run.
+		pass
+
 	dev_list = list(params.get("devices", []))
 	if not dev_list:
 		raise ValueError("No devices configured. Set compute.devices in the config, or pass --device.")
@@ -267,11 +463,11 @@ def _cmd_analyze_resid(args: argparse.Namespace) -> int:
 				f"Config compute.devices has {len(dev_list)} entries but `spider analyze-resid` is single-device. "
 				"Pass --device to pick one GPU."
 			)
-		device_id = int(dev_list[0])
+		device_id = _parse_device_entry(dev_list[0])
 	else:
 		device_id = int(args.device)
 		params["devices"] = [device_id]
-	device = torch.device(f"cuda:{device_id}") if torch.cuda.is_available() else torch.device("cpu")
+	device = _device_from_id(int(device_id))
 
 	# Load model (needed to compute residuals)
 	model = _load_model(params, device)
@@ -310,10 +506,10 @@ def _cmd_sample_multi(args: argparse.Namespace) -> int:
 	# Devices: either provided explicitly, or use inference.compute.devices from params.
 	devs = None
 	if getattr(args, "devices", None):
-		devs = [int(x) for x in str(args.devices).split(",") if str(x).strip()]
+		devs = [_parse_device_entry(x.strip()) for x in str(args.devices).split(",") if str(x).strip()]
 	else:
 		try:
-			devs = [int(x) for x in base_params.get("inference", {}).get("compute", {}).get("devices", [])]
+			devs = [_parse_device_entry(x) for x in base_params.get("inference", {}).get("compute", {}).get("devices", [])]
 		except Exception:
 			devs = []
 	if not devs:
@@ -441,10 +637,10 @@ def _cmd_locate_multi_legacy(args: argparse.Namespace) -> int:
 	# Devices: either provided explicitly, or use compute.devices from params.
 	devs = None
 	if getattr(args, "devices", None):
-		devs = [int(x) for x in str(args.devices).split(",") if str(x).strip()]
+		devs = [_parse_device_entry(x.strip()) for x in str(args.devices).split(",") if str(x).strip()]
 	else:
 		try:
-			devs = [int(x) for x in base_params.get("inference", {}).get("compute", {}).get("devices", [])]
+			devs = [_parse_device_entry(x) for x in base_params.get("inference", {}).get("compute", {}).get("devices", [])]
 		except Exception:
 			devs = []
 	if not devs:
@@ -980,6 +1176,34 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	g_plot.add_argument("--no-plot-variograms", dest="plot_variograms", action="store_false", help="Disable variogram plotting")
 	p_ar.set_defaults(plot_variograms=True)
 	p_ar.add_argument("--plot-dir", type=str, default=None, help="Directory for variogram PNGs (default: bundle directory)")
+
+	# Optional: shared_event_latent tau estimation overrides (post-Phase1 diagnostics)
+	p_tau = p_ar.add_argument_group("shared_event_latent tau estimation (diagnostics)")
+	p_tau.add_argument(
+		"--tau-method",
+		type=str,
+		default=None,
+		choices=["moment", "cv"],
+		help="Tau estimator for shared_event_latent: 'moment' (fast heuristic) or 'cv' (held-out predictive, slower).",
+	)
+	g_apply = p_tau.add_mutually_exclusive_group()
+	g_apply.set_defaults(tau_apply=None)
+	g_apply.add_argument("--tau-apply", dest="tau_apply", action="store_true", help="Apply estimated tau into params for this analyze-resid run.")
+	g_apply.add_argument("--no-tau-apply", dest="tau_apply", action="store_false", help="Do not apply estimated tau (just print).")
+	p_tau.add_argument("--tau-apply-scale", type=float, default=None, help="Scale factor applied to estimated tau before applying (e.g. 0.5 to be more conservative).")
+	p_tau.add_argument("--tau-n-rows", type=int, default=None, help="Rows to subsample for tau estimation (default depends on method).")
+	p_tau.add_argument("--tau-seed", type=int, default=None, help="RNG seed for tau estimation subsampling/splits.")
+	p_tau.add_argument("--tau-batch-size", type=int, default=None, help="Batch size for residual evaluation during tau estimation.")
+	# CV-only knobs (ignored for moment)
+	p_tau.add_argument("--tau-holdout-frac", type=float, default=None, help="Holdout fraction per station-phase group for CV tau.")
+	p_tau.add_argument("--tau-min-edges-per-group", type=int, default=None, help="Minimum edges per station-phase group to include in CV.")
+	p_tau.add_argument("--tau-max-edges-per-group", type=int, default=None, help="Max edges per station-phase group (cap for compute).")
+	p_tau.add_argument("--tau-max-groups-per-phase", type=int, default=None, help="Max station groups per phase to include in CV.")
+	p_tau.add_argument("--tau-grid-decades", type=float, default=None, help="Log10 half-width for tau grid around center (e.g. 1.0 -> ×[0.1,10]).")
+	p_tau.add_argument("--tau-grid-size", type=int, default=None, help="Number of tau candidates in the grid (odd recommended).")
+	p_tau.add_argument("--tau-cg-rtol", type=float, default=None, help="CG relative tolerance for CV ridge solves.")
+	p_tau.add_argument("--tau-cg-maxiter", type=int, default=None, help="CG max iterations for CV ridge solves.")
+
 	p_ar.set_defaults(func=_cmd_analyze_resid)
 
 	# locate subcommand

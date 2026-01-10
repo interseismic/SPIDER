@@ -3,6 +3,8 @@ from typing import Optional
 
 import torch
 
+from .gauge import project_event_mean_inplace
+
 
 class AdaptiveSGHMC(torch.optim.Optimizer):
     """
@@ -126,7 +128,41 @@ class AdaptiveSGHMC(torch.optim.Optimizer):
                 v_hat = st["v_hat"]
                 momentum = st["momentum"]
 
-                grad = p.grad.data * scale_grad_t
+                # SPIDER convention:
+                # - Autograd produces minibatch-mean gradients of the *average* negative log posterior.
+                # - Sampler drift wants the "sum-loglik" convention, so we scale by n_obs (scale_grad).
+                #
+                # For consistency with SGHMC/pSGLD:
+                # - Use drift_grad = N * ḡ for the dynamics
+                # - Use precond/adaptation stats from the minibatch-mean gradient (optionally degree-normalized)
+                #   so the preconditioner is less sensitive to dataset size and heterogeneous event degrees.
+                grad_mean = p.grad.data
+                # --- Optional gauge projection: remove translation mode before adaptation/preconditioner updates ---
+                try:
+                    gauge_enable = bool(getattr(self, "_gauge_project_enable", False))
+                    gauge_param = getattr(self, "_gauge_project_param", None)
+                    if gauge_enable and (gauge_param is p):
+                        if isinstance(grad_mean, torch.Tensor) and grad_mean.ndim == 2 and int(grad_mean.shape[1]) >= 4:
+                            dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                            mode = str(getattr(self, "_gauge_project_mode", "global"))
+                            cid = getattr(self, "_gauge_cluster_ids", None)
+                            cc = getattr(self, "_gauge_cluster_counts", None)
+                            project_event_mean_inplace(grad_mean, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                except Exception:
+                    pass
+                drift_grad = grad_mean * scale_grad_t
+
+                # Optional DD-degree normalization (attached by spider.core.state._attach_dd_preconditioner_metric).
+                # This mirrors SGHMC/pSGLD behavior where degree scaling affects preconditioner statistics,
+                # not the drift scaling itself.
+                dd_degree = getattr(p, "_dd_degree", None)
+                if dd_degree is not None:
+                    try:
+                        precond_grad = grad_mean / dd_degree
+                    except Exception:
+                        precond_grad = grad_mean
+                else:
+                    precond_grad = grad_mean
 
                 # tau_inv = 1/(tau+1)
                 tau_inv = 1.0 / (tau + 1.0)
@@ -143,8 +179,8 @@ class AdaptiveSGHMC(torch.optim.Optimizer):
                 if do_burnin and (not freeze_precond):
                     # Eq. 9 (Springenberg et al. 2016): update tau, g, v_hat
                     tau.add_(-tau * (g * g / (v_hat + epsilon)) + 1.0)
-                    g.add_(-g * tau_inv + tau_inv * grad)
-                    v_hat.add_(-v_hat * tau_inv + tau_inv * (grad * grad))
+                    g.add_(-g * tau_inv + tau_inv * precond_grad)
+                    v_hat.add_(-v_hat * tau_inv + tau_inv * (precond_grad * precond_grad))
 
                 # Diagonal preconditioner
                 minv_t = 1.0 / (torch.sqrt(v_hat) + epsilon)
@@ -162,8 +198,8 @@ class AdaptiveSGHMC(torch.optim.Optimizer):
                 if ema_g2 is None:
                     ema_g2 = torch.zeros_like(p)
                     st["ema_g2"] = ema_g2
-                ema_g.mul_(grad_ema_beta).add_(grad, alpha=(1.0 - grad_ema_beta))
-                ema_g2.mul_(grad_ema_beta).addcmul_(grad, grad, value=(1.0 - grad_ema_beta))
+                ema_g.mul_(grad_ema_beta).add_(drift_grad, alpha=(1.0 - grad_ema_beta))
+                ema_g2.mul_(grad_ema_beta).addcmul_(drift_grad, drift_grad, value=(1.0 - grad_ema_beta))
 
                 # BOHAMIANN noise variance term
                 # epsilon_var = 2 * lr^2 * mdecay * minv_t - lr^4
@@ -173,12 +209,35 @@ class AdaptiveSGHMC(torch.optim.Optimizer):
                 if add_noise and noise_scale > 0.0 and temperature > 0.0:
                     # Allow SPIDER to ramp/scale noise and apply a temperature (std scales by sqrt(T)).
                     sigma = torch.sqrt(eps_var) * float(noise_scale) * math.sqrt(float(temperature))
-                    noise = torch.normal(mean=torch.zeros_like(grad), std=sigma)
+                    noise = torch.normal(mean=torch.zeros_like(drift_grad), std=sigma)
+                    # Optional gauge projection of injected noise (prevents centroid random-walk).
+                    try:
+                        if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                            if bool(getattr(self, "_gauge_project_apply_noise", True)):
+                                dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                                mode = str(getattr(self, "_gauge_project_mode", "global"))
+                                cid = getattr(self, "_gauge_cluster_ids", None)
+                                cc = getattr(self, "_gauge_cluster_counts", None)
+                                project_event_mean_inplace(noise, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                    except Exception:
+                        pass
                 else:
-                    noise = torch.zeros_like(grad)
+                    noise = torch.zeros_like(drift_grad)
 
                 # Momentum update (Eq. 10 right)
-                momentum.add_(-(lr * lr) * minv_t * grad - mdecay * momentum + noise)
+                momentum.add_(-(lr * lr) * minv_t * drift_grad - mdecay * momentum + noise)
+
+                # Optional: project momentum mean as well (helps because momentum carries across steps).
+                try:
+                    if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                        if bool(getattr(self, "_gauge_project_apply_momentum", True)):
+                            dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                            mode = str(getattr(self, "_gauge_project_mode", "global"))
+                            cid = getattr(self, "_gauge_cluster_ids", None)
+                            cc = getattr(self, "_gauge_cluster_counts", None)
+                            project_event_mean_inplace(momentum, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                except Exception:
+                    pass
 
                 # Theta update (Eq. 10 left): theta += momentum
                 p.data.add_(momentum)

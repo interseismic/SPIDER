@@ -27,6 +27,7 @@ _FORBIDDEN_BLOCK1_TOPLEVEL_KEYS: Tuple[str, ...] = (
     "samples_outfile",
     "checkpoint_dir",
     "checkpoint_interval",
+    "sample_write_interval",
     "save_every_n",
     "write_samples",
     # model (legacy)
@@ -185,6 +186,15 @@ def validate_and_materialize_block1(params: Dict[str, Any]) -> Dict[str, Any]:
     samples_outfile = _require_str(_require(io, "samples_outfile", "io"), "io.samples_outfile")
     checkpoint_dir = _require_str(_require(io, "checkpoint_dir", "io"), "io.checkpoint_dir")
     checkpoint_interval = int(_require_num(_require(io, "checkpoint_interval", "io"), "io.checkpoint_interval"))
+    # Optional: allow sample flush cadence to differ from checkpoint cadence.
+    # If not provided, preserve historical behavior: flush samples when checkpointing.
+    sample_write_interval_v = io.get("sample_write_interval", None)
+    if sample_write_interval_v is None:
+        sample_write_interval = int(checkpoint_interval)
+    else:
+        sample_write_interval = int(_require_num(sample_write_interval_v, "io.sample_write_interval"))
+    if sample_write_interval < 0:
+        raise _err("io.sample_write_interval", "must be >= 0 (0 means 'only flush at final write')")
     save_every_n = int(_require_num(_require(io, "save_every_n", "io"), "io.save_every_n"))
     write_samples = _require_bool(_require(io, "write_samples", "io"), "io.write_samples")
 
@@ -222,6 +232,7 @@ def validate_and_materialize_block1(params: Dict[str, Any]) -> Dict[str, Any]:
     params["samples_outfile"] = samples_outfile
     params["checkpoint_dir"] = checkpoint_dir
     params["checkpoint_interval"] = checkpoint_interval
+    params["sample_write_interval"] = sample_write_interval
     params["save_every_n"] = save_every_n
     params["write_samples"] = write_samples
 
@@ -271,6 +282,8 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
       sampler.beta (0<=beta<1), sampler.eps (>0)
       sampler.freeze_preconditioner_sampling (bool)
       sampler.sghmc_alpha (>0) iff backend=="sghmc" (no default)
+      sampler.dt_lr_mult (optional float>0, default 1.0): multiplier applied to the ΔT gradient (dimension 3)
+        to effectively use a different learning rate for the origin-time correction component.
     """
     forbidden_present = [k for k in _FORBIDDEN_BLOCK2_TOPLEVEL_KEYS if k in params]
     if forbidden_present:
@@ -323,6 +336,14 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     temperature = _require_num(_require(sampler, "temperature", "sampler"), "sampler.temperature")
     if temperature < 0.0:
         raise _err("sampler.temperature", "must be >= 0")
+
+    # Optional: per-dimension LR multiplier for ΔT (origin time correction).
+    # Implemented as a gradient scaler in the epoch runner so it works across Adam/PSGLD/SGHMC.
+    dt_lr_mult = 1.0
+    if "dt_lr_mult" in sampler and sampler.get("dt_lr_mult", None) is not None:
+        dt_lr_mult = float(_require_num(sampler.get("dt_lr_mult"), "sampler.dt_lr_mult"))
+        if not (dt_lr_mult > 0.0) or not math.isfinite(dt_lr_mult):
+            raise _err("sampler.dt_lr_mult", "must be finite and > 0")
 
     precond = _require_dict(_require(sampler, "preconditioning", "sampler"), "sampler.preconditioning")
     precond_enabled = _require_bool(_require(precond, "enabled", "sampler.preconditioning"), "sampler.preconditioning.enabled")
@@ -439,6 +460,7 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     params["sampler_lr_mode"] = lr_mode
     params["sampler_backend"] = backend
     params["sampler_temperature"] = temperature
+    params["dt_lr_mult"] = float(dt_lr_mult)
     params["sampler_preconditioning"] = bool(precond_enabled)
     params["sampler_preconditioner"] = precond_type if precond_enabled else "none"
     params["sampler_beta"] = beta
@@ -587,14 +609,83 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     if not temp_enabled:
         temp_alpha = 1.0
 
+    # Optional: additional heteroscedastic noise inflation for the likelihood (no latent term).
+    #
+    # This adds a per-observation variance term in quadrature with the base noise scale:
+    #   sigma_eff^2 = sigma_phase^2 + sigma_extra_var
+    #
+    # Intended use: represent unmodeled path/velocity-structure uncertainty that scales with
+    # event-pair separation, while still allowing `shared_event_latent` to learn coherent mean
+    # corrections (nuisance_delta).
+    #
+    # Config:
+    #   model.likelihood.sigma_inflation:
+    #     enabled: bool
+    #     mode: "vel_frac_linear_dd"   # sigma_struct(d) = (vel_frac / v_km_s) * d_km
+    #     vel_frac: [P,S]              # fractional velocity error (e.g., 0.02 for 2%)
+    #     v_km_s: [P,S]                # reference phase speeds in km/s (e.g., [6.0, 3.5])
+    #     max_d_km: number|null        # optional clamp on d_km (stability / conservative cap)
+    #     use_3d: bool                 # if true use sqrt(dx^2+dy^2+dz^2), else horizontal only
+    #
+    # Note: this is currently NOT supported with `shared_event_re` (pcg_sparse) because that
+    # solver assumes a homoscedastic diagonal; we validate that below.
+    sigma_infl_cfg = lk.get("sigma_inflation", None)
+    sigma_infl_enabled = False
+    sigma_infl_mode = "vel_frac_linear_dd"
+    sigma_infl_vel_frac = [0.0, 0.0]
+    sigma_infl_v_km_s = [6.0, 3.5]
+    sigma_infl_max_d_km = None
+    sigma_infl_use_3d = True
+    if isinstance(sigma_infl_cfg, dict):
+        sigma_infl_enabled = bool(sigma_infl_cfg.get("enabled", False))
+        if "mode" in sigma_infl_cfg and sigma_infl_cfg.get("mode", None) is not None:
+            sigma_infl_mode = str(sigma_infl_cfg.get("mode", "vel_frac_linear_dd")).strip().lower()
+        if sigma_infl_mode not in {"vel_frac_linear_dd"}:
+            raise _err("model.likelihood.sigma_inflation.mode", "supported: 'vel_frac_linear_dd'")
+        if "vel_frac" in sigma_infl_cfg and sigma_infl_cfg.get("vel_frac", None) is not None:
+            v = sigma_infl_cfg["vel_frac"]
+            if isinstance(v, (int, float)):
+                f = float(v)
+                sigma_infl_vel_frac = [f, f]
+            elif isinstance(v, list):
+                sigma_infl_vel_frac = _require_float_list(v, "model.likelihood.sigma_inflation.vel_frac", length=2)
+            else:
+                raise _err("model.likelihood.sigma_inflation.vel_frac", f"expected number or [P,S] list, got {type(v).__name__}")
+        if not (sigma_infl_vel_frac[0] >= 0.0 and sigma_infl_vel_frac[1] >= 0.0):
+            raise _err("model.likelihood.sigma_inflation.vel_frac", "must be >= 0")
+        if "v_km_s" in sigma_infl_cfg and sigma_infl_cfg.get("v_km_s", None) is not None:
+            v = sigma_infl_cfg["v_km_s"]
+            if isinstance(v, (int, float)):
+                f = float(v)
+                sigma_infl_v_km_s = [f, f]
+            elif isinstance(v, list):
+                sigma_infl_v_km_s = _require_float_list(v, "model.likelihood.sigma_inflation.v_km_s", length=2)
+            else:
+                raise _err("model.likelihood.sigma_inflation.v_km_s", f"expected number or [P,S] list, got {type(v).__name__}")
+        if not (sigma_infl_v_km_s[0] > 0.0 and sigma_infl_v_km_s[1] > 0.0):
+            raise _err("model.likelihood.sigma_inflation.v_km_s", "must be > 0")
+        if "max_d_km" in sigma_infl_cfg and sigma_infl_cfg.get("max_d_km", None) is not None:
+            sigma_infl_max_d_km = float(_require_num(sigma_infl_cfg["max_d_km"], "model.likelihood.sigma_inflation.max_d_km"))
+            if not (sigma_infl_max_d_km > 0.0) or (not math.isfinite(sigma_infl_max_d_km)):
+                raise _err("model.likelihood.sigma_inflation.max_d_km", "must be finite and > 0 (or null)")
+        if "use_3d" in sigma_infl_cfg and sigma_infl_cfg.get("use_3d", None) is not None:
+            sigma_infl_use_3d = _require_bool(sigma_infl_cfg.get("use_3d"), "model.likelihood.sigma_inflation.use_3d")
+    if not sigma_infl_enabled:
+        # Materialize safe defaults (disabled)
+        sigma_infl_mode = "vel_frac_linear_dd"
+        sigma_infl_vel_frac = [0.0, 0.0]
+        sigma_infl_max_d_km = None
+        sigma_infl_use_3d = True
+
     # Residual-correlation block removed entirely (no backward compatibility).
     if "residual_correlation" in lk:
         raise _err("model.likelihood.residual_correlation", "removed; structured residual correlation models are no longer supported")
 
     # The following likelihood extensions have been removed from SPIDER.
     # Keep the config surface area focused on `likelihood.shared_event_latent`.
-    if "shared_event_re" in lk:
-        raise _err("model.likelihood.shared_event_re", "removed; use model.likelihood.shared_event_latent instead")
+    #
+    # NOTE: `shared_event_re` is supported again as an OPTIONAL *collapsed* (marginalized) Gaussian
+    # likelihood. The uncollapsed/latent version remains implemented under `shared_event_latent`.
     if "latent_field" in lk:
         raise _err("model.likelihood.latent_field", "removed; use model.likelihood.shared_event_latent instead")
 
@@ -622,7 +713,9 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     se_cache_max_entries = 4096
     se_cache_log_every = 0
     # Optional: solver selection for shared_event_re
-    se_solver = "dense"  # 'dense' (exact) or 'pcg_sparse' (quadratic-only; logdet dropped)
+    # Phase A implements `pcg_sparse` (quadratic-only; logdet dropped). A dense/exact solver may be
+    # added later for small groups (Phase B/C work).
+    se_solver = "pcg_sparse"  # 'pcg_sparse' (quadratic-only; logdet dropped)
     se_drop_logdet = True
     se_pcg_max_iters = 50
     se_pcg_tol = 1e-3
@@ -639,7 +732,7 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
         if se_grouping in {"stationphase", "station-phase"}:
             se_grouping = "station_phase"
         if se_grouping not in {"phase", "station_phase"}:
-            raise _err("likelihood.shared_event_re.grouping", "supported: 'phase', 'station_phase'")
+            raise _err("model.likelihood.shared_event_re.grouping", "supported: 'phase', 'station_phase'")
 
         if "tau_s" in se_cfg and se_cfg["tau_s"] is not None:
             v = se_cfg["tau_s"]
@@ -649,100 +742,272 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             elif isinstance(v, list):
                 se_tau_ps = _require_float_list(v, "likelihood.shared_event_re.tau_s", length=2)
             else:
-                raise _err("likelihood.shared_event_re.tau_s", f"expected number or [P,S] list, got {type(v).__name__}")
+                raise _err("model.likelihood.shared_event_re.tau_s", f"expected number or [P,S] list, got {type(v).__name__}")
         if not (se_tau_ps[0] >= 0.0 and se_tau_ps[1] >= 0.0):
-            raise _err("likelihood.shared_event_re.tau_s", "must be >= 0")
+            raise _err("model.likelihood.shared_event_re.tau_s", "must be >= 0")
 
         if "joint_ps" in se_cfg and se_cfg["joint_ps"] is not None:
             se_joint_ps = bool(se_cfg.get("joint_ps", False))
         if "rho_ps" in se_cfg and se_cfg["rho_ps"] is not None:
-            se_rho_ps = float(_require_num(se_cfg["rho_ps"], "likelihood.shared_event_re.rho_ps"))
+            se_rho_ps = float(_require_num(se_cfg["rho_ps"], "model.likelihood.shared_event_re.rho_ps"))
             if not (-0.999 < se_rho_ps < 0.999):
-                raise _err("likelihood.shared_event_re.rho_ps", "must satisfy -0.999 < rho_ps < 0.999")
+                raise _err("model.likelihood.shared_event_re.rho_ps", "must satisfy -0.999 < rho_ps < 0.999")
 
         if "max_nodes_per_group" in se_cfg and se_cfg["max_nodes_per_group"] is not None:
-            se_max_nodes_per_group = int(_require_num(se_cfg["max_nodes_per_group"], "likelihood.shared_event_re.max_nodes_per_group"))
+            se_max_nodes_per_group = int(_require_num(se_cfg["max_nodes_per_group"], "model.likelihood.shared_event_re.max_nodes_per_group"))
             if se_max_nodes_per_group < 2:
-                raise _err("likelihood.shared_event_re.max_nodes_per_group", "must be >= 2")
+                raise _err("model.likelihood.shared_event_re.max_nodes_per_group", "must be >= 2")
         if "max_rows_per_group" in se_cfg and se_cfg["max_rows_per_group"] is not None:
-            se_max_rows_per_group = int(_require_num(se_cfg["max_rows_per_group"], "likelihood.shared_event_re.max_rows_per_group"))
+            se_max_rows_per_group = int(_require_num(se_cfg["max_rows_per_group"], "model.likelihood.shared_event_re.max_rows_per_group"))
             if se_max_rows_per_group < 2:
-                raise _err("likelihood.shared_event_re.max_rows_per_group", "must be >= 2")
+                raise _err("model.likelihood.shared_event_re.max_rows_per_group", "must be >= 2")
         if "fallback_to_diag" in se_cfg and se_cfg["fallback_to_diag"] is not None:
             se_fallback_to_diag = bool(se_cfg.get("fallback_to_diag", True))
         if "jitter0" in se_cfg and se_cfg["jitter0"] is not None:
-            se_jitter0 = float(_require_num(se_cfg["jitter0"], "likelihood.shared_event_re.jitter0"))
+            se_jitter0 = float(_require_num(se_cfg["jitter0"], "model.likelihood.shared_event_re.jitter0"))
             if se_jitter0 <= 0.0:
-                raise _err("likelihood.shared_event_re.jitter0", "must be > 0")
+                raise _err("model.likelihood.shared_event_re.jitter0", "must be > 0")
         if "jitter_max" in se_cfg and se_cfg["jitter_max"] is not None:
-            se_jitter_max = float(_require_num(se_cfg["jitter_max"], "likelihood.shared_event_re.jitter_max"))
+            se_jitter_max = float(_require_num(se_cfg["jitter_max"], "model.likelihood.shared_event_re.jitter_max"))
             if se_jitter_max <= 0.0:
-                raise _err("likelihood.shared_event_re.jitter_max", "must be > 0")
+                raise _err("model.likelihood.shared_event_re.jitter_max", "must be > 0")
         if se_jitter_max < se_jitter0:
-            raise _err("likelihood.shared_event_re.jitter_max", "must be >= jitter0")
+            raise _err("model.likelihood.shared_event_re.jitter_max", "must be >= jitter0")
 
         if "cache_max_entries" in se_cfg and se_cfg["cache_max_entries"] is not None:
-            se_cache_max_entries = int(_require_num(se_cfg["cache_max_entries"], "likelihood.shared_event_re.cache_max_entries"))
+            se_cache_max_entries = int(_require_num(se_cfg["cache_max_entries"], "model.likelihood.shared_event_re.cache_max_entries"))
             if se_cache_max_entries < 0:
-                raise _err("likelihood.shared_event_re.cache_max_entries", "must be >= 0")
+                raise _err("model.likelihood.shared_event_re.cache_max_entries", "must be >= 0")
         if "cache_log_every" in se_cfg and se_cfg["cache_log_every"] is not None:
-            se_cache_log_every = int(_require_num(se_cfg["cache_log_every"], "likelihood.shared_event_re.cache_log_every"))
+            se_cache_log_every = int(_require_num(se_cfg["cache_log_every"], "model.likelihood.shared_event_re.cache_log_every"))
             if se_cache_log_every < 0:
-                raise _err("likelihood.shared_event_re.cache_log_every", "must be >= 0")
+                raise _err("model.likelihood.shared_event_re.cache_log_every", "must be >= 0")
 
         if "solver" in se_cfg and se_cfg["solver"] is not None:
             se_solver = str(se_cfg.get("solver", se_solver)).strip().lower()
         if se_solver in {"pcg", "pcg-sparse", "pcg_sparse"}:
             se_solver = "pcg_sparse"
         if se_solver not in {"dense", "pcg_sparse"}:
-            raise _err("likelihood.shared_event_re.solver", "supported: 'dense', 'pcg_sparse'")
+            raise _err("model.likelihood.shared_event_re.solver", "supported: 'dense', 'pcg_sparse'")
         if "drop_logdet" in se_cfg and se_cfg["drop_logdet"] is not None:
             se_drop_logdet = bool(se_cfg.get("drop_logdet", True))
         if "pcg_max_iters" in se_cfg and se_cfg["pcg_max_iters"] is not None:
-            se_pcg_max_iters = int(_require_num(se_cfg["pcg_max_iters"], "likelihood.shared_event_re.pcg_max_iters"))
+            se_pcg_max_iters = int(_require_num(se_cfg["pcg_max_iters"], "model.likelihood.shared_event_re.pcg_max_iters"))
             if se_pcg_max_iters < 1:
-                raise _err("likelihood.shared_event_re.pcg_max_iters", "must be >= 1")
+                raise _err("model.likelihood.shared_event_re.pcg_max_iters", "must be >= 1")
         if "pcg_tol" in se_cfg and se_cfg["pcg_tol"] is not None:
-            se_pcg_tol = float(_require_num(se_cfg["pcg_tol"], "likelihood.shared_event_re.pcg_tol"))
+            se_pcg_tol = float(_require_num(se_cfg["pcg_tol"], "model.likelihood.shared_event_re.pcg_tol"))
             if not (se_pcg_tol > 0.0):
-                raise _err("likelihood.shared_event_re.pcg_tol", "must be > 0")
+                raise _err("model.likelihood.shared_event_re.pcg_tol", "must be > 0")
 
         # Optional diagnostics logging controls
         if "diag_log_every_epochs" in se_cfg and se_cfg["diag_log_every_epochs"] is not None:
-            se_diag_log_every_epochs = int(_require_num(se_cfg["diag_log_every_epochs"], "likelihood.shared_event_re.diag_log_every_epochs"))
+            se_diag_log_every_epochs = int(_require_num(se_cfg["diag_log_every_epochs"], "model.likelihood.shared_event_re.diag_log_every_epochs"))
             if se_diag_log_every_epochs < 0:
-                raise _err("likelihood.shared_event_re.diag_log_every_epochs", "must be >= 0")
+                raise _err("model.likelihood.shared_event_re.diag_log_every_epochs", "must be >= 0")
         if "diag_max_groups" in se_cfg and se_cfg["diag_max_groups"] is not None:
-            se_diag_max_groups = int(_require_num(se_cfg["diag_max_groups"], "likelihood.shared_event_re.diag_max_groups"))
+            se_diag_max_groups = int(_require_num(se_cfg["diag_max_groups"], "model.likelihood.shared_event_re.diag_max_groups"))
             if se_diag_max_groups < 1:
-                raise _err("likelihood.shared_event_re.diag_max_groups", "must be >= 1")
+                raise _err("model.likelihood.shared_event_re.diag_max_groups", "must be >= 1")
         if "diag_max_rows_per_group" in se_cfg and se_cfg["diag_max_rows_per_group"] is not None:
-            se_diag_max_rows_per_group = int(_require_num(se_cfg["diag_max_rows_per_group"], "likelihood.shared_event_re.diag_max_rows_per_group"))
+            se_diag_max_rows_per_group = int(_require_num(se_cfg["diag_max_rows_per_group"], "model.likelihood.shared_event_re.diag_max_rows_per_group"))
             if se_diag_max_rows_per_group < 64:
-                raise _err("likelihood.shared_event_re.diag_max_rows_per_group", "must be >= 64")
+                raise _err("model.likelihood.shared_event_re.diag_max_rows_per_group", "must be >= 64")
         if "diag_max_nodes" in se_cfg and se_cfg["diag_max_nodes"] is not None:
-            se_diag_max_nodes = int(_require_num(se_cfg["diag_max_nodes"], "likelihood.shared_event_re.diag_max_nodes"))
+            se_diag_max_nodes = int(_require_num(se_cfg["diag_max_nodes"], "model.likelihood.shared_event_re.diag_max_nodes"))
             if se_diag_max_nodes < 16:
-                raise _err("likelihood.shared_event_re.diag_max_nodes", "must be >= 16")
+                raise _err("model.likelihood.shared_event_re.diag_max_nodes", "must be >= 16")
         if "diag_seed" in se_cfg and se_cfg["diag_seed"] is not None:
-            se_diag_seed = int(_require_num(se_cfg["diag_seed"], "likelihood.shared_event_re.diag_seed"))
+            se_diag_seed = int(_require_num(se_cfg["diag_seed"], "model.likelihood.shared_event_re.diag_seed"))
             if se_diag_seed < 0:
-                raise _err("likelihood.shared_event_re.diag_seed", "must be >= 0")
+                raise _err("model.likelihood.shared_event_re.diag_seed", "must be >= 0")
 
     if se_enabled:
         # Collapsed shared-event RE is Gaussian-conjugate; require a quadratic likelihood family.
         if str(lk_type).strip().lower() not in {"gaussian", "l2", "mse"}:
             raise _err(
-                "likelihood.type",
+                "model.likelihood.type",
                 "must be 'gaussian'/'l2'/'mse' when likelihood.shared_event_re.enabled=true "
                 "(collapsed shared-event random effects is implemented for Gaussian likelihood only)",
+            )
+        # Phase-A implementation is "quadratic-only": we do not include the correlated logdet term.
+        # Until we implement Phase-B (SLQ logdet), we forbid learning σ under this likelihood to
+        # avoid pathological behavior / incorrect gradients.
+        if bool(learn_noise_scale):
+            raise _err(
+                "model.likelihood.learn_noise_scale",
+                "must be false when model.likelihood.shared_event_re.enabled=true "
+                "(quadratic-only collapsed likelihood currently does not support learning σ; "
+                "this will be supported in a future extension with logdet/SLQ)",
             )
         if bool(se_joint_ps):
             # joint_ps requires both phases to have positive tau to be meaningful; allow zeros but warn via runtime behavior.
             pass
         # pcg_sparse currently supports only scalar (per-phase) random effects (joint_ps=False).
         if str(se_solver) == "pcg_sparse" and bool(se_joint_ps):
-            raise _err("likelihood.shared_event_re.joint_ps", "must be false when likelihood.shared_event_re.solver='pcg_sparse'")
+            raise _err("model.likelihood.shared_event_re.joint_ps", "must be false when model.likelihood.shared_event_re.solver='pcg_sparse'")
+        if str(se_solver) == "pcg_sparse" and (not bool(se_drop_logdet)):
+            raise _err(
+                "model.likelihood.shared_event_re.drop_logdet",
+                "must be true when model.likelihood.shared_event_re.solver='pcg_sparse' "
+                "(Phase-A implementation drops logdet; Phase-B will add SLQ logdet)",
+            )
+
+    # Optional: collapsed slowness inducing-GP covariance likelihood (Gaussian; marginalized; no latent state).
+    #
+    # This is a geometry-aware correlated likelihood induced by a zero-mean slowness *vector* field u(x),
+    # approximated with inducing points. It is intended as a collapsed alternative to
+    # `shared_event_latent.mode='slowness_inducing_gp'` that does NOT carry a latent state.
+    #
+    # Phase-A implementation (to be implemented in code): quadratic-only (drop logdet).
+    sl_cfg = lk.get("slowness_re", None)
+    sl_enabled = False
+    sl_grouping = "station_phase"  # 'phase' | 'station_phase'
+    sl_ell_km = 0.0
+    sl_tau_ps = [0.0, 0.0]
+    sl_tau_units = "abs"  # 'abs' (s/km) | 'vel_frac' (dimensionless)
+    sl_max_rows_per_group = 200000
+    sl_max_nodes_per_group = 2048
+    sl_fallback_to_diag = True
+    sl_drop_logdet = True
+    # Inducing plan (required when enabled)
+    sl_plan_enabled = True
+    sl_plan_cover_frac = 1.0
+    sl_plan_min_m = 1
+    sl_plan_max_m = 1024
+    sl_plan_top_k = 10
+    sl_plan_seed_strategy = "max_degree"
+    sl_plan_fixed_xyz = True
+    sl_plan_kernel_jitter = 1e-6
+    sl_plan_selection_outfile = None
+    sl_plan_interpolation_enabled = True
+    sl_plan_interpolation_m = 4
+    sl_plan_interpolation_outfile = None
+    # FITC diagonal residual (recommended)
+    sl_fitc_enabled = True
+    if isinstance(sl_cfg, dict):
+        sl_enabled = bool(sl_cfg.get("enabled", False))
+        if "grouping" in sl_cfg and sl_cfg.get("grouping", None) is not None:
+            sl_grouping = str(sl_cfg.get("grouping", sl_grouping)).strip().lower()
+        if sl_grouping in {"stationphase", "station-phase"}:
+            sl_grouping = "station_phase"
+        if sl_grouping not in {"phase", "station_phase"}:
+            raise _err("model.likelihood.slowness_re.grouping", "supported: 'phase', 'station_phase'")
+
+        if "ell_km" in sl_cfg and sl_cfg.get("ell_km", None) is not None:
+            sl_ell_km = float(_require_num(sl_cfg.get("ell_km"), "model.likelihood.slowness_re.ell_km"))
+        if sl_enabled:
+            if not math.isfinite(sl_ell_km) or not (sl_ell_km > 0.0):
+                raise _err("model.likelihood.slowness_re.ell_km", "must be finite and > 0 when enabled")
+
+        # tau_s: abs (s/km) or vel_frac object (dimensionless), same convention as slowness_inducing_gp latent.
+        if "tau_s" in sl_cfg and sl_cfg.get("tau_s", None) is not None:
+            tv = sl_cfg.get("tau_s", None)
+            if isinstance(tv, dict):
+                if "vel_frac" not in tv or tv.get("vel_frac", None) is None:
+                    raise _err("model.likelihood.slowness_re.tau_s.vel_frac", "required when tau_s is an object")
+                vv = tv.get("vel_frac", None)
+                if isinstance(vv, (int, float)):
+                    f = float(vv)
+                    sl_tau_ps = [f, f]
+                elif isinstance(vv, list):
+                    sl_tau_ps = _require_float_list(vv, "model.likelihood.slowness_re.tau_s.vel_frac", length=2)
+                else:
+                    raise _err("model.likelihood.slowness_re.tau_s.vel_frac", f"expected number or [P,S] list, got {type(vv).__name__}")
+                sl_tau_units = "vel_frac"
+            elif isinstance(tv, (int, float)):
+                f = float(tv)
+                sl_tau_ps = [f, f]
+                sl_tau_units = "abs"
+            elif isinstance(tv, list):
+                sl_tau_ps = _require_float_list(tv, "model.likelihood.slowness_re.tau_s", length=2)
+                sl_tau_units = "abs"
+            else:
+                raise _err("model.likelihood.slowness_re.tau_s", f"expected number, [P,S] list, or object, got {type(tv).__name__}")
+        if sl_enabled and (not (sl_tau_ps[0] >= 0.0 and sl_tau_ps[1] >= 0.0)):
+            raise _err("model.likelihood.slowness_re.tau_s", "must be >= 0")
+
+        if "max_rows_per_group" in sl_cfg and sl_cfg.get("max_rows_per_group", None) is not None:
+            sl_max_rows_per_group = int(_require_num(sl_cfg.get("max_rows_per_group"), "model.likelihood.slowness_re.max_rows_per_group"))
+            if sl_max_rows_per_group < 2:
+                raise _err("model.likelihood.slowness_re.max_rows_per_group", "must be >= 2")
+        if "max_nodes_per_group" in sl_cfg and sl_cfg.get("max_nodes_per_group", None) is not None:
+            sl_max_nodes_per_group = int(_require_num(sl_cfg.get("max_nodes_per_group"), "model.likelihood.slowness_re.max_nodes_per_group"))
+            if sl_max_nodes_per_group < 2:
+                raise _err("model.likelihood.slowness_re.max_nodes_per_group", "must be >= 2")
+        if "fallback_to_diag" in sl_cfg and sl_cfg.get("fallback_to_diag", None) is not None:
+            sl_fallback_to_diag = bool(sl_cfg.get("fallback_to_diag", True))
+        if "drop_logdet" in sl_cfg and sl_cfg.get("drop_logdet", None) is not None:
+            sl_drop_logdet = bool(sl_cfg.get("drop_logdet", True))
+
+        plan = sl_cfg.get("inducing_plan", None)
+        if isinstance(plan, dict):
+            if "enabled" in plan and plan.get("enabled", None) is not None:
+                sl_plan_enabled = bool(plan.get("enabled", True))
+            if "cover_frac_of_ell" in plan and plan.get("cover_frac_of_ell", None) is not None:
+                sl_plan_cover_frac = float(_require_num(plan.get("cover_frac_of_ell"), "model.likelihood.slowness_re.inducing_plan.cover_frac_of_ell"))
+                if not (sl_plan_cover_frac > 0.0) or not math.isfinite(sl_plan_cover_frac):
+                    raise _err("model.likelihood.slowness_re.inducing_plan.cover_frac_of_ell", "must be finite and > 0")
+            if "min_inducing_per_component" in plan and plan.get("min_inducing_per_component", None) is not None:
+                sl_plan_min_m = int(_require_num(plan.get("min_inducing_per_component"), "model.likelihood.slowness_re.inducing_plan.min_inducing_per_component"))
+                if sl_plan_min_m < 1:
+                    raise _err("model.likelihood.slowness_re.inducing_plan.min_inducing_per_component", "must be >= 1")
+            if "max_inducing_per_component" in plan and plan.get("max_inducing_per_component", None) is not None:
+                sl_plan_max_m = int(_require_num(plan.get("max_inducing_per_component"), "model.likelihood.slowness_re.inducing_plan.max_inducing_per_component"))
+                if sl_plan_max_m < 1:
+                    raise _err("model.likelihood.slowness_re.inducing_plan.max_inducing_per_component", "must be >= 1")
+            if sl_plan_max_m < sl_plan_min_m:
+                raise _err("model.likelihood.slowness_re.inducing_plan.max_inducing_per_component", "must be >= min_inducing_per_component")
+            if "top_k" in plan and plan.get("top_k", None) is not None:
+                sl_plan_top_k = int(_require_num(plan.get("top_k"), "model.likelihood.slowness_re.inducing_plan.top_k"))
+                if sl_plan_top_k < 1:
+                    raise _err("model.likelihood.slowness_re.inducing_plan.top_k", "must be >= 1")
+            if "seed_strategy" in plan and plan.get("seed_strategy", None) is not None:
+                sl_plan_seed_strategy = str(plan.get("seed_strategy")).strip().lower()
+                if sl_plan_seed_strategy not in {"max_degree", "random"}:
+                    raise _err("model.likelihood.slowness_re.inducing_plan.seed_strategy", "supported: 'max_degree', 'random'")
+            if "fixed_xyz" in plan and plan.get("fixed_xyz", None) is not None:
+                sl_plan_fixed_xyz = bool(plan.get("fixed_xyz", True))
+            if "kernel_jitter" in plan and plan.get("kernel_jitter", None) is not None:
+                sl_plan_kernel_jitter = float(_require_num(plan.get("kernel_jitter"), "model.likelihood.slowness_re.inducing_plan.kernel_jitter"))
+                if not math.isfinite(sl_plan_kernel_jitter) or sl_plan_kernel_jitter < 0.0:
+                    raise _err("model.likelihood.slowness_re.inducing_plan.kernel_jitter", "must be finite and >= 0")
+            if "selection_outfile" in plan:
+                v = plan.get("selection_outfile", None)
+                sl_plan_selection_outfile = None if v is None else _require_str(v, "model.likelihood.slowness_re.inducing_plan.selection_outfile")
+            interp = plan.get("interpolation", None)
+            if isinstance(interp, dict):
+                if "enabled" in interp and interp.get("enabled", None) is not None:
+                    sl_plan_interpolation_enabled = bool(interp.get("enabled", True))
+                if "m" in interp and interp.get("m", None) is not None:
+                    sl_plan_interpolation_m = int(_require_num(interp.get("m"), "model.likelihood.slowness_re.inducing_plan.interpolation.m"))
+                    if sl_plan_interpolation_m < 1:
+                        raise _err("model.likelihood.slowness_re.inducing_plan.interpolation.m", "must be >= 1")
+                if "outfile" in interp:
+                    v = interp.get("outfile", None)
+                    sl_plan_interpolation_outfile = None if v is None else _require_str(v, "model.likelihood.slowness_re.inducing_plan.interpolation.outfile")
+
+        fitc = sl_cfg.get("fitc", None)
+        if isinstance(fitc, dict) and ("enabled" in fitc) and (fitc.get("enabled", None) is not None):
+            sl_fitc_enabled = bool(fitc.get("enabled", True))
+
+    if sl_enabled:
+        if str(lk_type).strip().lower() not in {"gaussian", "l2", "mse"}:
+            raise _err(
+                "model.likelihood.type",
+                "must be 'gaussian'/'l2'/'mse' when model.likelihood.slowness_re.enabled=true "
+                "(collapsed slowness covariance is implemented for Gaussian likelihood only)",
+            )
+        if bool(learn_noise_scale):
+            raise _err(
+                "model.likelihood.learn_noise_scale",
+                "must be false when model.likelihood.slowness_re.enabled=true (quadratic-only collapsed likelihood)",
+            )
+        if not bool(sl_drop_logdet):
+            raise _err(
+                "model.likelihood.slowness_re.drop_logdet",
+                "must be true in the current Phase-A implementation (quadratic-only; logdet dropped)",
+            )
 
     # Optional: uncollapsed shared-event latent random effects (explicit b sampled in PSG-LD/SGHMC).
     # Model hyperparameters live under `model.likelihood.shared_event_latent`.
@@ -758,7 +1023,15 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     se_lat_ell_km = 0.0
     se_lat_q_diag = 0.0
     se_lat_graph_lambda = 1.0
+    # Optional: graph_gmrf sparsification on the DD-edge set (performance knob for very dense DD graphs)
+    se_lat_graph_max_degree = 0          # keep top-k DD neighbors per event (0 disables)
+    se_lat_graph_max_edge_km = None      # optional distance cutoff on DD edges before degree pruning
     se_lat_tau_ps = [0.0, 0.0]
+    # Units for tau_s in slowness_inducing_gp:
+    # - "abs": tau_s is interpreted as s/km (slowness amplitude)
+    # - "vel_frac": tau_s is interpreted as fractional velocity perturbation δv/v (dimensionless)
+    # Must always be defined because we materialize it unconditionally later.
+    tau_units = "abs"
     se_lat_rho_ps = 0.0
     # Optional: inducing-point planning diagnostics (stage-1 for future inducing GP implementation)
     se_lat_plan_enable = False
@@ -775,6 +1048,10 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     se_lat_plan_interp_m = 16
     se_lat_plan_interp_outfile = None
     se_lat_plan_interp_store_dist = False
+    # For slowness_inducing_gp, Option-B fixed inducing geometry: treat inducing locations as fixed XYZ points
+    # (selected from MAP event cloud) rather than "moving with events" via inducing_event_idx.
+    # Default: True for slowness_inducing_gp; False otherwise.
+    se_lat_plan_fixed_xyz = None
     # Regularization / numerical stabilization for K_UU construction (inducing_gp only).
     # This is added to the diagonal of each per-component K_UU block: K <- K + kernel_jitter * I.
     # Default is tiny (numerical jitter); users can increase it to tame ill-conditioned inducing layouts.
@@ -782,6 +1059,17 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     # Optional: FITC-style diagonal correction for inducing-point GP (Stage 5).
     # Default: enabled for inducing_gp (to avoid DTC under-dispersion), disabled otherwise.
     se_lat_fitc_enable = None
+    # Identifiability constraint (enforced): drop the station-common (constant across stations)
+    # mode of b so it cannot mimic per-event origin-time shifts Δt.
+    # This is not a modeling option; it is a gauge-fixing for a non-identifiable direction.
+    se_lat_drop_station_common_mode = False
+    # Optional: fixed station-geometry basis for shared_event_latent (dimension reduction across stations).
+    # Defaults must be defined even when shared_event_latent is disabled so materialization below is safe.
+    se_lat_sta_basis_enabled = False
+    se_lat_sta_basis_r = 0
+    se_lat_sta_basis_ell_km = 0.0
+    se_lat_sta_basis_jitter = 1e-6
+    se_lat_sta_basis_method = "eigh_rbf"
     if se_lat_cfg is None:
         se_lat_cfg = {}
     if not isinstance(se_lat_cfg, dict):
@@ -802,10 +1090,10 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             se_lat_param = str(se_lat_cfg.get("mode")).strip().lower()
         elif "parameterization" in se_lat_cfg and se_lat_cfg.get("parameterization", None) is not None:
             se_lat_param = str(se_lat_cfg.get("parameterization")).strip().lower()
-        if se_lat_param not in {"full", "inducing_gp", "graph_gmrf"}:
+        if se_lat_param not in {"full", "inducing_gp", "slowness_inducing_gp", "graph_gmrf"}:
             raise _err(
                 "model.likelihood.shared_event_latent.mode",
-                "supported: 'inducing_gp', 'graph_gmrf' (legacy: 'full')",
+                "supported: 'inducing_gp', 'slowness_inducing_gp', 'graph_gmrf' (legacy: 'full')",
             )
 
         # Shared hyperparameters
@@ -842,6 +1130,17 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
                 se_lat_graph_lambda = float(_require_num(vlam, "model.likelihood.shared_event_latent.lambda"))
             if not math.isfinite(se_lat_graph_lambda) or se_lat_graph_lambda < 0.0:
                 raise _err("model.likelihood.shared_event_latent.lambda", "must be finite and >= 0")
+            # Optional: prune the DD-edge set to top-k neighbors per node (and/or within a distance cutoff).
+            # This is a *performance* knob; statistically it is usually safe because w_ij decays with distance.
+            if "max_degree" in se_lat_cfg and se_lat_cfg.get("max_degree", None) is not None:
+                se_lat_graph_max_degree = int(_require_num(se_lat_cfg.get("max_degree"), "model.likelihood.shared_event_latent.max_degree"))
+                if se_lat_graph_max_degree < 0:
+                    raise _err("model.likelihood.shared_event_latent.max_degree", "must be >= 0")
+            if "max_edge_km" in se_lat_cfg and se_lat_cfg.get("max_edge_km", None) is not None:
+                v = float(_require_num(se_lat_cfg.get("max_edge_km"), "model.likelihood.shared_event_latent.max_edge_km"))
+                if not (v > 0.0) or not math.isfinite(v):
+                    raise _err("model.likelihood.shared_event_latent.max_edge_km", "must be finite and > 0")
+                se_lat_graph_max_edge_km = float(v)
             # Backward-compatible: allow knn key but ignore it.
             try:
                 if "knn" in se_lat_cfg and se_lat_cfg.get("knn", None) is not None:
@@ -849,7 +1148,7 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
         else:
-            # inducing_gp: uses inducing_plan artifacts (selection + interpolation) and ignores knn/q_diag.
+            # inducing_gp / slowness_inducing_gp: uses inducing_plan artifacts (selection + interpolation) and ignores knn/q_diag.
             # Keep backward-compatible parsing if keys are present.
             if "rank" in se_lat_cfg:
                 raise _err("model.likelihood.shared_event_latent.rank", "removed")
@@ -863,14 +1162,37 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
+        # tau_s: interpretation depends on mode.
+        # - For legacy modes, tau_s is in seconds (scalar nuisance amplitude).
+        # - For slowness_inducing_gp, tau_s can be provided either as:
+        #     (a) absolute units (s/km): number or [P,S] list (legacy behavior), OR
+        #     (b) fractional velocity perturbation (dimensionless): { "vel_frac": number|[P,S] }.
+        #
+        # In case (b), we treat the learned field as dimensionless ε(x) (≈ δv/v) and convert to
+        # slowness units at runtime using an effective 1D v(z) derived from EikoNet.
+        tau_units = "abs"
         tau_v = _require(se_lat_cfg, "tau_s", "model.likelihood.shared_event_latent")
-        if isinstance(tau_v, (int, float)):
+        if isinstance(tau_v, dict):
+            if se_lat_param != "slowness_inducing_gp":
+                raise _err("model.likelihood.shared_event_latent.tau_s", "object form is only supported when mode='slowness_inducing_gp'")
+            if "vel_frac" not in tau_v or tau_v.get("vel_frac", None) is None:
+                raise _err("model.likelihood.shared_event_latent.tau_s.vel_frac", "required when tau_s is an object for slowness_inducing_gp")
+            vv = tau_v.get("vel_frac", None)
+            if isinstance(vv, (int, float)):
+                f = float(vv)
+                se_lat_tau_ps = [f, f]
+            elif isinstance(vv, list):
+                se_lat_tau_ps = _require_float_list(vv, "model.likelihood.shared_event_latent.tau_s.vel_frac", length=2)
+            else:
+                raise _err("model.likelihood.shared_event_latent.tau_s.vel_frac", f"expected number or [P,S] list, got {type(vv).__name__}")
+            tau_units = "vel_frac"
+        elif isinstance(tau_v, (int, float)):
             f = float(tau_v)
             se_lat_tau_ps = [f, f]
         elif isinstance(tau_v, list):
             se_lat_tau_ps = _require_float_list(tau_v, "model.likelihood.shared_event_latent.tau_s", length=2)
         else:
-            raise _err("model.likelihood.shared_event_latent.tau_s", f"expected number or [P,S] list, got {type(tau_v).__name__}")
+            raise _err("model.likelihood.shared_event_latent.tau_s", f"expected number, [P,S] list, or object, got {type(tau_v).__name__}")
         if not (se_lat_tau_ps[0] >= 0.0 and se_lat_tau_ps[1] >= 0.0):
             raise _err("model.likelihood.shared_event_latent.tau_s", "must be >= 0")
         se_lat_rho_ps = float(_require_num(_require(se_lat_cfg, "rho_ps", "model.likelihood.shared_event_latent"), "model.likelihood.shared_event_latent.rho_ps"))
@@ -936,6 +1258,8 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
                     raise _err("model.likelihood.shared_event_latent.inducing_plan.seed_strategy", "supported: 'max_degree', 'random'")
             if "use_xyz" in plan and plan.get("use_xyz", None) is not None:
                 se_lat_plan_use_xyz = bool(plan.get("use_xyz", False))
+            if "fixed_xyz" in plan and plan.get("fixed_xyz", None) is not None:
+                se_lat_plan_fixed_xyz = bool(plan.get("fixed_xyz", False))
             interp = plan.get("interpolation", None)
             if interp is not None:
                 if not isinstance(interp, dict):
@@ -965,15 +1289,25 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
         # Default FITC enablement: on for inducing_gp, off otherwise.
         if se_lat_fitc_enable is None:
             se_lat_fitc_enable = bool(se_lat_param == "inducing_gp")
+        # FITC is optional for inducing-point modes. For slowness_inducing_gp, we support a FITC-style
+        # diagonal correction (computed at MAP) that inflates the per-row likelihood variance.
+
+        # Enforce identifiability: always drop station-common mode when enabled.
+        # If the user provided a value, accept it but ignore it (backward compatibility / experiments).
+        se_lat_drop_station_common_mode = True
+        try:
+            if "drop_station_common_mode" in se_lat_cfg and se_lat_cfg.get("drop_station_common_mode", None) is not None:
+                if not bool(se_lat_cfg.get("drop_station_common_mode", True)):
+                    print(
+                        "Warning: model.likelihood.shared_event_latent.drop_station_common_mode=false is ignored; "
+                        "SPIDER enforces this constraint to keep origin time (Δt) identifiable."
+                    )
+        except Exception:
+            pass
 
         # Optional: fixed station-geometry basis for shared_event_latent (dimension reduction across stations).
         # This is intended to encode that nearby stations share similar latent structure.
         sta_basis = se_lat_cfg.get("station_basis", None)
-        se_lat_sta_basis_enabled = False
-        se_lat_sta_basis_r = 0
-        se_lat_sta_basis_ell_km = 0.0
-        se_lat_sta_basis_jitter = 1e-6
-        se_lat_sta_basis_method = "eigh_rbf"
         if sta_basis is not None:
             if not isinstance(sta_basis, dict):
                 raise _err("model.likelihood.shared_event_latent.station_basis", "expected object/dict or null")
@@ -993,19 +1327,31 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
                     se_lat_sta_basis_method = str(sta_basis.get("method")).strip().lower()
                     if se_lat_sta_basis_method not in {"eigh_rbf"}:
                         raise _err("model.likelihood.shared_event_latent.station_basis.method", "supported: 'eigh_rbf'")
-        else:
-            # Not provided: keep disabled
-            se_lat_sta_basis_enabled = False
-            se_lat_sta_basis_r = 0
-            se_lat_sta_basis_ell_km = 0.0
-            se_lat_sta_basis_jitter = 1e-6
-            se_lat_sta_basis_method = "eigh_rbf"
+        # else: not provided -> keep defaults (disabled)
 
-    # Mutual exclusion: uncollapsed latent b and collapsed shared_event_re cannot both be active.
+    # Mutual exclusion: uncollapsed latent b and collapsed covariance likelihoods cannot both be active.
     # If both are enabled in config, prefer the uncollapsed model (and disable the collapsed one)
     # to avoid double-counting the same correlation mechanism.
     if bool(se_lat_enabled) and bool(se_enabled):
         se_enabled = False
+    if bool(se_lat_enabled) and bool(sl_enabled):
+        sl_enabled = False
+    # Two collapsed likelihoods at once is ambiguous. Prefer slowness_re and disable shared_event_re.
+    if bool(sl_enabled) and bool(se_enabled):
+        se_enabled = False
+
+    # sigma_inflation is currently incompatible with shared_event_re (pcg_sparse) because that code path
+    # assumes a homoscedastic diagonal (no per-row variance).
+    if bool(se_enabled) and bool(sigma_infl_enabled):
+        raise _err(
+            "model.likelihood.sigma_inflation",
+            "not supported when model.likelihood.shared_event_re.enabled=true (heteroscedastic sigma not yet implemented for the PCG solver)",
+        )
+    if bool(sl_enabled) and bool(sigma_infl_enabled):
+        raise _err(
+            "model.likelihood.sigma_inflation",
+            "not supported when model.likelihood.slowness_re.enabled=true (use slowness_re fitc/diag instead; sigma_inflation integration is not implemented yet)",
+        )
 
     # Optional: latent-field model for structured residuals (NNGP + ESS).
     # Intentionally OPTIONAL (absent -> disabled) to avoid breaking existing configs.
@@ -1291,6 +1637,14 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
 
     batch_size_warmup = _req_int(_require(bs, "warmup", "batching.standard"), "batching.standard.warmup", min_v=1)
     batch_size_sgld = _req_int(_require(bs, "sgld", "batching.standard"), "batching.standard.sgld", min_v=1)
+    # Optional: allow standard batching without the per-epoch random permutation (saves huge memory traffic for big N).
+    # Default to True for backward compatibility.
+    batch_shuffle = True
+    if isinstance(bs, dict) and ("shuffle" in bs):
+        try:
+            batch_shuffle = _require_bool(bs.get("shuffle"), "batching.standard.shuffle")
+        except Exception:
+            batch_shuffle = True
 
     event_batches_enabled = _require_bool(_require(eb, "enabled", "batching.event_batches"), "batching.event_batches.enabled")
     ev_size_v = _require(eb, "events_per_batch", "batching.event_batches")
@@ -1313,6 +1667,12 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["learn_noise_scale"] = bool(learn_noise_scale)
     params["_likelihood_tempering_enabled"] = bool(temp_enabled)
     params["_likelihood_tempering_alpha"] = float(temp_alpha)
+    params["_likelihood_sigma_inflation_enabled"] = bool(sigma_infl_enabled)
+    params["_likelihood_sigma_inflation_mode"] = str(sigma_infl_mode)
+    params["_likelihood_sigma_inflation_vel_frac"] = [float(sigma_infl_vel_frac[0]), float(sigma_infl_vel_frac[1])]
+    params["_likelihood_sigma_inflation_v_km_s"] = [float(sigma_infl_v_km_s[0]), float(sigma_infl_v_km_s[1])]
+    params["_likelihood_sigma_inflation_max_d_km"] = (float(sigma_infl_max_d_km) if sigma_infl_max_d_km is not None else None)
+    params["_likelihood_sigma_inflation_use_3d"] = bool(sigma_infl_use_3d)
 
     # Collapsed shared-event random effects (optional)
     params["_shared_event_re_enabled"] = bool(se_enabled)
@@ -1337,6 +1697,31 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["_shared_event_re_diag_max_nodes"] = int(se_diag_max_nodes)
     params["_shared_event_re_diag_seed"] = int(se_diag_seed)
 
+    # Collapsed slowness covariance likelihood (optional)
+    params["_slowness_re_enabled"] = bool(sl_enabled)
+    params["_slowness_re_grouping"] = str(sl_grouping)
+    params["_slowness_re_ell_km"] = float(sl_ell_km)
+    params["_slowness_re_tau_s"] = [float(sl_tau_ps[0]), float(sl_tau_ps[1])]
+    params["_slowness_re_tau_units"] = str(sl_tau_units)
+    params["_slowness_re_max_nodes_per_group"] = int(sl_max_nodes_per_group)
+    params["_slowness_re_max_rows_per_group"] = int(sl_max_rows_per_group)
+    params["_slowness_re_fallback_to_diag"] = bool(sl_fallback_to_diag)
+    params["_slowness_re_drop_logdet"] = bool(sl_drop_logdet)
+    # Inducing plan (required for slowness_re)
+    params["_slowness_re_inducing_plan_enable"] = bool(sl_plan_enabled)
+    params["_slowness_re_inducing_plan_cover_frac_of_ell"] = float(sl_plan_cover_frac)
+    params["_slowness_re_inducing_plan_min_inducing_per_component"] = int(sl_plan_min_m)
+    params["_slowness_re_inducing_plan_max_inducing_per_component"] = int(sl_plan_max_m)
+    params["_slowness_re_inducing_plan_top_k"] = int(sl_plan_top_k)
+    params["_slowness_re_inducing_plan_seed_strategy"] = str(sl_plan_seed_strategy)
+    params["_slowness_re_inducing_fixed_xyz"] = bool(sl_plan_fixed_xyz)
+    params["_slowness_re_inducing_jitter"] = float(sl_plan_kernel_jitter)
+    params["_slowness_re_inducing_plan_selection_outfile"] = sl_plan_selection_outfile
+    params["_slowness_re_inducing_plan_interpolation_enable"] = bool(sl_plan_interpolation_enabled)
+    params["_slowness_re_inducing_plan_interpolation_m"] = int(sl_plan_interpolation_m)
+    params["_slowness_re_inducing_plan_interpolation_outfile"] = sl_plan_interpolation_outfile
+    params["_slowness_re_inducing_fitc_enable"] = bool(sl_fitc_enabled)
+
     # Uncollapsed shared-event latent random effects (optional)
     params["_shared_event_latent_enabled"] = bool(se_lat_enabled)
     params["_shared_event_latent_parameterization"] = str(se_lat_param)
@@ -1344,8 +1729,15 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["_shared_event_latent_ell_km"] = float(se_lat_ell_km)
     params["_shared_event_latent_q_diag"] = float(se_lat_q_diag)
     params["_shared_event_latent_graph_lambda"] = float(se_lat_graph_lambda)
+    params["_shared_event_latent_graph_max_degree"] = int(se_lat_graph_max_degree)
+    params["_shared_event_latent_graph_max_edge_km"] = (float(se_lat_graph_max_edge_km) if se_lat_graph_max_edge_km is not None else None)
     params["_shared_event_latent_tau_s"] = [float(se_lat_tau_ps[0]), float(se_lat_tau_ps[1])]
+    # Units for tau_s in slowness_inducing_gp:
+    # - "abs": tau_s is interpreted as s/km (slowness amplitude)
+    # - "vel_frac": tau_s is interpreted as fractional velocity perturbation δv/v (dimensionless)
+    params["_shared_event_latent_slowness_tau_units"] = str(tau_units)
     params["_shared_event_latent_rho_ps"] = float(se_lat_rho_ps)
+    params["_shared_event_latent_drop_station_common_mode"] = bool(se_lat_drop_station_common_mode)
     # Inducing plan diagnostics (optional)
     params["_shared_event_latent_inducing_plan_enable"] = bool(se_lat_plan_enable)
     params["_shared_event_latent_inducing_plan_cover_frac_of_ell"] = float(se_lat_plan_cover_frac)
@@ -1357,6 +1749,12 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["_shared_event_latent_inducing_plan_selection_outfile"] = se_lat_plan_selection_outfile
     params["_shared_event_latent_inducing_plan_seed_strategy"] = str(se_lat_plan_seed_strategy)
     params["_shared_event_latent_inducing_plan_use_xyz"] = bool(se_lat_plan_use_xyz)
+    # Fixed inducing geometry (Option-B) defaulting:
+    # - slowness_inducing_gp: True unless explicitly overridden
+    # - other modes: False unless explicitly overridden
+    if se_lat_plan_fixed_xyz is None:
+        se_lat_plan_fixed_xyz = bool(se_lat_param == "slowness_inducing_gp")
+    params["_shared_event_latent_inducing_fixed_xyz"] = bool(se_lat_plan_fixed_xyz)
     params["_shared_event_latent_inducing_plan_interpolation_enable"] = bool(se_lat_plan_interp)
     params["_shared_event_latent_inducing_plan_interpolation_m"] = int(se_lat_plan_interp_m)
     params["_shared_event_latent_inducing_plan_interpolation_outfile"] = se_lat_plan_interp_outfile
@@ -1430,6 +1828,7 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
 
     params["batch_size_warmup"] = int(batch_size_warmup)
     params["batch_size_sgld"] = int(batch_size_sgld)
+    params["batch_shuffle"] = bool(batch_shuffle)
     params["event_batch_enable"] = bool(event_batches_enabled)
     params["event_batch_size"] = int(event_batch_size)
     params["event_batch_max_edges"] = int(event_batch_max_edges)
@@ -1576,6 +1975,38 @@ def validate_and_materialize_block4(params: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         runtime_seed = 0
 
+    # Optional: gauge projection (remove translation mode by projecting out mean gradient/noise).
+    # This is an alternative to the centroid prior: it imposes a hard constraint on the mean update.
+    gp_enable = False
+    gp_mode = "global"  # or "cluster" (per connected component) when cluster ids are available
+    gp_dims = [0, 1, 2]  # default: spatial only; include 3 to also constrain origin-time mean
+    gp_apply_noise = True
+    gp_apply_momentum = True
+    try:
+        gp = rt.get("gauge_projection", None)
+        if isinstance(gp, dict):
+            if "enabled" in gp and gp.get("enabled", None) is not None:
+                gp_enable = bool(gp.get("enabled", False))
+            if "mode" in gp and gp.get("mode", None) is not None:
+                gp_mode = str(gp.get("mode", "global")).strip().lower()
+            if gp_mode not in {"global", "cluster"}:
+                raise _err("runtime.gauge_projection.mode", "supported: 'global' or 'cluster'")
+            if "dims" in gp and gp.get("dims", None) is not None:
+                dv = gp.get("dims")
+                if not isinstance(dv, list) or len(dv) == 0:
+                    raise _err("runtime.gauge_projection.dims", "expected non-empty list of ints in {0,1,2,3}")
+                for i, d in enumerate(dv):
+                    if (not isinstance(d, int)) or d not in {0, 1, 2, 3}:
+                        raise _err(f"runtime.gauge_projection.dims[{i}]", "must be one of {0,1,2,3}")
+                gp_dims = list(dv)
+            if "apply_noise" in gp and gp.get("apply_noise", None) is not None:
+                gp_apply_noise = bool(gp.get("apply_noise", True))
+            if "apply_momentum" in gp and gp.get("apply_momentum", None) is not None:
+                gp_apply_momentum = bool(gp.get("apply_momentum", True))
+    except Exception as e:
+        # Keep backward compatibility: if user provided an invalid gauge_projection block, error out clearly.
+        raise
+
     saf = _require_dict(_require(inf, "safety", "inference"), "inference.safety")
     max_abs_dX_v = _require(saf, "max_abs_dX", "safety")
     if max_abs_dX_v is None:
@@ -1612,6 +2043,11 @@ def validate_and_materialize_block4(params: Dict[str, Any]) -> Dict[str, Any]:
     params["verbose"] = bool(verbose)
     params["cluster_events"] = bool(cluster_events)
     params["runtime_seed"] = int(runtime_seed)
+    params["gauge_project_enable"] = bool(gp_enable)
+    params["gauge_project_mode"] = str(gp_mode)
+    params["gauge_project_dims"] = list(gp_dims)
+    params["gauge_project_apply_noise"] = bool(gp_apply_noise)
+    params["gauge_project_apply_momentum"] = bool(gp_apply_momentum)
 
     if max_abs_dX is not None:
         params["max_abs_dX"] = max_abs_dX
@@ -1624,7 +2060,13 @@ def validate_and_materialize_block5(params: Dict[str, Any]) -> Dict[str, Any]:
     Block 5 (hard-break schema): compute + dd-precision preconditioning toggle.
 
     Required:
-      - inference.compute.devices: list[int], len>=1
+      - inference.compute.devices: list of device specifiers, len>=1
+        Supported entries:
+          - integer CUDA device id (e.g. 0, 1, 2, ...)
+          - -1 to force CPU
+          - string "cpu" (case-insensitive) to force CPU
+          - string "cuda:N" to select CUDA device N
+          - numeric strings like "0" are accepted and treated as ints
 
     Also requires (if `inference.sampler` exists in params):
       - inference.sampler.dd_prec_enable: bool
@@ -1649,24 +2091,67 @@ def validate_and_materialize_block5(params: Dict[str, Any]) -> Dict[str, Any]:
     comp = _require_dict(_require(inf, "compute", "inference"), "inference.compute")
     devs_v = _require(comp, "devices", "inference.compute")
     if not isinstance(devs_v, list) or len(devs_v) < 1:
-        raise _err("inference.compute.devices", "expected non-empty list of integers")
+        raise _err("inference.compute.devices", "expected non-empty list of device specifiers")
+
+    def _parse_dev(x: Any, path: str) -> int:
+        # Canonical internal representation:
+        # - CUDA device ids are non-negative ints
+        # - CPU is encoded as -1
+        if isinstance(x, int):
+            return int(x)
+        if isinstance(x, str):
+            s = str(x).strip().lower()
+            if s == "cpu":
+                return -1
+            if s.startswith("cuda:"):
+                s2 = s.split("cuda:", 1)[1].strip()
+                if not s2.isdigit():
+                    raise _err(path, "expected 'cuda:<int>' or 'cpu' or integer")
+                return int(s2)
+            if s.isdigit():
+                return int(s)
+            raise _err(path, "supported: int CUDA id, -1/'cpu', 'cuda:<int>'")
+        raise _err(path, f"expected int or str, got {type(x).__name__}")
+
     devs: List[int] = []
     for i, x in enumerate(devs_v):
-        if not isinstance(x, int):
-            raise _err(f"inference.compute.devices[{i}]", f"expected int, got {type(x).__name__}")
-        devs.append(int(x))
+        devs.append(_parse_dev(x, f"inference.compute.devices[{i}]"))
 
     # dd_prec_enable moved under sampler
     dd_prec_enable = None
+    dd_prec_dims = [0, 1, 2, 3]  # default: apply DD degree normalization to all ΔX dims
     if "sampler" in inf:
         sampler = _require_dict(inf["sampler"], "inference.sampler")
         dd_prec_enable = _require_bool(_require(sampler, "dd_prec_enable", "inference.sampler"), "inference.sampler.dd_prec_enable")
+        # Optional: restrict which ΔX dimensions use DD degree normalization in preconditioner stats.
+        # Default is [0,1,2,3] for backward compatibility.
+        try:
+            v = sampler.get("dd_prec_dims", None)
+            if v is None:
+                dd_prec_dims = [0, 1, 2, 3]
+            else:
+                if not isinstance(v, list) or len(v) == 0:
+                    raise _err("inference.sampler.dd_prec_dims", "expected a non-empty list of ints in {0,1,2,3} or null")
+                out = []
+                for i, x in enumerate(v):
+                    if not isinstance(x, int):
+                        raise _err(f"inference.sampler.dd_prec_dims[{i}]", f"expected int, got {type(x).__name__}")
+                    if int(x) not in {0, 1, 2, 3}:
+                        raise _err(f"inference.sampler.dd_prec_dims[{i}]", "must be one of {0,1,2,3}")
+                    out.append(int(x))
+                # de-dupe + stable sort
+                dd_prec_dims = sorted(set(out))
+        except ValueError:
+            raise
+        except Exception as e:
+            raise _err("inference.sampler.dd_prec_dims", f"invalid: {e}")
     else:
         dd_prec_enable = False
 
     # materialize
     params["devices"] = devs
     params["dd_prec_enable"] = bool(dd_prec_enable)
+    params["dd_prec_dims"] = list(dd_prec_dims)
     return params
 
 

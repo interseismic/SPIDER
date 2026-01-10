@@ -33,6 +33,8 @@ def _variogram_half_plateau_ell_pairs(
     seed: int,
     curve_out: Optional[dict] = None,
     max_dist_km: Optional[float] = None,
+    binning: str = "linear",
+    # Backward-compatibility alias (deprecated): when True, behaves like binning="log".
     log_bins: bool = False,
 ) -> Tuple[float, float, int]:
     """
@@ -78,7 +80,21 @@ def _variogram_half_plateau_ell_pairs(
     if not np.isfinite(dmax) or dmax <= 0:
         return float("nan"), float("nan"), int(d.numel())
 
-    if bool(log_bins) and float(dmax) > 0:
+    # Resolve binning mode (log_bins is legacy alias).
+    try:
+        if bool(log_bins):
+            binning = "log"
+    except Exception:
+        pass
+    bmode = str(binning).strip().lower()
+    if bmode in {"log_bins", "logspace", "log-spaced"}:
+        bmode = "log"
+    if bmode in {"equal_count", "equal-count", "quantile", "quantiles"}:
+        bmode = "equal_count"
+    if bmode not in {"linear", "log", "equal_count"}:
+        bmode = "linear"
+
+    if bmode == "log" and float(dmax) > 0:
         # Log-spaced edges on (0, dmax], with an explicit 0 edge.
         # This improves resolution near 0 km where correlation-length cues live.
         eps = float(dmax) * 1e-3  # 0.1% of range (e.g., 4 km -> 4 m)
@@ -90,6 +106,24 @@ def _variogram_half_plateau_ell_pairs(
             dtype=torch.float32,
         )
         edges = torch.cat([torch.zeros((1,), dtype=torch.float32), e1], dim=0)
+    elif bmode == "equal_count":
+        # Quantile bins: choose edges so each bin has ~equal number of sampled pairs.
+        # Note: exact equality isn't guaranteed when distances repeat, but it greatly stabilizes
+        # tail estimates compared to fixed-width (linear/log) bins.
+        try:
+            d_np = d.detach().cpu().numpy().astype(np.float64, copy=False)
+            qs = np.linspace(0.0, 1.0, int(n_bins) + 1, dtype=np.float64)
+            e_np = np.quantile(d_np, qs)
+            e_np[0] = 0.0
+            e_np = np.unique(np.sort(e_np))
+            if e_np.size >= 2:
+                edges = torch.from_numpy(e_np.astype(np.float32, copy=False))
+                # If many edges collapse, reduce bins accordingly.
+                n_bins = int(max(1, int(edges.numel()) - 1))
+            else:
+                edges = torch.linspace(0.0, dmax, steps=n_bins + 1, dtype=torch.float32)
+        except Exception:
+            edges = torch.linspace(0.0, dmax, steps=n_bins + 1, dtype=torch.float32)
     else:
         edges = torch.linspace(0.0, dmax, steps=n_bins + 1, dtype=torch.float32)
     bi = torch.bucketize(d, edges, right=False) - 1
@@ -100,11 +134,16 @@ def _variogram_half_plateau_ell_pairs(
     g_sum.scatter_add_(0, bi.to(torch.int64), g.to(torch.float64))
     g_cnt.scatter_add_(0, bi.to(torch.int64), torch.ones_like(g, dtype=torch.float64))
     g_mean = (g_sum / torch.clamp_min(g_cnt, 1.0)).to(torch.float32)
-    if bool(log_bins):
+    if bmode == "log":
         # Geometric mean for log-spaced bins; first bin (0, e1] gets a simple midpoint.
         c0 = 0.5 * edges[1]
         cg = torch.sqrt(torch.clamp_min(edges[1:-1] * edges[2:], 0.0))
         centers = torch.cat([c0.view(1), cg], dim=0)
+    elif bmode == "equal_count":
+        # Use mean distance per bin as x-axis center (stable for variable-width quantile bins).
+        d_sum = torch.zeros((n_bins,), dtype=torch.float64)
+        d_sum.scatter_add_(0, bi.to(torch.int64), d.to(torch.float64))
+        centers = (d_sum / torch.clamp_min(g_cnt, 1.0)).to(torch.float32)
     else:
         centers = 0.5 * (edges[:-1] + edges[1:])
 
@@ -124,6 +163,7 @@ def _variogram_half_plateau_ell_pairs(
                 curve_out["gamma"] = g_mean.detach().cpu().numpy().astype(np.float32, copy=False)
                 curve_out["count"] = g_cnt.detach().cpu().numpy().astype(np.float32, copy=False)
                 curve_out["plateau"] = np.asarray([plateau], dtype=np.float32)
+                curve_out["binning"] = np.asarray([str(bmode)], dtype=object)
             except Exception:
                 pass
         return float("nan"), float(plateau), int(d.numel())
@@ -153,6 +193,7 @@ def _variogram_half_plateau_ell_pairs(
                 curve_out["plateau"] = np.asarray([plateau], dtype=np.float32)
                 curve_out["nugget"] = np.asarray([nugget], dtype=np.float32)
                 curve_out["target"] = np.asarray([target], dtype=np.float32)
+                curve_out["binning"] = np.asarray([str(bmode)], dtype=object)
             except Exception:
                 pass
         return float("nan"), float(plateau), int(d.numel())
@@ -167,6 +208,7 @@ def _variogram_half_plateau_ell_pairs(
             curve_out["plateau"] = np.asarray([plateau], dtype=np.float32)
             curve_out["nugget"] = np.asarray([nugget], dtype=np.float32)
             curve_out["target"] = np.asarray([target], dtype=np.float32)
+            curve_out["binning"] = np.asarray([str(bmode)], dtype=object)
         except Exception:
             pass
     return float(ell), float(plateau), int(d.numel())
@@ -232,6 +274,8 @@ def estimate_shared_event_latent_event_ell_km(
     variogram_pairs: int = 200_000,
     curves_out: Optional[dict] = None,
     max_dist_km: Optional[float] = None,
+    binning: str = "linear",
+    # Backward-compatibility alias (deprecated): when True, behaves like binning="log".
     log_bins: bool = False,
 ) -> Optional[SharedEventLatentEventEllEstimate]:
     """
@@ -342,6 +386,7 @@ def estimate_shared_event_latent_event_ell_km(
             seed=int(seed) + int(seed_off),
             curve_out=curve if isinstance(curves_out, dict) else None,
             max_dist_km=max_dist_km,
+            binning=str(binning),
             log_bins=bool(log_bins),
         )
         if isinstance(curves_out, dict):
@@ -393,6 +438,7 @@ def estimate_shared_event_latent_event_ell_km(
             seed=int(seed) + int(seed_off),
             curve_out=curve if isinstance(curves_out, dict) else None,
             max_dist_km=max_dist_km,
+            binning=str(binning),
             log_bins=bool(log_bins),
         )
         if isinstance(curves_out, dict):
@@ -413,6 +459,7 @@ def estimate_shared_event_latent_event_ell_km(
                 "ridge": float(ridge),
                 "rtol": float(rtol),
                 "maxiter": int(maxiter),
+                "binning": str(binning),
             }
         except Exception:
             pass

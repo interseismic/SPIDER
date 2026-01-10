@@ -6,6 +6,154 @@ import torch.nn.functional as F
 
 
 # -----------------------------------------------------------------------------
+# Collapsed shared-event random effects (Gaussian; marginalized b; PCG quadratic)
+# -----------------------------------------------------------------------------
+
+class _CollapsedQuad(torch.autograd.Function):
+    """
+    Compute 0.5 * r^T u while defining the gradient w.r.t. r as u.
+
+    For a true quadratic form 0.5 r^T Σ^{-1} r, the gradient w.r.t r is Σ^{-1} r.
+    We typically compute u ≈ Σ^{-1} r via an iterative solve, and we do NOT want
+    to differentiate through that solver. This custom autograd function makes that
+    explicit and stable.
+    """
+
+    @staticmethod
+    def forward(ctx, r: torch.Tensor, u: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        u_det = u.detach()
+        ctx.save_for_backward(u_det)
+        return 0.5 * (r * u_det).sum()
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):  # type: ignore[override]
+        (u_det,) = ctx.saved_tensors
+        grad_r = grad_out * u_det
+        return grad_r, None
+
+
+def _laplacian_mv(u: torch.Tensor, v: torch.Tensor, x: torch.Tensor, n_nodes: int) -> torch.Tensor:
+    """Compute (A^T A) x for an undirected edge list (u,v) in local node indexing."""
+    if n_nodes <= 0:
+        return torch.zeros_like(x)
+    out = torch.zeros((n_nodes,), device=x.device, dtype=x.dtype)
+    if u.numel() == 0:
+        return out
+    tmp = x.index_select(0, u) - x.index_select(0, v)
+    out.index_add_(0, u, tmp)
+    out.index_add_(0, v, -tmp)
+    return out
+
+
+def _pcg_solve(
+    *,
+    u: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    deg: torch.Tensor,
+    max_iters: int,
+    tol: float,
+) -> torch.Tensor:
+    """
+    Solve (alpha*I + beta*L) x = b with (Jacobi-)preconditioned conjugate gradient.
+    L = A^T A for the undirected edge list (u,v).
+    """
+    n = int(b.numel())
+    if n == 0:
+        return b
+    # Initial guess x=0
+    x = torch.zeros_like(b)
+
+    def A_mv(z: torch.Tensor) -> torch.Tensor:
+        return alpha * z + beta * _laplacian_mv(u, v, z, n)
+
+    r = b - A_mv(x)
+    # Jacobi preconditioner: M^{-1} ≈ diag(A)^{-1} where diag(A)=alpha + beta*deg
+    diag = (alpha + beta * deg).clamp_min(1e-12)
+    z = r / diag
+    p = z.clone()
+    rz_old = (r * z).sum()
+    b_norm = b.norm().clamp_min(1e-12)
+
+    for _ in range(int(max_iters)):
+        Ap = A_mv(p)
+        denom = (p * Ap).sum().clamp_min(1e-20)
+        a = rz_old / denom
+        x = x + a * p
+        r = r - a * Ap
+        if (r.norm() / b_norm).item() <= float(tol):
+            break
+        z = r / diag
+        rz_new = (r * z).sum()
+        bcoef = rz_new / rz_old.clamp_min(1e-30)
+        p = z + bcoef * p
+        rz_old = rz_new
+
+    return x
+
+
+def _shared_event_re_u_pcg(
+    *,
+    idx_g: torch.Tensor,
+    resid_g: torch.Tensor,
+    sigma: torch.Tensor,
+    tau: float,
+    jitter0: float,
+    pcg_max_iters: int,
+    pcg_tol: float,
+) -> torch.Tensor:
+    """
+    Compute u ≈ Σ^{-1} r for Σ = sigma^2 I + tau^2 A A^T via node-space PCG.
+    """
+    # tau <= 0 -> iid
+    if not (tau > 0.0):
+        s2 = sigma.square().clamp_min(1e-24)
+        return resid_g / s2
+
+    # Local remapping of event ids -> [0..n_nodes-1]
+    ev_flat = idx_g.reshape(-1)
+    nodes, inv_nodes = torch.unique(ev_flat, return_inverse=True)
+    m = int(idx_g.shape[0])
+    u = inv_nodes[:m]
+    v = inv_nodes[m:]
+    n_nodes = int(nodes.numel())
+
+    # deg (for Jacobi preconditioner) in local node indexing
+    deg = torch.zeros((n_nodes,), device=resid_g.device, dtype=resid_g.dtype)
+    if m > 0:
+        ones = torch.ones((m,), device=resid_g.device, dtype=resid_g.dtype)
+        deg.index_add_(0, u, ones)
+        deg.index_add_(0, v, ones)
+
+    # Right-hand side: b = beta * A^T r
+    beta = (1.0 / sigma.square().clamp_min(1e-24)).to(device=resid_g.device, dtype=resid_g.dtype)
+    b = torch.zeros((n_nodes,), device=resid_g.device, dtype=resid_g.dtype)
+    b.index_add_(0, u, -beta * resid_g)
+    b.index_add_(0, v, beta * resid_g)
+
+    alpha = torch.tensor((1.0 / (float(tau) * float(tau))) + float(jitter0), device=resid_g.device, dtype=resid_g.dtype)
+
+    # Solve for x (node potentials)
+    x = _pcg_solve(
+        u=u,
+        v=v,
+        b=b,
+        alpha=alpha,
+        beta=beta,
+        deg=deg,
+        max_iters=int(pcg_max_iters),
+        tol=float(pcg_tol),
+    )
+
+    # u_edge = beta * (r - A x) with (A x)_e = x[v]-x[u]
+    Ax = x.index_select(0, v) - x.index_select(0, u)
+    u_edge = beta * (resid_g - Ax)
+    return u_edge
+
+
+# -----------------------------------------------------------------------------
 # Core Physics / Travel Time Logic
 # -----------------------------------------------------------------------------
 
@@ -229,6 +377,15 @@ def compute_likelihood_loss(
     
     Loss = Mean( DataLoss(residual / sigma) + log(sigma) )
     """
+    # Likelihood-only tempering (power posterior): posterior ∝ prior * likelihood^alpha
+    # This scales ONLY the likelihood term, leaving priors unchanged.
+    try:
+        alpha = float(params.get("_likelihood_tempering_alpha", 1.0))
+        if not (alpha > 0.0) or not np.isfinite(alpha):
+            alpha = 1.0
+    except Exception:
+        alpha = 1.0
+
     # 1. Predict
     dt_pred = compute_travel_times(idx, y, X_src, ΔX_src, model)
     if nuisance_delta is not None:
@@ -259,17 +416,612 @@ def compute_likelihood_loss(
             pass
     resid = dt_obs - dt_pred
     scaled_resid = resid / sigma
+
+    # Optional: collapsed slowness inducing-GP covariance likelihood (Gaussian; marginalized; no latent state).
+    #
+    # Phase-A implementation: quadratic-only (drop logdet). We compute u ≈ Σ^{-1} r per group and return:
+    #   mean( 0.5 r^T u ) + mean(log sigma)
+    # with custom autograd so d/dr = u (do not differentiate through the solver).
+    try:
+        sl_enable = bool(params.get("_slowness_re_enabled", False))
+    except Exception:
+        sl_enable = False
+    if sl_enable:
+        grouping = str(params.get("_slowness_re_grouping", "station_phase")).strip().lower()
+        if grouping in {"stationphase", "station-phase"}:
+            grouping = "station_phase"
+        tau_ps = params.get("_slowness_re_tau_s", [0.0, 0.0])
+        tau_p = float(tau_ps[0]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+        tau_s = float(tau_ps[1]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+        tau_units = str(params.get("_slowness_re_tau_units", "abs")).strip().lower()
+        ell_km = float(params.get("_slowness_re_ell_km", 0.0))
+        max_rows_per_group = int(params.get("_slowness_re_max_rows_per_group", 200000))
+        max_nodes_per_group = int(params.get("_slowness_re_max_nodes_per_group", 2048))
+        fallback_to_diag = bool(params.get("_slowness_re_fallback_to_diag", True))
+
+        # We currently rely on a homoscedastic base sigma and incorporate only our own diagonal correction (FITC).
+        # sigma_extra_var may already have been applied above (e.g., by shared_event_latent); we accept it here.
+
+        # Station index (optional) for station_phase grouping
+        sta_idx = None
+        if grouping == "station_phase":
+            sta_idx = params.get("_runtime_bucket_station_index", None)
+            if not isinstance(sta_idx, torch.Tensor) or int(sta_idx.numel()) != int(resid.numel()):
+                if not bool(params.get("_slowness_re_warned_no_station_index", False)):
+                    print(
+                        "Warning: slowness_re.grouping='station_phase' requested but no per-row station index "
+                        "was available for this batch. Falling back to grouping='phase'."
+                    )
+                    params["_slowness_re_warned_no_station_index"] = True
+                grouping = "phase"
+                sta_idx = None
+
+        # NOTE: We intentionally do NOT require cluster_ids here for performance. If inducing points are
+        # selected per connected component and K_UU is block diagonal, solving a single system per
+        # station-phase group still results in zero cross-component coupling.
+        cid_ev = params.get("_runtime_event_cluster_ids", None)
+
+        # Inducing artifacts (built once at MAP by locate.py)
+        nei_idx_ev = params.get("_slowness_re_inducing_neighbor_idx", None)
+        if not isinstance(nei_idx_ev, torch.Tensor):
+            try:
+                a = np.asarray(nei_idx_ev, dtype=np.int64)
+                if a.ndim == 2:
+                    nei_idx_ev = torch.from_numpy(a)
+            except Exception:
+                pass
+        inducing_xyz = params.get("_slowness_re_inducing_xyz_km_t", None)
+        if not isinstance(inducing_xyz, torch.Tensor):
+            inducing_xyz0 = params.get("_slowness_re_inducing_xyz_km", None)
+            if isinstance(inducing_xyz0, torch.Tensor):
+                inducing_xyz = inducing_xyz0
+            else:
+                try:
+                    a = np.asarray(inducing_xyz0, dtype=np.float32)
+                    if a.ndim == 2 and a.shape[1] >= 3:
+                        inducing_xyz = torch.from_numpy(a[:, :3])
+                except Exception:
+                    inducing_xyz = None
+        offs = params.get("_slowness_re_inducing_offsets", None)
+        K_full = params.get("_slowness_re_inducing_K_full", None)
+        K_full3 = params.get("_slowness_re_inducing_K_full_3", None)
+        K_blocks = params.get("_slowness_re_inducing_K_blocks", None)
+        comp_to_block = params.get("_slowness_re_inducing_comp_to_block", None)
+        fitc_resid_ev = params.get("_slowness_re_inducing_fitc_resid", None)
+
+        have_full = isinstance(K_full, torch.Tensor) and K_full.ndim == 2
+        have_inducing = (
+            isinstance(nei_idx_ev, torch.Tensor)
+            and isinstance(inducing_xyz, torch.Tensor)
+            and isinstance(offs, torch.Tensor)
+            and (have_full or (isinstance(comp_to_block, torch.Tensor) and isinstance(K_blocks, list) and len(K_blocks) > 0))
+        )
+        if not have_inducing:
+            raise ValueError(
+                "slowness_re.enabled=true but inducing artifacts are missing. "
+                "Run MAP initialization (Phase 1) with slowness_re enabled so locate.py can build them."
+            )
+        # Normalize devices/dtypes
+        dev = resid.device
+        nei_idx_ev = nei_idx_ev.to(device=dev, dtype=torch.int64)
+        inducing_xyz = inducing_xyz.to(device=dev, dtype=torch.float32)
+        offs = offs.to(device=dev, dtype=torch.int64)
+        if have_full:
+            K_full = K_full.to(device=dev, dtype=torch.float32)
+            if isinstance(K_full3, torch.Tensor) and K_full3.ndim == 2:
+                K_full3 = K_full3.to(device=dev, dtype=torch.float32)
+            else:
+                K_full3 = None
+        else:
+            comp_to_block = comp_to_block.to(device=dev, dtype=torch.int64)
+        if isinstance(fitc_resid_ev, torch.Tensor):
+            fitc_resid_ev = fitc_resid_ev.to(device=dev, dtype=torch.float32)
+
+        # Current event XYZ in km (detach so covariance does not participate in autograd).
+        X_cur = (X_src + ΔX_src)[:, :3].detach().to(device=dev, dtype=torch.float32)
+
+        # Optional v(z) for vel_frac units (cache on-device in params via epoch_runner).
+        zc = params.get("_runtime_eikonet_v1d_z_cent_km_t", None)
+        vp = params.get("_runtime_eikonet_v1d_vp_km_s_t", None)
+        vs = params.get("_runtime_eikonet_v1d_vs_km_s_t", None)
+        if tau_units == "vel_frac" and (not (isinstance(zc, torch.Tensor) and isinstance(vp, torch.Tensor) and isinstance(vs, torch.Tensor))):
+            # Fallback: build tensors from serialized lists (if available).
+            try:
+                z_arr = np.asarray(params.get("_eikonet_v1d_depth_centers_km", []), dtype=np.float32).reshape(-1)
+                vp_arr = np.asarray(params.get("_eikonet_v1d_vp_km_s", []), dtype=np.float32).reshape(-1)
+                vs_arr = np.asarray(params.get("_eikonet_v1d_vs_km_s", []), dtype=np.float32).reshape(-1)
+                if z_arr.size > 0 and vp_arr.size == z_arr.size and vs_arr.size == z_arr.size:
+                    zc = torch.from_numpy(z_arr).to(device=dev, dtype=torch.float32)
+                    vp = torch.from_numpy(vp_arr).to(device=dev, dtype=torch.float32)
+                    vs = torch.from_numpy(vs_arr).to(device=dev, dtype=torch.float32)
+                    params["_runtime_eikonet_v1d_z_cent_km_t"] = zc
+                    params["_runtime_eikonet_v1d_vp_km_s_t"] = vp
+                    params["_runtime_eikonet_v1d_vs_km_s_t"] = vs
+            except Exception:
+                pass
+        if tau_units == "vel_frac" and (not (isinstance(zc, torch.Tensor) and isinstance(vp, torch.Tensor) and isinstance(vs, torch.Tensor))):
+            if not bool(params.get("_slowness_re_warned_no_v1d", False)):
+                print(
+                    "Warning: slowness_re.tau_s uses vel_frac but no EikoNet v(z) curve was available. "
+                    "Falling back to constant vP=6.0 km/s, vS=3.5 km/s for scaling."
+                )
+                params["_slowness_re_warned_no_v1d"] = True
+            zc = None
+            vp = None
+            vs = None
+
+        def _matern32(d: torch.Tensor, ell: float) -> torch.Tensor:
+            a = float(np.sqrt(3.0) / float(max(ell, 1e-12)))
+            x = (a * d).to(torch.float32)
+            return (1.0 + x) * torch.exp(-x)
+
+        def _interp1d_linear(z: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # x must be sorted ascending; returns linear interpolation with endpoint clamping.
+            if int(x.numel()) <= 1:
+                return y.reshape(1).expand_as(z)
+            idx = torch.bucketize(z, x)
+            idx1 = idx.clamp(0, int(x.numel()) - 1)
+            idx0 = (idx1 - 1).clamp(0, int(x.numel()) - 1)
+            x0 = x.index_select(0, idx0)
+            x1 = x.index_select(0, idx1)
+            y0 = y.index_select(0, idx0)
+            y1 = y.index_select(0, idx1)
+            denom = (x1 - x0).clamp_min(1e-6)
+            t = ((z - x0) / denom).clamp(0.0, 1.0)
+            return y0 + t * (y1 - y0)
+
+        # Build group keys:
+        # - Fast path (K_full available): group by (station, phase) only (no explicit component split).
+        # - Fallback: preserve previous component-wise grouping if K_full not available.
+        ph_id = torch.where(is_p, torch.zeros_like(resid, dtype=torch.int64), torch.ones_like(resid, dtype=torch.int64))
+        if have_full:
+            if grouping == "phase":
+                keys = ph_id
+            else:
+                n_sta = params.get("_runtime_n_stations", None)
+                if (not isinstance(n_sta, int)) or n_sta <= 0:
+                    try:
+                        n_sta = int(sta_idx.max().item()) + 1  # type: ignore[union-attr]
+                    except Exception:
+                        n_sta = 1
+                keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id  # type: ignore[union-attr]
+        else:
+            if cid_ev is None:
+                comp_row = torch.zeros_like(ph_id, dtype=torch.int64)
+            else:
+                comp_row = cid_ev.index_select(0, idx[:, 0].to(dtype=torch.int64))
+            if grouping == "phase":
+                keys = (comp_row * 2) + ph_id
+            else:
+                n_sta = params.get("_runtime_n_stations", None)
+                if not isinstance(n_sta, int) or n_sta <= 0:
+                    try:
+                        n_sta = int(getattr(params.get("_runtime_state_n_stations", None), "item", lambda: 0)())
+                    except Exception:
+                        n_sta = 0
+                if (not isinstance(n_sta, int)) or n_sta <= 0:
+                    # fall back to local max+1
+                    try:
+                        n_sta = int(sta_idx.max().item()) + 1  # type: ignore[union-attr]
+                    except Exception:
+                        n_sta = 1
+                keys = ((comp_row * int(n_sta)) + sta_idx.to(dtype=torch.int64)) * 2 + ph_id  # type: ignore[union-attr]
+
+        keys_sorted, perm = torch.sort(keys)
+        if keys_sorted.numel() > 0:
+            is_new = torch.ones_like(keys_sorted, dtype=torch.bool)
+            is_new[1:] = keys_sorted[1:] != keys_sorted[:-1]
+            starts = torch.nonzero(is_new, as_tuple=False).reshape(-1)
+            ends = torch.cat([starts[1:], torch.tensor([keys_sorted.numel()], device=starts.device, dtype=starts.dtype)])
+        else:
+            starts = torch.zeros((0,), device=resid.device, dtype=torch.int64)
+            ends = torch.zeros((0,), device=resid.device, dtype=torch.int64)
+
+        quad = torch.tensor(0.0, device=resid.device, dtype=resid.dtype)
+        n_groups_total = 0
+        n_groups_woodbury = 0
+        n_groups_fallback_diag = 0
+        max_rows_seen = 0
+        max_nodes_seen = 0
+        # main group loop
+        for si, ei in zip(starts.tolist(), ends.tolist()):
+            idxs = perm[si:ei]
+            m_g = int(idxs.numel())
+            if m_g <= 0:
+                continue
+            n_groups_total += 1
+            if m_g > max_rows_seen:
+                max_rows_seen = m_g
+            # Phase for this group
+            ph_g = int(ph_id.index_select(0, idxs[:1]).item())
+            tau0 = tau_p if ph_g == 0 else tau_s
+            tau = float(tau0)
+            sigma_g = σ_p if ph_g == 0 else σ_s
+
+            if m_g > int(max_rows_per_group):
+                if not fallback_to_diag:
+                    raise ValueError(
+                        f"slowness_re: group too large (rows={m_g} > max_rows_per_group={max_rows_per_group}). "
+                        f"Set max_rows_per_group higher or enable fallback_to_diag."
+                    )
+                n_groups_fallback_diag += 1
+                u_g = resid.index_select(0, idxs) / sigma_g.square().clamp_min(1e-24)
+                quad = quad + _CollapsedQuad.apply(resid.index_select(0, idxs), u_g)
+                continue
+
+            idx_g = idx.index_select(0, idxs)
+            try:
+                n_nodes = int(torch.unique(idx_g.reshape(-1)).numel())
+            except Exception:
+                n_nodes = m_g * 2
+            if n_nodes > max_nodes_seen:
+                max_nodes_seen = n_nodes
+            if n_nodes > int(max_nodes_per_group):
+                if not fallback_to_diag:
+                    raise ValueError(
+                        f"slowness_re: group too large (nodes={n_nodes} > max_nodes_per_group={max_nodes_per_group}). "
+                        f"Set max_nodes_per_group higher or enable fallback_to_diag."
+                    )
+                n_groups_fallback_diag += 1
+                u_g = resid.index_select(0, idxs) / sigma_g.square().clamp_min(1e-24)
+                quad = quad + _CollapsedQuad.apply(resid.index_select(0, idxs), u_g)
+                continue
+
+            resid_g = resid.index_select(0, idxs)
+            # tau <= 0 -> iid
+            if not (tau > 0.0):
+                u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                continue
+
+            if have_full:
+                Kuu = K_full
+                M = int(Kuu.shape[0])
+                if M <= 0:
+                    n_groups_fallback_diag += 1
+                    u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                    quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                    continue
+                # No component-bound offsets in this mode.
+                off0 = 0
+                off1 = M
+            else:
+                # Component id for this group (from the first row; keys enforce constness)
+                if cid_ev is None:
+                    comp_id = 0
+                else:
+                    comp_id = int(cid_ev.index_select(0, idx_g[:1, 0].to(dtype=torch.int64)).item())
+                if comp_id < 0 or comp_id >= int(comp_to_block.numel()):
+                    n_groups_fallback_diag += 1
+                    u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                    quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                    continue
+                bi = int(comp_to_block[comp_id].item())
+                if bi < 0 or bi >= int(len(K_blocks)):
+                    n_groups_fallback_diag += 1
+                    u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                    quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                    continue
+                Kuu = K_blocks[bi].to(device=dev, dtype=torch.float32)
+                off0 = int(offs[bi].item())
+                off1 = int(offs[bi + 1].item())
+                M = int(Kuu.shape[0])
+                if M <= 0 or (off1 - off0) != M:
+                    n_groups_fallback_diag += 1
+                    u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                    quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                    continue
+
+            # Endpoints and geometry (detach)
+            e1 = idx_g[:, 0].to(dtype=torch.int64)
+            e2 = idx_g[:, 1].to(dtype=torch.int64)
+            x1 = X_cur.index_select(0, e1)
+            x2 = X_cur.index_select(0, e2)
+            dx = x2 - x1  # (B,3)
+
+            # Scale w for vel_frac units: w = dx / v(z)
+            if tau_units == "vel_frac":
+                zbar = 0.5 * (x1[:, 2] + x2[:, 2])
+                if isinstance(zc, torch.Tensor) and isinstance(vp, torch.Tensor) and isinstance(vs, torch.Tensor):
+                    v = _interp1d_linear(zbar.to(torch.float32), zc.to(torch.float32), (vp if ph_g == 0 else vs).to(torch.float32))
+                else:
+                    v = torch.full((int(zbar.numel()),), 6.0 if ph_g == 0 else 3.5, device=dev, dtype=torch.float32)
+                inv_v = (1.0 / v.clamp_min(1e-3)).to(torch.float32)
+                w = dx * inv_v.unsqueeze(1)
+            else:
+                w = dx
+
+            # Build Kbar sparse rows (union of endpoint neighbor lists)
+            nei1 = nei_idx_ev.index_select(0, e1)  # (B,m)
+            nei2 = nei_idx_ev.index_select(0, e2)  # (B,m)
+            nei_g = torch.cat([nei1, nei2], dim=1)  # (B,2m) global inducing idx
+            mask = (nei_g >= 0)
+            # clamp for gather
+            nei_clamped = torch.where(mask, nei_g, torch.zeros_like(nei_g))
+            # enforce component block bounds
+            in_block = (nei_clamped >= int(off0)) & (nei_clamped < int(off1))
+            mask = mask & in_block
+            nei_loc = (nei_clamped - int(off0)).to(torch.int64)
+            nei_loc = torch.where(mask, nei_loc, torch.zeros_like(nei_loc))
+
+            B = int(nei_loc.shape[0])
+            K = int(nei_loc.shape[1])
+            if K <= 0:
+                n_groups_fallback_diag += 1
+                u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                continue
+            if (K % 2) != 0:
+                # We assume K = 2*m (neighbors for each endpoint). If it's not even, degrade safely.
+                n_groups_fallback_diag += 1
+                u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                continue
+
+            # Kernel weights k(e,U). Prefer precomputed Matérn(3/2) at MAP for speed; fall back to dynamic eval.
+            k_map = params.get("_slowness_re_inducing_neighbor_k_matern32", None)
+            if isinstance(k_map, torch.Tensor) and k_map.ndim == 2 and int(k_map.shape[0]) == int(X_src.shape[0]):
+                k_map = k_map.to(device=dev, dtype=torch.float32)
+                k1 = k_map.index_select(0, e1)
+                k2 = k_map.index_select(0, e2)
+                k_eu = torch.cat([k1, k2], dim=1)
+            else:
+                U = inducing_xyz.index_select(0, nei_clamped.reshape(-1)).reshape(B, K, 3)
+                xe = torch.cat(
+                    [x1.unsqueeze(1).expand(B, K // 2, 3), x2.unsqueeze(1).expand(B, K // 2, 3)],
+                    dim=1,
+                )
+                d = torch.linalg.norm(U - xe, dim=2)
+                k_eu = _matern32(d, ell_km)
+            k_eu = torch.where(mask, k_eu, torch.zeros_like(k_eu))
+            # 0.5 * (k(x1,U) + k(x2,U)) is represented by concatenation with a 0.5 scale
+            kbar = 0.5 * k_eu  # (B,K)
+
+            # Diagonal D = sigma^2 + FITC_diag (optional)
+            s2 = sigma_g.square().clamp_min(1e-24).to(torch.float32)
+            if isinstance(fitc_resid_ev, torch.Tensor):
+                lam1 = fitc_resid_ev.index_select(0, e1).to(torch.float32)
+                lam2 = fitc_resid_ev.index_select(0, e2).to(torch.float32)
+                lam_bar = 0.5 * (lam1 + lam2)
+                w2 = (w * w).sum(dim=1).to(torch.float32)
+                diag_extra = (float(tau) * float(tau)) * (lam_bar.clamp_min(0.0)) * w2
+                D = (s2 + diag_extra).clamp_min(1e-24)
+            else:
+                D = s2.expand(B).clamp_min(1e-24)
+            alpha_d = (1.0 / D).to(torch.float32)  # (B,)
+
+            # Assemble S = (1/tau^2) * (Kuu ⊗ I3) + B^T D^{-1} B, and rhs = B^T D^{-1} r.
+            #
+            # IMPORTANT performance note:
+            # The earlier implementation built B^T D^{-1} B via explicit K×K outer products with python loops,
+            # which is extremely slow for many small groups. Here we instead form a tiny dense B (shape B×(3M))
+            # using scatter_add into (B×M), then use a weighted matmul to get BtDB and rhs. For the common case
+            # in compact clusters with long ell, M is tiny (1–8) and this is very fast.
+            w_f = w.to(torch.float32)
+            # Dense Kbar: (B,M) with Kbar[b,u] = sum_k kbar[b,k] for neighbors mapping to u.
+            Kbar_dense = torch.zeros((B, M), device=dev, dtype=torch.float32)
+            # nei_loc is (B,K) with invalid entries mapped to 0 and kbar already zeroed for invalid => safe scatter_add
+            Kbar_dense.scatter_add_(1, nei_loc, kbar)
+            # B_dense: (B,3M)
+            B0 = (w_f[:, 0:1] * Kbar_dense)
+            B1 = (w_f[:, 1:2] * Kbar_dense)
+            B2 = (w_f[:, 2:3] * Kbar_dense)
+            B_dense = torch.cat([B0, B1, B2], dim=1).contiguous()
+
+            # Weighted system using sqrt(alpha_d): BtDB = (sqrtA*B)^T (sqrtA*B), rhs = (sqrtA*B)^T (sqrtA*r)
+            sA = alpha_d.sqrt().to(torch.float32)  # (B,)
+            WB = B_dense * sA.unsqueeze(1)         # (B,3M)
+            wr = resid_g.to(torch.float32) * sA    # (B,)
+            BtDB = WB.transpose(0, 1) @ WB         # (3M,3M)
+            rhs_vec = WB.transpose(0, 1) @ wr      # (3M,)
+
+            # Add prior term A^{-1} = (1/tau^2) * (Kuu ⊗ I3)
+            inv_tau2 = float(1.0 / (float(tau) * float(tau)))
+            if have_full:
+                # Avoid python loops for the common/full mode.
+                if isinstance(K_full3, torch.Tensor) and int(K_full3.shape[0]) == int(3 * M):
+                    G = BtDB + (inv_tau2 * K_full3)
+                else:
+                    Kprior = (inv_tau2 * Kuu)
+                    G = BtDB + torch.block_diag(Kprior, Kprior, Kprior)
+            else:
+                G = BtDB
+                for d0 in range(3):
+                    s0 = d0 * M
+                    G[s0 : s0 + M, s0 : s0 + M] = G[s0 : s0 + M, s0 : s0 + M] + (inv_tau2 * Kuu)
+
+            # Solve S y = rhs
+            try:
+                L = torch.linalg.cholesky(G)
+                y = torch.cholesky_solve(rhs_vec.reshape(-1, 1), L).reshape(-1)  # (3M,)
+            except Exception:
+                try:
+                    j = 1e-4
+                    L = torch.linalg.cholesky(G + (j * torch.eye(int(G.shape[0]), device=dev, dtype=G.dtype)))
+                    y = torch.cholesky_solve(rhs_vec.reshape(-1, 1), L).reshape(-1)
+                except Exception:
+                    n_groups_fallback_diag += 1
+                    u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                    quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                    continue
+
+            by = (B_dense @ y).to(torch.float32)  # (B,)
+            u_g = alpha_d * (resid_g.to(torch.float32) - by)
+            u_g = u_g.to(dtype=resid_g.dtype)
+            n_groups_woodbury += 1
+            quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+
+        # Stash stats for caller
+        try:
+            params["_slowness_re_runtime_last_grouping"] = str(grouping)
+            params["_slowness_re_runtime_last_groups"] = int(n_groups_total)
+            params["_slowness_re_runtime_last_groups_woodbury"] = int(n_groups_woodbury)
+            params["_slowness_re_runtime_last_groups_fallback_diag"] = int(n_groups_fallback_diag)
+            params["_slowness_re_runtime_last_max_rows"] = int(max_rows_seen)
+            params["_slowness_re_runtime_last_max_nodes"] = int(max_nodes_seen)
+        except Exception:
+            pass
+
+        m_tot = float(max(int(resid.numel()), 1))
+        loss_like = (quad / m_tot) + torch.log(sigma).mean()
+        return float(alpha) * loss_like
+
+    # Optional: collapsed shared-event random effects (Gaussian; marginalized b).
+    # This replaces the independent quadratic term with a correlated quadratic
+    # while keeping the overall loss scaled "per observation" (mean over rows).
+    try:
+        se_enable = bool(params.get("_shared_event_re_enabled", False))
+    except Exception:
+        se_enable = False
+    if se_enable:
+        solver = str(params.get("_shared_event_re_solver", "pcg_sparse")).strip().lower()
+        if solver in {"pcg", "pcg_sparse", "pcg-sparse"}:
+            # Current Phase-A implementation: quadratic-only (drop_logdet must be true; enforced by schema).
+            # We compute u ≈ Σ^{-1} r per group and return:
+            #   mean( 0.5 r^T u ) + mean(log sigma)
+            # but with custom autograd so d/dr = u (do not differentiate through the solver).
+            grouping = str(params.get("_shared_event_re_grouping", "phase")).strip().lower()
+            if grouping in {"stationphase", "station-phase"}:
+                grouping = "station_phase"
+            tau_ps = params.get("_shared_event_re_tau_s", [0.0, 0.0])
+            tau_p = float(tau_ps[0]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+            tau_s = float(tau_ps[1]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+            jitter0 = float(params.get("_shared_event_re_jitter0", 1e-8))
+            pcg_max_iters = int(params.get("_shared_event_re_pcg_max_iters", 50))
+            pcg_tol = float(params.get("_shared_event_re_pcg_tol", 1e-3))
+            max_rows_per_group = int(params.get("_shared_event_re_max_rows_per_group", 200000))
+            max_nodes_per_group = int(params.get("_shared_event_re_max_nodes_per_group", 512))
+            fallback_to_diag = bool(params.get("_shared_event_re_fallback_to_diag", True))
+
+            if sigma_extra_var is not None:
+                raise ValueError(
+                    "model.likelihood.shared_event_re: sigma_extra_var is not supported with pcg_sparse "
+                    "(would require a weighted Laplacian / heteroscedastic diagonal; implement in a future phase)"
+                )
+
+            # Station index is supplied at runtime by the epoch runner when owner-bucket batching is active.
+            sta_idx = None
+            if grouping == "station_phase":
+                sta_idx = params.get("_runtime_bucket_station_index", None)
+                if not isinstance(sta_idx, torch.Tensor) or int(sta_idx.numel()) != int(resid.numel()):
+                    # Fall back quietly to phase-only; warn once.
+                    if not bool(params.get("_shared_event_re_warned_no_station_index", False)):
+                        print(
+                            "Warning: shared_event_re.grouping='station_phase' requested but no per-row station index "
+                            "was available for this batch. Falling back to grouping='phase'."
+                        )
+                        params["_shared_event_re_warned_no_station_index"] = True
+                    grouping = "phase"
+                    sta_idx = None
+
+            # Build group keys (sorted -> contiguous runs)
+            ph_id = torch.where(is_p, torch.zeros_like(resid, dtype=torch.int64), torch.ones_like(resid, dtype=torch.int64))
+            if grouping == "phase":
+                keys = ph_id
+            else:
+                keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id  # type: ignore[union-attr]
+            keys_sorted, perm = torch.sort(keys)
+            # Run boundaries
+            if keys_sorted.numel() > 0:
+                is_new = torch.ones_like(keys_sorted, dtype=torch.bool)
+                is_new[1:] = keys_sorted[1:] != keys_sorted[:-1]
+                starts = torch.nonzero(is_new, as_tuple=False).reshape(-1)
+                ends = torch.cat([starts[1:], torch.tensor([keys_sorted.numel()], device=starts.device, dtype=starts.dtype)])
+            else:
+                starts = torch.zeros((0,), device=resid.device, dtype=torch.int64)
+                ends = torch.zeros((0,), device=resid.device, dtype=torch.int64)
+
+            quad = torch.tensor(0.0, device=resid.device, dtype=resid.dtype)
+            # Optional: lightweight per-call workload summary (used by epoch_runner profiling/logging).
+            # We keep this extremely cheap (just counters) so it can be enabled in long runs.
+            n_groups_total = 0
+            n_groups_pcg = 0
+            n_groups_fallback_diag = 0
+            max_rows_seen = 0
+            max_nodes_seen = 0
+            # Process each group
+            for si, ei in zip(starts.tolist(), ends.tolist()):
+                idxs = perm[si:ei]
+                m_g = int(idxs.numel())
+                if m_g <= 0:
+                    continue
+                n_groups_total += 1
+                if m_g > max_rows_seen:
+                    max_rows_seen = m_g
+                # Decode phase for this group (0=P, 1=S)
+                ph_g = int(ph_id.index_select(0, idxs[:1]).item())
+                tau = tau_p if ph_g == 0 else tau_s
+                sigma_g = σ_p if ph_g == 0 else σ_s
+
+                if m_g > int(max_rows_per_group):
+                    if not fallback_to_diag:
+                        raise ValueError(
+                            f"shared_event_re: group too large (rows={m_g} > max_rows_per_group={max_rows_per_group}). "
+                            f"Set max_rows_per_group higher or enable fallback_to_diag."
+                        )
+                    n_groups_fallback_diag += 1
+                    u_g = resid.index_select(0, idxs) / sigma_g.square().clamp_min(1e-24)
+                    quad = quad + _CollapsedQuad.apply(resid.index_select(0, idxs), u_g)
+                    continue
+
+                idx_g = idx.index_select(0, idxs)
+                # Enforce node-count limit (avoid pathological buckets)
+                try:
+                    n_nodes = int(torch.unique(idx_g.reshape(-1)).numel())
+                except Exception:
+                    n_nodes = m_g * 2
+                if n_nodes > max_nodes_seen:
+                    max_nodes_seen = n_nodes
+                if n_nodes > int(max_nodes_per_group):
+                    if not fallback_to_diag:
+                        raise ValueError(
+                            f"shared_event_re: group too large (nodes={n_nodes} > max_nodes_per_group={max_nodes_per_group}). "
+                            f"Set max_nodes_per_group higher or enable fallback_to_diag."
+                        )
+                    n_groups_fallback_diag += 1
+                    u_g = resid.index_select(0, idxs) / sigma_g.square().clamp_min(1e-24)
+                    quad = quad + _CollapsedQuad.apply(resid.index_select(0, idxs), u_g)
+                    continue
+
+                resid_g = resid.index_select(0, idxs)
+                u_g = _shared_event_re_u_pcg(
+                    idx_g=idx_g,
+                    resid_g=resid_g,
+                    sigma=sigma_g.clamp_min(1e-12),
+                    tau=float(tau),
+                    jitter0=float(jitter0),
+                    pcg_max_iters=int(pcg_max_iters),
+                    pcg_tol=float(pcg_tol),
+                )
+                if float(tau) > 0.0:
+                    n_groups_pcg += 1
+                quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+
+            # Stash stats for the caller (epoch_runner) to optionally log.
+            # Note: params is a mutable dict shared across calls; we keep keys private/prefixed.
+            try:
+                params["_shared_event_re_runtime_last_grouping"] = str(grouping)
+                params["_shared_event_re_runtime_last_groups"] = int(n_groups_total)
+                params["_shared_event_re_runtime_last_groups_pcg"] = int(n_groups_pcg)
+                params["_shared_event_re_runtime_last_groups_fallback_diag"] = int(n_groups_fallback_diag)
+                params["_shared_event_re_runtime_last_max_rows"] = int(max_rows_seen)
+                params["_shared_event_re_runtime_last_max_nodes"] = int(max_nodes_seen)
+            except Exception:
+                pass
+
+            # Mean over observations (to match the rest of SPIDER)
+            m_tot = float(max(int(resid.numel()), 1))
+            # Keep the independent log(sigma) term for compatibility (with learn_noise_scale=false it's a constant anyway).
+            loss_like = (quad / m_tot) + torch.log(sigma).mean()
+            return float(alpha) * loss_like
+        else:
+            raise NotImplementedError(
+                f"model.likelihood.shared_event_re: solver='{solver}' is not implemented. "
+                f"Supported in Phase-A: solver='pcg_sparse'."
+            )
     
     # 4. Loss Function
     loss_type = str(params.get("likelihood", "huber")).strip().lower()
-    # Likelihood-only tempering (power posterior): posterior ∝ prior * likelihood^alpha
-    # This scales ONLY the likelihood term, leaving priors unchanged.
-    try:
-        alpha = float(params.get("_likelihood_tempering_alpha", 1.0))
-        if not (alpha > 0.0) or not np.isfinite(alpha):
-            alpha = 1.0
-    except Exception:
-        alpha = 1.0
 
     if loss_type in {"gaussian", "mse", "l2"}:
         # NLL ~ 0.5 * r^2
@@ -431,32 +1183,46 @@ def compute_prior_loss(
     try:
         if bool(params.get("_shared_event_latent_enabled", False)) and isinstance(shared_event_latent_b, torch.Tensor):
             mode = str(params.get("_shared_event_latent_parameterization", "full")).strip().lower()
-            if mode not in {"full", "inducing_gp", "graph_gmrf"}:
+            if mode not in {"full", "inducing_gp", "slowness_inducing_gp", "graph_gmrf"}:
                 mode = "full"
             u = params.get("_shared_event_latent_u", None)
             v = params.get("_shared_event_latent_v", None)
             w = params.get("_shared_event_latent_w", None)
             q_diag = float(params.get("_shared_event_latent_q_diag_runtime", params.get("_shared_event_latent_q_diag", 0.0)))
             b = shared_event_latent_b
-            if b.ndim == 3 and int(b.shape[2]) == 2:
-                # Σ^{-1} for joint (P,S) coupling
-                tau_ps = params.get("_shared_event_latent_tau_s", [0.0, 0.0])
-                tau_p = float(tau_ps[0]); tau_s = float(tau_ps[1])
-                rho = float(params.get("_shared_event_latent_rho_ps", 0.0))
-                if (tau_p > 0.0) and (tau_s > 0.0) and (abs(rho) < 1.0):
-                    det = (tau_p * tau_p) * (tau_s * tau_s) * (1.0 - rho * rho)
-                    inv00 = (tau_s * tau_s) / det
-                    inv11 = (tau_p * tau_p) / det
-                    inv01 = (-rho * tau_p * tau_s) / det
 
-                    bP = b[:, :, 0]
-                    bS = b[:, :, 1]
+            # Supported coefficient shapes:
+            # - full / graph_gmrf: b is event-level (…, n_events, 2)
+            # - inducing_gp:       b is inducing coeffs (…, M_total, 2)
+            # - slowness_inducing_gp: inducing coeffs for a 3D vector field (…, M_total, 2, 3)
+            is_scalar = bool(b.ndim == 3 and int(b.shape[2]) == 2)
+            is_vec3 = bool(b.ndim == 4 and int(b.shape[2]) == 2 and int(b.shape[3]) == 3)
+            if mode == "slowness_inducing_gp" and (not is_vec3):
+                raise RuntimeError("shared_event_latent slowness_inducing_gp expects b shape (S_or_R, M_total, 2, 3)")
+            if mode != "slowness_inducing_gp" and (not is_scalar):
+                # Do not crash; just skip prior if shape is unexpected.
+                raise RuntimeError("shared_event_latent prior: unexpected b shape")
 
-            if mode == "inducing_gp":
+            # Σ^{-1} for joint (P,S) coupling (used for both scalar and vector modes).
+            tau_ps = params.get("_shared_event_latent_tau_s", [0.0, 0.0])
+            tau_p = float(tau_ps[0]); tau_s = float(tau_ps[1])
+            rho = float(params.get("_shared_event_latent_rho_ps", 0.0))
+            if (tau_p > 0.0) and (tau_s > 0.0) and (abs(rho) < 1.0):
+                det = (tau_p * tau_p) * (tau_s * tau_s) * (1.0 - rho * rho)
+                inv00 = (tau_s * tau_s) / det
+                inv11 = (tau_p * tau_p) / det
+                inv01 = (-rho * tau_p * tau_s) / det
+            else:
+                # Degenerate / disabled: treat prior as off.
+                inv00 = 0.0
+                inv11 = 0.0
+                inv01 = 0.0
+
+            if mode in {"inducing_gp", "slowness_inducing_gp"}:
                 # Inducing-point GP coefficients prior (predictive-process mean):
                 # For each connected component block, coefficients c (per station, per inducing point) have prior
                 #   c ~ N(0, K_UU^{-1})  ⇔  log p(c) ∝ -0.5 * c^T K_UU c
-                # where K_UU is the inducing kernel matrix for that component (RBF with ell_km).
+                # where K_UU is the inducing kernel matrix for that component.
                 offs = params.get("_shared_event_latent_inducing_offsets", None)
                 K_blocks = params.get("_shared_event_latent_inducing_K_blocks", None)
                 if isinstance(offs, torch.Tensor) and isinstance(K_blocks, list) and K_blocks:
@@ -476,17 +1242,27 @@ def compute_prior_loss(
                             continue
                         if not isinstance(K, torch.Tensor) or K.numel() == 0:
                             continue
-                        cP = bP[:, i0:i1]
-                        cS = bS[:, i0:i1]
                         # Ensure kernel on same device/dtype
                         Kt = K.to(device=b.device, dtype=b.dtype)
-                        # Quadratic forms summed over stations:
-                        # sum_s c_s^T K c_s = sum_s sum_i c_{s,i} ( (c_s @ K)_i )
-                        KP = torch.matmul(cP, Kt)
-                        KS = torch.matmul(cS, Kt)
-                        e00 = e00 + (cP * KP).sum()
-                        e11 = e11 + (cS * KS).sum()
-                        e01 = e01 + (cP * KS).sum()
+                        if is_scalar:
+                            cP = b[:, i0:i1, 0]
+                            cS = b[:, i0:i1, 1]
+                            # Quadratic forms summed over stations:
+                            KP = torch.matmul(cP, Kt)
+                            KS = torch.matmul(cS, Kt)
+                            e00 = e00 + (cP * KP).sum()
+                            e11 = e11 + (cS * KS).sum()
+                            e01 = e01 + (cP * KS).sum()
+                        else:
+                            # Vector slowness coefficients: sum energies across xyz components (independent a priori).
+                            for d in range(3):
+                                cP = b[:, i0:i1, 0, d]
+                                cS = b[:, i0:i1, 1, d]
+                                KP = torch.matmul(cP, Kt)
+                                KS = torch.matmul(cS, Kt)
+                                e00 = e00 + (cP * KP).sum()
+                                e11 = e11 + (cS * KS).sum()
+                                e01 = e01 + (cP * KS).sum()
                     energy = 0.5 * (float(inv00) * e00 + float(inv11) * e11 + 2.0 * float(inv01) * e01)
                     log_prob_b = (-energy).to(dtype=ΔX_src.dtype)
             else:
@@ -496,6 +1272,8 @@ def compute_prior_loss(
                     u_i = u.to(torch.int64)
                     v_i = v.to(torch.int64)
                     w_f = w.to(dtype=b.dtype)
+                    bP = b[:, :, 0]
+                    bS = b[:, :, 1]
 
                     def _apply_Q(xSN: torch.Tensor) -> torch.Tensor:
                         y = xSN * float(max(0.0, q_diag))
