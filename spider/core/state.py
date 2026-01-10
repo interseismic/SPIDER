@@ -136,6 +136,16 @@ class LocateState:
     # Inducing prior blocks (component-wise). Offsets index into the concatenated inducing list.
     shared_event_latent_inducing_offsets: Optional[torch.Tensor] = None       # (n_blocks+1,) int64
     shared_event_latent_inducing_K_blocks: Optional[list] = None              # list[Tensor], each (M_c, M_c)
+
+    # --- Optional correlated forward-model error latent (corr_error) ---
+    # Low-rank station basis W (n_stations, R) and event latent b (n_events, R, 2).
+    corr_error_b: Optional[torch.nn.Parameter] = None
+    corr_error_station_basis_W: Optional[torch.Tensor] = None  # (n_stations, R) float32
+    corr_error_r: int = 0
+    corr_error_u: Optional[torch.Tensor] = None  # (E,) int64
+    corr_error_v: Optional[torch.Tensor] = None  # (E,) int64
+    corr_error_w: Optional[torch.Tensor] = None  # (E,) float32
+    corr_error_q_diag: float = 0.0
     # Optional FITC-style diagonal correction (Stage 5) for inducing_gp:
     # Q_ee ≈ K_eU K_UU^{-1} K_Ue (approximated using the same m-neighbor subset as interpolation),
     # residual diag Λ_ee = max(0, 1 - Q_ee).
@@ -351,6 +361,20 @@ def _apply_shared_event_latent_constraints_inplace(state: LocateState) -> None:
         b.sub_((r.to(dtype=b.dtype, device=b.device) / denom_b).view(R, 1, 1) * dot.view(1, -1, 2))
     except Exception:
         # Constraints must never crash inference.
+        return
+
+    # Also apply an identifiability constraint for corr_error:
+    # corr_error enters the likelihood only via (b_j - b_i), so the mean of b across events is a gauge mode.
+    try:
+        if not bool(state.params.get("_corr_error_enabled", False)):
+            return
+        b2 = getattr(state, "corr_error_b", None)
+        if not isinstance(b2, torch.Tensor) or b2.ndim != 3 or int(b2.shape[2]) != 2:
+            return
+        # Remove event-mean per (rank, phase): b <- b - mean_events(b)
+        mu2 = b2.mean(dim=0, keepdim=True)
+        b2.sub_(mu2)
+    except Exception:
         return
 
 

@@ -2221,7 +2221,7 @@ def compute_prior_loss(
     cluster_ids: torch.Tensor | None = None,
     cluster_counts: torch.Tensor | None = None,
     event_precision_matrix: torch.Tensor | None = None,
-    shared_event_latent_b: torch.Tensor | None = None,
+    corr_error_b: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Computes the Total Prior Negative Log-Probability, scaled by 1/N_total.
@@ -2235,10 +2235,62 @@ def compute_prior_loss(
     event_runtime_enable = bool(params.get("_prior_event_runtime_enable", True))
     centroid_runtime_enable = bool(params.get("_prior_centroid_runtime_enable", True))
 
-    if bool(params.get("_shared_event_latent_enabled", False)):
-        raise ValueError(
-            "shared_event_latent has been removed from SPIDER. Delete this block from your config and rerun from scratch."
-        )
+    # Correlated forward-model error prior p(b) (optional).
+    # This uses a fixed event-graph precision Q (kNN Laplacian + q_diag I) built from MAP.
+    log_prob_b_corr = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
+    try:
+        if bool(params.get("_corr_error_enabled", False)) and isinstance(corr_error_b, torch.Tensor):
+            # Expect b shape (n_events, R, 2)
+            b = corr_error_b
+            if not (b.ndim == 3 and int(b.shape[2]) == 2):
+                raise RuntimeError("corr_error prior: expected b shape (n_events, R, 2)")
+            u = params.get("_corr_error_u", None)
+            v = params.get("_corr_error_v", None)
+            w = params.get("_corr_error_w", None)
+            q_diag = float(params.get("_corr_error_q_diag", params.get("_corr_error_event_graph_q_diag", 0.0)))
+            if not (isinstance(u, torch.Tensor) and isinstance(v, torch.Tensor) and isinstance(w, torch.Tensor)):
+                raise RuntimeError("corr_error prior: missing event graph (u,v,w)")
+
+            u_i = u.to(torch.int64)
+            v_i = v.to(torch.int64)
+            w_f = w.to(dtype=b.dtype, device=b.device)
+
+            # Apply Q to a [N,R] tensor: y = q_diag*x + L_w x
+            def _apply_Q(xNR: torch.Tensor) -> torch.Tensor:
+                y = xNR * float(max(0.0, q_diag))
+                if int(u_i.numel()) > 0:
+                    xu = xNR.index_select(0, u_i)
+                    xv = xNR.index_select(0, v_i)
+                    diff = xu - xv  # [E,R]
+                    dw = diff * w_f.unsqueeze(1)
+                    y.index_add_(0, u_i, dw)
+                    y.index_add_(0, v_i, -dw)
+                return y
+
+            bP = b[:, :, 0]
+            bS = b[:, :, 1]
+            qP = _apply_Q(bP)
+            qS = _apply_Q(bS)
+            e00 = (bP * qP).sum()
+            e11 = (bS * qS).sum()
+            e01 = (bP * qS).sum()
+
+            tau_ps = params.get("_corr_error_tau_s", [0.0, 0.0])
+            tau_p = float(tau_ps[0]); tau_s = float(tau_ps[1])
+            rho = float(params.get("_corr_error_rho_ps", 0.0))
+            if (tau_p > 0.0) and (tau_s > 0.0) and (abs(rho) < 1.0):
+                det = (tau_p * tau_p) * (tau_s * tau_s) * (1.0 - rho * rho)
+                inv00 = (tau_s * tau_s) / det
+                inv11 = (tau_p * tau_p) / det
+                inv01 = (-rho * tau_p * tau_s) / det
+            else:
+                inv00 = 0.0
+                inv11 = 0.0
+                inv01 = 0.0
+            energy = 0.5 * (float(inv00) * e00 + float(inv11) * e11 + 2.0 * float(inv01) * e01)
+            log_prob_b_corr = (-energy).to(dtype=ΔX_src.dtype)
+    except Exception:
+        log_prob_b_corr = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
 
     # 1. Event Location Prior (sum over M events)
     # P(ΔX)
@@ -2338,130 +2390,10 @@ def compute_prior_loss(
     # 3. Noise prior removed: SPIDER uses fixed `phase_unc` only (no σ learning).
     log_prob_noise = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
     
-    # 4. Optional uncollapsed shared-event latent prior p(b)
-    # This uses a fixed event-kernel precision Q (kNN Laplacian + q_diag I) built from MAP.
-    # Prior: for each station s, b_s (N x 2) ~ N(0, Σ ⊗ Kevent), implemented via precision (Σ^{-1} ⊗ Q).
-    # We omit logdet constants (they don't affect gradients w.r.t. b or ΔX when Kevent is fixed).
-    log_prob_b = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
-    try:
-        if bool(params.get("_shared_event_latent_enabled", False)) and isinstance(shared_event_latent_b, torch.Tensor):
-            mode = str(params.get("_shared_event_latent_parameterization", "full")).strip().lower()
-            if mode not in {"full", "inducing_gp", "slowness_inducing_gp", "graph_gmrf"}:
-                mode = "full"
-            u = params.get("_shared_event_latent_u", None)
-            v = params.get("_shared_event_latent_v", None)
-            w = params.get("_shared_event_latent_w", None)
-            q_diag = float(params.get("_shared_event_latent_q_diag_runtime", params.get("_shared_event_latent_q_diag", 0.0)))
-            b = shared_event_latent_b
-
-            # Supported coefficient shapes:
-            # - full / graph_gmrf: b is event-level (…, n_events, 2)
-            # - inducing_gp:       b is inducing coeffs (…, M_total, 2)
-            # - slowness_inducing_gp: inducing coeffs for a 3D vector field (…, M_total, 2, 3)
-            is_scalar = bool(b.ndim == 3 and int(b.shape[2]) == 2)
-            is_vec3 = bool(b.ndim == 4 and int(b.shape[2]) == 2 and int(b.shape[3]) == 3)
-            if mode == "slowness_inducing_gp" and (not is_vec3):
-                raise RuntimeError("shared_event_latent slowness_inducing_gp expects b shape (S_or_R, M_total, 2, 3)")
-            if mode != "slowness_inducing_gp" and (not is_scalar):
-                # Do not crash; just skip prior if shape is unexpected.
-                raise RuntimeError("shared_event_latent prior: unexpected b shape")
-
-            # Σ^{-1} for joint (P,S) coupling (used for both scalar and vector modes).
-            tau_ps = params.get("_shared_event_latent_tau_s", [0.0, 0.0])
-            tau_p = float(tau_ps[0]); tau_s = float(tau_ps[1])
-            rho = float(params.get("_shared_event_latent_rho_ps", 0.0))
-            if (tau_p > 0.0) and (tau_s > 0.0) and (abs(rho) < 1.0):
-                det = (tau_p * tau_p) * (tau_s * tau_s) * (1.0 - rho * rho)
-                inv00 = (tau_s * tau_s) / det
-                inv11 = (tau_p * tau_p) / det
-                inv01 = (-rho * tau_p * tau_s) / det
-            else:
-                # Degenerate / disabled: treat prior as off.
-                inv00 = 0.0
-                inv11 = 0.0
-                inv01 = 0.0
-
-            if mode in {"inducing_gp", "slowness_inducing_gp"}:
-                # Inducing-point GP coefficients prior (predictive-process mean):
-                # For each connected component block, coefficients c (per station, per inducing point) have prior
-                #   c ~ N(0, K_UU^{-1})  ⇔  log p(c) ∝ -0.5 * c^T K_UU c
-                # where K_UU is the inducing kernel matrix for that component.
-                offs = params.get("_shared_event_latent_inducing_offsets", None)
-                K_blocks = params.get("_shared_event_latent_inducing_K_blocks", None)
-                if isinstance(offs, torch.Tensor) and isinstance(K_blocks, list) and K_blocks:
-                    e00 = torch.tensor(0.0, device=b.device, dtype=b.dtype)
-                    e11 = torch.tensor(0.0, device=b.device, dtype=b.dtype)
-                    e01 = torch.tensor(0.0, device=b.device, dtype=b.dtype)
-                    # offs length = n_blocks+1
-                    nb = int(max(0, int(offs.numel()) - 1))
-                    for bi in range(nb):
-                        i0 = int(offs[bi].item())
-                        i1 = int(offs[bi + 1].item())
-                        if i1 <= i0:
-                            continue
-                        try:
-                            K = K_blocks[bi]
-                        except Exception:
-                            continue
-                        if not isinstance(K, torch.Tensor) or K.numel() == 0:
-                            continue
-                        # Ensure kernel on same device/dtype
-                        Kt = K.to(device=b.device, dtype=b.dtype)
-                        if is_scalar:
-                            cP = b[:, i0:i1, 0]
-                            cS = b[:, i0:i1, 1]
-                            # Quadratic forms summed over stations:
-                            KP = torch.matmul(cP, Kt)
-                            KS = torch.matmul(cS, Kt)
-                            e00 = e00 + (cP * KP).sum()
-                            e11 = e11 + (cS * KS).sum()
-                            e01 = e01 + (cP * KS).sum()
-                        else:
-                            # Vector slowness coefficients: sum energies across xyz components (independent a priori).
-                            for d in range(3):
-                                cP = b[:, i0:i1, 0, d]
-                                cS = b[:, i0:i1, 1, d]
-                                KP = torch.matmul(cP, Kt)
-                                KS = torch.matmul(cS, Kt)
-                                e00 = e00 + (cP * KP).sum()
-                                e11 = e11 + (cS * KS).sum()
-                                e01 = e01 + (cP * KS).sum()
-                    energy = 0.5 * (float(inv00) * e00 + float(inv11) * e11 + 2.0 * float(inv01) * e01)
-                    log_prob_b = (-energy).to(dtype=ΔX_src.dtype)
-            else:
-                # Full Laplacian-GMRF prior over events:
-                # Apply Q to a [S,N] tensor: y = q_diag*x + L_w x
-                if isinstance(u, torch.Tensor) and isinstance(v, torch.Tensor) and isinstance(w, torch.Tensor):
-                    u_i = u.to(torch.int64)
-                    v_i = v.to(torch.int64)
-                    w_f = w.to(dtype=b.dtype)
-                    bP = b[:, :, 0]
-                    bS = b[:, :, 1]
-
-                    def _apply_Q(xSN: torch.Tensor) -> torch.Tensor:
-                        y = xSN * float(max(0.0, q_diag))
-                        if int(u_i.numel()) > 0:
-                            xu = xSN.index_select(1, u_i)
-                            xv = xSN.index_select(1, v_i)
-                            diff = xu - xv  # [S,E]
-                            dw = diff * w_f.unsqueeze(0)
-                            y.index_add_(1, u_i, dw)
-                            y.index_add_(1, v_i, -dw)
-                        return y
-
-                    qP = _apply_Q(bP)
-                    qS = _apply_Q(bS)
-                    # Energy = 0.5 * sum_s [ inv00 bP·qP + inv11 bS·qS + 2 inv01 bP·qS ]
-                    e00 = (bP * qP).sum()
-                    e11 = (bS * qS).sum()
-                    e01 = (bP * qS).sum()
-                    energy = 0.5 * (float(inv00) * e00 + float(inv11) * e11 + 2.0 * float(inv01) * e01)
-                    log_prob_b = (-energy).to(dtype=ΔX_src.dtype)
-    except Exception:
-        log_prob_b = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
+    # (shared_event_latent prior removed)
 
     # Total Log Prior
-    total_log_prior = log_prob_events + log_prob_centroid + log_prob_noise + log_prob_b
+    total_log_prior = log_prob_events + log_prob_centroid + log_prob_noise + log_prob_b_corr
     
     base_prior_loss = -total_log_prior / float(N_total)
     return base_prior_loss
@@ -2474,7 +2406,7 @@ def total_loss(
     sigma_extra_var=None,
     cluster_ids=None, cluster_counts=None,
     event_precision_matrix=None,
-    shared_event_latent_b=None,
+    corr_error_b=None,
 ):
     """
     Compute Total Unified Loss (Average Negative Log Posterior).
@@ -2493,7 +2425,7 @@ def total_loss(
     loss_prior = compute_prior_loss(
         ΔX_src, prior_event, prior_centroid, σ_p, σ_s, N_total, params,
         cluster_ids, cluster_counts, event_precision_matrix,
-        shared_event_latent_b,
+        corr_error_b,
     )
     
     return loss_like + loss_prior

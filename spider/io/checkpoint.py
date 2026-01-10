@@ -16,6 +16,7 @@ def save_checkpoint(
     phase: str,
     global_step_count: int = 0,
     noise_log_scale=None,
+    corr_error_b=None,
     event_precision_matrix=None,
 ):
     """Save a checkpoint including phase and step metadata.
@@ -45,6 +46,14 @@ def save_checkpoint(
             checkpoint_data["noise_log_scale"] = noise_log_scale.detach().cpu()
         except Exception:
             checkpoint_data["noise_log_scale"] = torch.as_tensor(noise_log_scale).detach().cpu()
+    if corr_error_b is not None:
+        try:
+            checkpoint_data["corr_error_b"] = corr_error_b.detach().cpu()
+        except Exception:
+            try:
+                checkpoint_data["corr_error_b"] = torch.as_tensor(corr_error_b).detach().cpu()
+            except Exception:
+                pass
     # Optional Hierarchical Prior P0
     if event_precision_matrix is not None:
         try:
@@ -115,6 +124,13 @@ def load_checkpoint(params, device):
         if not isinstance(nls, torch.Tensor):
             nls = torch.tensor(nls)
         out["noise_log_scale"] = nls.to(device=device, dtype=torch.float32)
+
+    # Optional corr_error latent
+    if "corr_error_b" in data:
+        b = data["corr_error_b"]
+        if not isinstance(b, torch.Tensor):
+            b = torch.tensor(b)
+        out["corr_error_b"] = b.to(device=device, dtype=torch.float32)
         
     # Optional Hierarchical Prior P0 (can be (4, 4) or (K, 4, 4))
     if "event_precision_matrix" in data:

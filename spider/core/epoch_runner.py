@@ -1465,7 +1465,28 @@ def _run_epoch(
 
         # sigma_inflation removed (start fresh).
 
-        b_lat_for_prior = (getattr(state, "shared_event_latent_b", None) if bool(state.params.get("_shared_event_latent_enabled", False)) else None)
+        # Optional: corr_error latent (low-rank station basis × event-graph GMRF) contribution to likelihood.
+        try:
+            if bool(state.params.get("_corr_error_enabled", False)):
+                W = getattr(state, "corr_error_station_basis_W", None)
+                b = getattr(state, "corr_error_b", None)
+                sta_b = state.params.get("_runtime_bucket_station_index", None)
+                if isinstance(W, torch.Tensor) and isinstance(b, torch.Tensor) and isinstance(sta_b, torch.Tensor):
+                    e1 = II_b[:, 0].to(torch.int64)
+                    e2 = II_b[:, 1].to(torch.int64)
+                    bi = b.index_select(0, e1)  # (B,R,2)
+                    bj = b.index_select(0, e2)
+                    db = (bj - bi).to(torch.float32)
+                    ph = YY_b[:, 4]
+                    is_s = (ph >= 0.5)
+                    db_phase = torch.where(is_s.view(-1, 1), db[:, :, 1], db[:, :, 0])  # (B,R)
+                    Wr = W.index_select(0, sta_b.to(torch.int64))  # (B,R)
+                    delta_corr = (Wr * db_phase).sum(dim=1)  # (B,)
+                    nuisance_delta = delta_corr if nuisance_delta is None else (nuisance_delta + delta_corr)
+        except Exception:
+            pass
+
+        b_corr_for_prior = (getattr(state, "corr_error_b", None) if bool(state.params.get("_corr_error_enabled", False)) else None)
         if ddp_enabled:
             # DDP-safe loss construction:
             # - Likelihood term is the *global batch mean* across all ranks: (1/B) Σ_i NLL_i.
@@ -1589,7 +1610,7 @@ def _run_epoch(
                 cluster_ids=state.cluster_ids,
                 cluster_counts=state.cluster_counts,
                 event_precision_matrix=state.event_precision_matrix,
-                shared_event_latent_b=b_lat_for_prior,
+                corr_error_b=b_corr_for_prior,
             )
 
             loss = loss_like * (float(local_bsz) / float(B_global)) + (loss_prior / float(ddp_world_size))
@@ -1706,7 +1727,7 @@ def _run_epoch(
                 cluster_ids=state.cluster_ids,
                 cluster_counts=state.cluster_counts,
                 event_precision_matrix=state.event_precision_matrix,
-                shared_event_latent_b=b_lat_for_prior,
+                corr_error_b=b_corr_for_prior,
             )
             loss = loss_like + loss_prior
 
@@ -1793,7 +1814,7 @@ def _run_epoch(
                 cluster_ids=state.cluster_ids,
                 cluster_counts=state.cluster_counts,
                 event_precision_matrix=state.event_precision_matrix,
-                shared_event_latent_b=(getattr(state, "shared_event_latent_b", None) if bool(state.params.get("_shared_event_latent_enabled", False)) else None),
+                corr_error_b=(getattr(state, "corr_error_b", None) if bool(state.params.get("_corr_error_enabled", False)) else None),
             )
             loss_snap.backward()
             grad_batch_snapshot = state.dX_src.grad
@@ -2417,7 +2438,7 @@ def _run_epoch(
                     cluster_ids=state.cluster_ids,
                     cluster_counts=state.cluster_counts,
                     event_precision_matrix=state.event_precision_matrix,
-                    shared_event_latent_b=getattr(state, "shared_event_latent_b", None),
+                    corr_error_b=getattr(state, "corr_error_b", None),
                 )
                 l_prior_f = float(l_prior.detach().cpu().item())
                 metrics["shared_event_latent/loss_total"] = float(total_loss_mean)
@@ -2591,7 +2612,7 @@ def _run_epoch(
                                 cluster_ids=state.cluster_ids,
                                 cluster_counts=state.cluster_counts,
                                 event_precision_matrix=state.event_precision_matrix,
-                                shared_event_latent_b=(getattr(state, "shared_event_latent_b", None) if bool(state.params.get("_shared_event_latent_enabled", False)) else None),
+                                corr_error_b=(getattr(state, "corr_error_b", None) if bool(state.params.get("_corr_error_enabled", False)) else None),
                             )
                             # l is mean over this chunk
                             w = int(i1 - i0)

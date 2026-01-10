@@ -62,6 +62,11 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
     # Parameter list: ΔX_src only (noise learning removed; fixed phase_unc only)
     base_params_list: List[torch.nn.Parameter] = [state.dX_src]
 
+    # Optional: correlated forward-model error latent b (separate param group; often needs smaller step/noise).
+    b_corr = getattr(state, "corr_error_b", None)
+    use_b_corr = bool((b_corr is not None) and bool(params.get("_corr_error_enabled", False)))
+    corr_overrides_active = bool(params.get("_corr_error_sampler_overrides_active", False))
+
     lr = float(params["lr_sampler"])
     lr_mode = str(params["sampler_lr_mode"]).strip().lower()
     n_obs = int(getattr(state, "N", params.get("n_obs", 1)))
@@ -76,6 +81,13 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
             lr_eff = lr / float(n_obs)
         base_group = {"params": base_params_list, "group_name": "core"}
         param_groups = [base_group]
+        if use_b_corr:
+            g_corr = {"params": [b_corr], "group_name": "corr_error"}  # type: ignore[list-item]
+            if corr_overrides_active:
+                eps_b = float(params.get("_corr_error_eps", max(float(params["sampler_eps"]), 1e-3)))
+                freeze_b = bool(params.get("_corr_error_freeze_preconditioner_sampling", False))
+                g_corr.update({"eps": eps_b, "freeze_preconditioner": freeze_b})
+            param_groups.append(g_corr)
         opt = pSGLD(
             params=param_groups,
             n_obs=state.N,
@@ -120,6 +132,13 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
             lr_eff = lr / float(n_obs)
         base_group = {"params": base_params_list, "group_name": "core"}
         param_groups = [base_group]
+        if use_b_corr:
+            g_corr = {"params": [b_corr], "group_name": "corr_error"}  # type: ignore[list-item]
+            if corr_overrides_active:
+                eps_b = float(params.get("_corr_error_eps", max(float(params["sampler_eps"]), 1e-3)))
+                freeze_b = bool(params.get("_corr_error_freeze_preconditioner_sampling", False))
+                g_corr.update({"eps": eps_b, "freeze_preconditioner": freeze_b})
+            param_groups.append(g_corr)
         opt = SGHMC(
             params=param_groups,
             n_obs=state.N,
@@ -165,6 +184,14 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
             lr_eff = float(max(lr_eff, 0.0)) ** 0.5
         base_group = {"params": base_params_list, "group_name": "core"}
         param_groups = [base_group]
+        if use_b_corr:
+            # AdaptiveSGHMC uses `epsilon` (and also honors `eps`) for numerical stability.
+            g_corr = {"params": [b_corr], "group_name": "corr_error"}  # type: ignore[list-item]
+            if corr_overrides_active:
+                eps_b = float(params.get("_corr_error_eps", max(float(params["sampler_eps"]), 1e-3)))
+                freeze_b = bool(params.get("_corr_error_freeze_preconditioner_sampling", False))
+                g_corr.update({"epsilon": eps_b, "eps": eps_b, "freeze_preconditioner": freeze_b})
+            param_groups.append(g_corr)
         opt = AdaptiveSGHMC(
             params=param_groups,
             lr=lr_eff,
@@ -199,6 +226,13 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         # Simple SGD-based backend with no preconditioning; acts as placeholder
         base_group = {"params": base_params_list, "group_name": "core"}
         param_groups = [base_group]
+        if use_b_corr:
+            g_corr = {"params": [b_corr], "group_name": "corr_error"}  # type: ignore[list-item]
+            if corr_overrides_active:
+                eps_b = float(params.get("_corr_error_eps", max(float(params["sampler_eps"]), 1e-3)))
+                freeze_b = bool(params.get("_corr_error_freeze_preconditioner_sampling", False))
+                g_corr.update({"eps": eps_b, "freeze_preconditioner": freeze_b})
+            param_groups.append(g_corr)
         opt = torch.optim.SGD(param_groups, lr=lr)
         _attach_set_lr(opt)
         _ensure_common_group_keys(opt, params=params, n_obs=state.N)

@@ -473,7 +473,7 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     params["sampler_preconditioning_include_gamma_proxy"] = bool(precond_include_gamma_proxy)
 
     # ---- sampler parameter-group overrides (hard-break schema) ----
-    # Structured likelihood components have been removed; disallow legacy override blocks.
+    # These are inference-only controls. They let high-dimensional latent groups use smaller step/noise.
     overrides = sampler.get("overrides", None)
     if overrides is None:
         overrides = {}
@@ -484,6 +484,47 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
             "inference.sampler.overrides.shared_event_latent",
             "removed; shared_event_latent has been removed from SPIDER (delete this block)",
         )
+
+    # Optional: correlated forward-model error latent (corr_error) group overrides.
+    # Defaults chosen to be conservative for a large latent.
+    corr_lr_mult = 0.05
+    corr_temp_mult = 0.25
+    corr_eps = 1e-3
+    corr_freeze_precond = False
+    corr_overrides_active = False
+    corr_ov = overrides.get("corr_error", None)
+    if corr_ov is not None:
+        if not isinstance(corr_ov, dict):
+            raise _err("inference.sampler.overrides.corr_error", "expected object/dict or null")
+        for k in ("lr_mult", "temperature_mult", "eps", "freeze_preconditioner_sampling"):
+            if k in corr_ov and corr_ov.get(k, None) is not None:
+                corr_overrides_active = True
+                break
+        if "lr_mult" in corr_ov and corr_ov.get("lr_mult", None) is not None:
+            corr_lr_mult = float(_require_num(corr_ov.get("lr_mult"), "inference.sampler.overrides.corr_error.lr_mult"))
+            if not (corr_lr_mult > 0.0):
+                raise _err("inference.sampler.overrides.corr_error.lr_mult", "must be > 0")
+        if "temperature_mult" in corr_ov and corr_ov.get("temperature_mult", None) is not None:
+            corr_temp_mult = float(
+                _require_num(corr_ov.get("temperature_mult"), "inference.sampler.overrides.corr_error.temperature_mult")
+            )
+            if not (corr_temp_mult > 0.0):
+                raise _err("inference.sampler.overrides.corr_error.temperature_mult", "must be > 0")
+        if "eps" in corr_ov and corr_ov.get("eps", None) is not None:
+            corr_eps = float(_require_num(corr_ov.get("eps"), "inference.sampler.overrides.corr_error.eps"))
+            if not (corr_eps >= 0.0):
+                raise _err("inference.sampler.overrides.corr_error.eps", "must be >= 0")
+        if "freeze_preconditioner_sampling" in corr_ov and corr_ov.get("freeze_preconditioner_sampling", None) is not None:
+            corr_freeze_precond = _require_bool(
+                corr_ov.get("freeze_preconditioner_sampling"),
+                "inference.sampler.overrides.corr_error.freeze_preconditioner_sampling",
+            )
+
+    params["_corr_error_lr_mult"] = float(corr_lr_mult)
+    params["_corr_error_temperature_mult"] = float(corr_temp_mult)
+    params["_corr_error_eps"] = float(corr_eps)
+    params["_corr_error_freeze_preconditioner_sampling"] = bool(corr_freeze_precond)
+    params["_corr_error_sampler_overrides_active"] = bool(corr_overrides_active)
 
     return params
 
@@ -597,7 +638,90 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     if "slowness_re" in lk:
         raise _err("model.likelihood.slowness_re", "removed; delete this block from your config")
     if "latent_field" in lk:
-        raise _err("model.likelihood.latent_field", "removed; use model.likelihood.shared_event_latent instead")
+        raise _err("model.likelihood.latent_field", "removed; delete this block from your config")
+
+    # Optional: correlated forward-model error latent (low-rank station basis × event-graph GMRF).
+    #
+    # Models residual correlations as:
+    #   r_e = (w_s · (b_j - b_i)) + eps
+    # where w_s is a fixed station basis vector and b_i is an event latent vector with a GMRF prior.
+    corr_cfg = lk.get("corr_error", None)
+    corr_enabled = False
+    corr_r = 0
+    corr_tau_ps = [0.0, 0.0]  # seconds
+    corr_rho_ps = 0.0
+    # Station basis (fixed, from station geometry)
+    corr_sta_ell_km = 0.0
+    corr_sta_jitter = 1e-6
+    corr_sta_method = "eigh_rbf"
+    # Event graph (fixed, from MAP event geometry)
+    corr_knn = 16
+    corr_event_ell_km = 0.0
+    corr_q_diag = 1e-3
+    corr_max_edges_per_step = 0  # 0 => use full edge set each step
+    if isinstance(corr_cfg, dict):
+        corr_enabled = bool(corr_cfg.get("enabled", False))
+        if "r" in corr_cfg and corr_cfg.get("r", None) is not None:
+            corr_r = int(_require_num(corr_cfg.get("r"), "model.likelihood.corr_error.r"))
+            if corr_r < 1:
+                raise _err("model.likelihood.corr_error.r", "must be >= 1")
+        if "tau_s" in corr_cfg and corr_cfg.get("tau_s", None) is not None:
+            v = corr_cfg.get("tau_s")
+            if isinstance(v, (int, float)):
+                f = float(v)
+                corr_tau_ps = [f, f]
+            elif isinstance(v, list):
+                corr_tau_ps = _require_float_list(v, "model.likelihood.corr_error.tau_s", length=2)
+            else:
+                raise _err("model.likelihood.corr_error.tau_s", f"expected number or [P,S] list, got {type(v).__name__}")
+        if not (corr_tau_ps[0] >= 0.0 and corr_tau_ps[1] >= 0.0):
+            raise _err("model.likelihood.corr_error.tau_s", "must be >= 0")
+        if "rho_ps" in corr_cfg and corr_cfg.get("rho_ps", None) is not None:
+            corr_rho_ps = float(_require_num(corr_cfg.get("rho_ps"), "model.likelihood.corr_error.rho_ps"))
+            if not (-0.999 < corr_rho_ps < 0.999):
+                raise _err("model.likelihood.corr_error.rho_ps", "must satisfy -0.999 < rho_ps < 0.999")
+
+        sta = corr_cfg.get("station_basis", None)
+        if corr_enabled and (not isinstance(sta, dict)):
+            raise _err("model.likelihood.corr_error.station_basis", "required when corr_error.enabled=true (expected object/dict)")
+        if isinstance(sta, dict):
+            corr_sta_ell_km = float(_require_num(_require(sta, "ell_km", "model.likelihood.corr_error.station_basis"), "model.likelihood.corr_error.station_basis.ell_km"))
+            if not (math.isfinite(corr_sta_ell_km) and corr_sta_ell_km > 0.0):
+                raise _err("model.likelihood.corr_error.station_basis.ell_km", "must be finite and > 0")
+            if "jitter" in sta and sta.get("jitter", None) is not None:
+                corr_sta_jitter = float(_require_num(sta.get("jitter"), "model.likelihood.corr_error.station_basis.jitter"))
+                if not (math.isfinite(corr_sta_jitter) and corr_sta_jitter >= 0.0):
+                    raise _err("model.likelihood.corr_error.station_basis.jitter", "must be finite and >= 0")
+            if "method" in sta and sta.get("method", None) is not None:
+                corr_sta_method = str(sta.get("method", "eigh_rbf")).strip().lower()
+            if corr_sta_method not in {"eigh_rbf"}:
+                raise _err("model.likelihood.corr_error.station_basis.method", "supported: 'eigh_rbf'")
+
+        eg = corr_cfg.get("event_graph", None)
+        if corr_enabled and (not isinstance(eg, dict)):
+            raise _err("model.likelihood.corr_error.event_graph", "required when corr_error.enabled=true (expected object/dict)")
+        if isinstance(eg, dict):
+            if "knn" in eg and eg.get("knn", None) is not None:
+                corr_knn = int(_require_num(eg.get("knn"), "model.likelihood.corr_error.event_graph.knn"))
+                if corr_knn < 1:
+                    raise _err("model.likelihood.corr_error.event_graph.knn", "must be >= 1")
+            corr_event_ell_km = float(_require_num(_require(eg, "ell_km", "model.likelihood.corr_error.event_graph"), "model.likelihood.corr_error.event_graph.ell_km"))
+            if not (math.isfinite(corr_event_ell_km) and corr_event_ell_km > 0.0):
+                raise _err("model.likelihood.corr_error.event_graph.ell_km", "must be finite and > 0")
+            if "q_diag" in eg and eg.get("q_diag", None) is not None:
+                corr_q_diag = float(_require_num(eg.get("q_diag"), "model.likelihood.corr_error.event_graph.q_diag"))
+                if not (math.isfinite(corr_q_diag) and corr_q_diag >= 0.0):
+                    raise _err("model.likelihood.corr_error.event_graph.q_diag", "must be finite and >= 0")
+            if "max_edges_per_step" in eg and eg.get("max_edges_per_step", None) is not None:
+                corr_max_edges_per_step = int(_require_num(eg.get("max_edges_per_step"), "model.likelihood.corr_error.event_graph.max_edges_per_step"))
+                if corr_max_edges_per_step < 0:
+                    raise _err("model.likelihood.corr_error.event_graph.max_edges_per_step", "must be >= 0")
+
+        if corr_enabled:
+            if corr_r <= 0:
+                raise _err("model.likelihood.corr_error.r", "required and must be >= 1 when corr_error.enabled=true")
+            if not (corr_event_ell_km > 0.0):
+                raise _err("model.likelihood.corr_error.event_graph.ell_km", "required and must be > 0 when corr_error.enabled=true")
 
     # Optional: collapsed shared-event random-effects likelihood (Gaussian, marginalized; no latent state).
     # This is intended to address "broken independence" from shared-event correlations while targeting
@@ -1644,6 +1768,19 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["likelihood"] = lk_type
     params["phase_unc"] = phase_unc
     params["_student_t_nu"] = float(student_t_nu)
+
+    # Correlated forward-model error latent (optional)
+    params["_corr_error_enabled"] = bool(corr_enabled)
+    params["_corr_error_r"] = int(corr_r)
+    params["_corr_error_tau_s"] = [float(corr_tau_ps[0]), float(corr_tau_ps[1])]
+    params["_corr_error_rho_ps"] = float(corr_rho_ps)
+    params["_corr_error_station_basis_ell_km"] = float(corr_sta_ell_km)
+    params["_corr_error_station_basis_jitter"] = float(corr_sta_jitter)
+    params["_corr_error_station_basis_method"] = str(corr_sta_method)
+    params["_corr_error_event_graph_knn"] = int(corr_knn)
+    params["_corr_error_event_graph_ell_km"] = float(corr_event_ell_km)
+    params["_corr_error_event_graph_q_diag"] = float(corr_q_diag)
+    params["_corr_error_event_graph_max_edges_per_step"] = int(corr_max_edges_per_step)
 
     # Latent field (NNGP + ESS) materialized keys (optional)
     params["_latent_field_enabled"] = bool(lf_enabled)

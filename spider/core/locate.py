@@ -1184,6 +1184,7 @@ def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=No
                 phase="phase1",
                 global_step_count=state.global_step_count,
                 noise_log_scale=None,
+            corr_error_b=getattr(state, "corr_error_b", None),
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -1544,6 +1545,7 @@ def _finalize_phase1(state: LocateState) -> None:
         phase="phase1",
         global_step_count=state.global_step_count,
         noise_log_scale=None,
+        corr_error_b=getattr(state, "corr_error_b", None),
         event_precision_matrix=state.event_precision_matrix,
     )
 
@@ -1655,6 +1657,13 @@ def _resume_or_initialize(state: LocateState):
 
     state.samples = []
     state.global_step_count = ckpt.get("global_step_count", 0)
+    # If present, stash corr_error_b to initialize the latent before sampler state is loaded.
+    try:
+        ceb = ckpt.get("corr_error_b", None)
+        if ceb is not None:
+            setattr(state, "_resume_corr_error_b", ceb)
+    except Exception:
+        pass
     state.sample_count = get_next_sample_count(state.params)
     # Clamp any resumed parameters to respect current config bounds
     try:
@@ -1822,6 +1831,7 @@ def _phase2_preconditioner(
                 phase="phase2",
                 global_step_count=state.global_step_count,
                 noise_log_scale=None,
+                corr_error_b=getattr(state, "corr_error_b", None),
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -1844,6 +1854,7 @@ def _phase2_preconditioner(
             phase="phase2",
             global_step_count=state.global_step_count,
             noise_log_scale=None,
+            corr_error_b=getattr(state, "corr_error_b", None),
             event_precision_matrix=state.event_precision_matrix,
         )
     
@@ -2165,6 +2176,7 @@ def _phase3_noise_ramp(
                 phase="phase3",
                 global_step_count=state.global_step_count,
                 noise_log_scale=None,
+                corr_error_b=getattr(state, "corr_error_b", None),
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -2187,6 +2199,7 @@ def _phase3_noise_ramp(
             phase="phase3",
             global_step_count=state.global_step_count,
             noise_log_scale=None,
+            corr_error_b=getattr(state, "corr_error_b", None),
             event_precision_matrix=state.event_precision_matrix,
         )
 
@@ -2339,6 +2352,7 @@ def _phase4_sampling(
                 phase="phase4",
                 global_step_count=state.global_step_count,
                 noise_log_scale=None,
+                corr_error_b=getattr(state, "corr_error_b", None),
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -2399,6 +2413,7 @@ def _phase4_sampling(
             phase="phase4",
             global_step_count=state.global_step_count,
             noise_log_scale=None,
+            corr_error_b=getattr(state, "corr_error_b", None),
             event_precision_matrix=state.event_precision_matrix,
         )  # type: ignore[arg-type]
     return
@@ -2406,29 +2421,26 @@ def _phase4_sampling(
 
 def _apply_sampler_group_overrides(state: "LocateState", sampler: Optional[torch.optim.Optimizer]) -> None:
     """
-    Apply per-parameter-group overrides for the uncollapsed shared_event_latent b field.
+    Apply per-parameter-group overrides for high-dimensional latent groups (e.g. corr_error).
     This is necessary because some call sites overwrite lr/temperature for *all* groups.
     """
     if sampler is None:
         return
-    if not bool(state.params.get("_shared_event_latent_enabled", False)):
-        return
     # If the user did not explicitly provide any overrides, do NOT touch group hyperparams.
     # This avoids surprising behavior and ensures global flags like sampler.freeze_preconditioner_sampling
     # apply uniformly to all parameter groups.
-    if not bool(state.params.get("_shared_event_latent_sampler_overrides_active", False)):
+    if not bool(state.params.get("_corr_error_sampler_overrides_active", False)):
         return
     try:
-        lr_mult = float(state.params.get("_shared_event_latent_lr_mult", 0.05))
-        t_mult = float(state.params.get("_shared_event_latent_temperature_mult", 0.25))
-        eps_b = float(state.params.get("_shared_event_latent_eps", 1e-3))
-        inc_gamma = bool(state.params.get("_shared_event_latent_include_gamma", False))
-        freeze_b = bool(state.params.get("_shared_event_latent_freeze_preconditioner_sampling", False))
+        lr_mult = float(state.params.get("_corr_error_lr_mult", 0.05))
+        t_mult = float(state.params.get("_corr_error_temperature_mult", 0.25))
+        eps_b = float(state.params.get("_corr_error_eps", 1e-3))
+        freeze_b = bool(state.params.get("_corr_error_freeze_preconditioner_sampling", False))
     except Exception:
-        lr_mult, t_mult, eps_b, inc_gamma, freeze_b = 0.05, 0.25, 1e-3, False, False
+        lr_mult, t_mult, eps_b, freeze_b = 0.05, 0.25, 1e-3, False
 
     for g in sampler.param_groups:
-        if str(g.get("group_name", "")).strip().lower() != "shared_event_latent":
+        if str(g.get("group_name", "")).strip().lower() != "corr_error":
             continue
         try:
             # Keep base lr/temperature as whatever caller set, then apply multipliers.
@@ -2441,8 +2453,6 @@ def _apply_sampler_group_overrides(state: "LocateState", sampler: Optional[torch
             g["temperature"] = float(g["base_temperature"]) * float(t_mult)
             # Stabilize RMSProp preconditioner/noise amplification
             g["eps"] = float(eps_b)
-            # Default to disabling gamma correction for b (less drift / fewer instabilities)
-            g["include_gamma"] = bool(inc_gamma)
             # Do not clobber the global freeze flag; if the run is in a frozen phase (Phase 4),
             # keep it frozen even if this group override isn't requesting freezing.
             g["freeze_preconditioner"] = bool(g.get("freeze_preconditioner", False)) or bool(freeze_b)
@@ -4776,6 +4786,171 @@ def _maybe_init_shared_event_latent(state: "LocateState") -> None:
     return
 
 
+@torch.no_grad()
+def _maybe_init_corr_error(state: "LocateState") -> None:
+    """
+    Optional correlated forward-model error latent (corr_error):
+
+      r_e = w_s · (b_j - b_i) + eps
+
+    where:
+      - w_s is a fixed station basis vector (n_stations, R)
+      - b is an event latent (n_events, R, 2) with a GMRF/Laplacian prior over an event kNN graph
+
+    This is designed to be pSGLD/SGHMC friendly: b is an explicit Parameter.
+    """
+    try:
+        if not bool(state.params.get("_corr_error_enabled", False)):
+            return
+    except Exception:
+        return
+
+    # Require station indices for receiver dependence.
+    if getattr(state, "row_station_index", None) is None or int(getattr(state, "n_stations", 0) or 0) <= 0:
+        warn("corr_error enabled but station indices are missing; disabling corr_error.", section="LIKELIHOOD")
+        state.params["_corr_error_enabled"] = False
+        return
+    n_stations = int(getattr(state, "n_stations", 0) or 0)
+    n_events = int(state.X_src.shape[0])
+    dev = state.device
+
+    # --- Station basis W (n_stations, R) ---
+    R = int(state.params.get("_corr_error_r", 0) or 0)
+    if R <= 0:
+        raise ValueError("corr_error.enabled=true but corr_error.r <= 0")
+    ell_sta = float(state.params.get("_corr_error_station_basis_ell_km", 0.0) or 0.0)
+    if not (ell_sta > 0.0) or (not math.isfinite(ell_sta)):
+        raise ValueError("corr_error.enabled=true but corr_error.station_basis.ell_km is not finite and > 0")
+    jitter_sta = float(state.params.get("_corr_error_station_basis_jitter", 1e-6) or 1e-6)
+
+    try:
+        sta_xy = (
+            state.dtimes.select([pl.col("sta_idx"), pl.col("X"), pl.col("Y")])
+            .unique(subset=["sta_idx"], maintain_order=True)
+            .sort("sta_idx")
+        )
+        if int(sta_xy.shape[0]) != int(n_stations):
+            raise ValueError(f"corr_error.station_basis: expected {n_stations} stations but got {int(sta_xy.shape[0])} unique sta_idx rows")
+        xy_np = sta_xy.select([pl.col("X"), pl.col("Y")]).to_numpy().astype(np.float32, copy=False)
+        XY = torch.from_numpy(xy_np).to(device=dev, dtype=torch.float32)  # (S,2)
+        D_sta = torch.cdist(XY, XY).to(torch.float32)
+        K_sta = torch.exp(-0.5 * (D_sta / float(ell_sta)).square())
+        j = 1e-6 if (not math.isfinite(jitter_sta) or jitter_sta <= 0.0) else float(jitter_sta)
+        K_sta = K_sta + (j * torch.eye(int(K_sta.shape[0]), device=dev, dtype=K_sta.dtype))
+        evals, evecs = torch.linalg.eigh(K_sta)
+        evals = evals.clamp_min(0.0)
+        if int(R) > int(evals.numel()):
+            raise ValueError(f"corr_error.station_basis: r={int(R)} exceeds n_stations={int(evals.numel())}")
+        evals_r = evals[-int(R):]
+        evecs_r = evecs[:, -int(R):]
+        W = (evecs_r * torch.sqrt(evals_r).unsqueeze(0)).to(device=dev, dtype=torch.float32)  # (S,R)
+    except Exception as e:
+        warn(f"Failed to build corr_error station_basis; disabling (err={e})", section="LIKELIHOOD")
+        state.params["_corr_error_enabled"] = False
+        return
+
+    state.corr_error_station_basis_W = W
+    state.corr_error_r = int(R)
+    state.params["_corr_error_station_basis_W"] = W
+
+    # --- Event kNN graph (u,v,w) built at MAP geometry ---
+    knn = int(state.params.get("_corr_error_event_graph_knn", 16) or 16)
+    ell_ev = float(state.params.get("_corr_error_event_graph_ell_km", 0.0) or 0.0)
+    if not (ell_ev > 0.0) or (not math.isfinite(ell_ev)):
+        raise ValueError("corr_error.enabled=true but corr_error.event_graph.ell_km is not finite and > 0")
+    q_diag = float(state.params.get("_corr_error_event_graph_q_diag", 0.0) or 0.0)
+
+    t0 = time.time()
+    X_map = (state.X_src.detach() + state.dX_src.detach())[:, :3].to(torch.float32).cpu()
+    X_np = X_map.numpy()
+    ii_np = None
+    jj_np = None
+    dd_np = None
+    used_backend = "torch_cdist"
+    try:
+        from scipy.spatial import cKDTree  # type: ignore
+        X64 = X_np.astype("float64", copy=False)
+        tree = cKDTree(X64)
+        kq = int(min(int(knn) + 1, int(n_events)))
+        try:
+            dists, nbrs = tree.query(X64, k=kq, workers=-1)
+        except TypeError:
+            try:
+                dists, nbrs = tree.query(X64, k=kq, n_jobs=-1)  # type: ignore[call-arg]
+            except TypeError:
+                dists, nbrs = tree.query(X64, k=kq)
+        dists = dists[:, 1:]
+        nbrs = nbrs[:, 1:]
+        knn_eff = int(nbrs.shape[1])
+        ii_np = np.repeat(np.arange(n_events, dtype=np.int64), knn_eff)
+        jj_np = nbrs.reshape(-1).astype(np.int64, copy=False)
+        dd_np = dists.reshape(-1).astype(np.float32, copy=False)
+        used_backend = "scipy_ckdtree"
+    except Exception:
+        # Fallback: exact O(n^2) memory/time (ok only for small n_events).
+        D = torch.cdist(X_map, X_map).to(torch.float32)
+        D.fill_diagonal_(float("inf"))
+        k_eff = int(min(int(knn), int(max(0, n_events - 1))))
+        vals, nbrs = torch.topk(D, k=k_eff, largest=False)
+        ii = torch.arange(n_events, dtype=torch.int64).unsqueeze(1).expand(-1, k_eff).reshape(-1)
+        jj = nbrs.reshape(-1).to(torch.int64)
+        dd = vals.reshape(-1).to(torch.float32)
+        ii_np = ii.numpy()
+        jj_np = jj.numpy()
+        dd_np = dd.numpy()
+        used_backend = "torch_cdist"
+
+    ww_np = np.exp(-0.5 * (dd_np / float(ell_ev)) ** 2).astype(np.float32, copy=False)
+    u = np.minimum(ii_np, jj_np).astype(np.int64, copy=False)
+    v = np.maximum(ii_np, jj_np).astype(np.int64, copy=False)
+    pairs = np.stack([u, v], axis=1)
+    uniq, inv = np.unique(pairs, axis=0, return_inverse=True)
+    w_sum = np.zeros((uniq.shape[0],), dtype=np.float64)
+    w_cnt = np.zeros((uniq.shape[0],), dtype=np.float64)
+    np.add.at(w_sum, inv, ww_np.astype(np.float64))
+    np.add.at(w_cnt, inv, 1.0)
+    w_mean = (w_sum / np.maximum(1.0, w_cnt)).astype(np.float32)
+    mask = (uniq[:, 0] != uniq[:, 1])
+    uniq = uniq[mask]
+    w_mean = w_mean[mask]
+
+    u_t = torch.tensor(uniq[:, 0], dtype=torch.int64, device=dev)
+    v_t = torch.tensor(uniq[:, 1], dtype=torch.int64, device=dev)
+    w_t = torch.tensor(w_mean, dtype=torch.float32, device=dev)
+    state.corr_error_u = u_t
+    state.corr_error_v = v_t
+    state.corr_error_w = w_t
+    state.corr_error_q_diag = float(max(0.0, q_diag))
+    state.params["_corr_error_u"] = u_t
+    state.params["_corr_error_v"] = v_t
+    state.params["_corr_error_w"] = w_t
+    state.params["_corr_error_q_diag"] = float(state.corr_error_q_diag)
+
+    # --- Initialize b (n_events, R, 2) ---
+    b0 = torch.zeros((int(n_events), int(R), 2), dtype=torch.float32, device=dev)
+    resume_b = getattr(state, "_resume_corr_error_b", None)
+    if isinstance(resume_b, torch.Tensor):
+        try:
+            b0.copy_(resume_b.to(device=dev, dtype=torch.float32))
+        except Exception:
+            pass
+        try:
+            delattr(state, "_resume_corr_error_b")
+        except Exception:
+            pass
+    state.corr_error_b = torch.nn.Parameter(b0)
+
+    dt_s = time.time() - t0
+    info(
+        "Initialized corr_error: "
+        f"b_shape=({int(n_events)},{int(R)},2) edges={int(u_t.numel())} "
+        f"ell_event_km={float(ell_ev):g} q_diag={float(state.corr_error_q_diag):g} "
+        f"ell_station_km={float(ell_sta):g} (knn_backend={used_backend}, dt={dt_s:.2f}s)",
+        section="LIKELIHOOD",
+    )
+    return
+
+
 def _maybe_estimate_eikonet_v1d_speed(state: "LocateState") -> None:
     """
     Optional diagnostic: estimate an effective 1D reference speed curve v(z) from EikoNet.
@@ -5182,6 +5357,7 @@ def locate_all(
         phase = "phase2"
 
     # Structured likelihood components (shared_event_latent/shared_event_re/slowness_re) removed.
+    _maybe_init_corr_error(state)
 
     # Set up sampler and optionally load state if resuming from sampling phases
     sampler = _setup_sampler(state)
@@ -5445,6 +5621,7 @@ def locate_sample_from_bundle(
     ckpt = None
 
     # Structured likelihood components (shared_event_latent/shared_event_re/slowness_re) removed.
+    _maybe_init_corr_error(state)
 
     sampler = _setup_sampler(state)
 
