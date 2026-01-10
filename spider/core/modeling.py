@@ -877,6 +877,7 @@ def compute_likelihood_loss(
         n_groups_fallback_diag = 0
         max_rows_seen = 0
         max_nodes_seen = 0
+        max_M_seen = 0
         # Use CPU-side boundaries for group iteration (one-time sync), then run group work on GPU.
         try:
             starts_cpu = starts.detach().cpu().numpy()
@@ -1088,6 +1089,12 @@ def compute_likelihood_loss(
                         u_g = resid_g / sigma_g.square().clamp_min(1e-24)
                         quad = quad + _CollapsedQuad.apply(resid_g, u_g)
                         continue
+
+            # Track maximum inducing size seen in this batch (useful for profiling / tuning solver thresholds).
+            try:
+                max_M_seen = max(int(max_M_seen), int(M))
+            except Exception:
+                pass
 
             # Endpoints and geometry (X_cur is already detached by construction).
             e1 = idx_g[:, 0].to(dtype=torch.int64)
@@ -1462,6 +1469,18 @@ def compute_likelihood_loss(
             params["_slowness_re_runtime_last_max_nodes"] = int(max_nodes_seen)
         except Exception:
             pass
+
+        # If profiling enabled, accumulate per-batch workload stats for epoch-level reporting.
+        if prof_sl:
+            try:
+                params["_sl_re_groups_sum"] = int(params.get("_sl_re_groups_sum", 0) or 0) + int(n_groups_total)
+                params["_sl_re_groups_woodbury_sum"] = int(params.get("_sl_re_groups_woodbury_sum", 0) or 0) + int(n_groups_woodbury)
+                params["_sl_re_groups_fallback_sum"] = int(params.get("_sl_re_groups_fallback_sum", 0) or 0) + int(n_groups_fallback_diag)
+                params["_sl_re_max_rows_max"] = max(int(params.get("_sl_re_max_rows_max", 0) or 0), int(max_rows_seen))
+                params["_sl_re_max_nodes_max"] = max(int(params.get("_sl_re_max_nodes_max", 0) or 0), int(max_nodes_seen))
+                params["_sl_re_max_M_max"] = max(int(params.get("_sl_re_max_M_max", 0) or 0), int(max_M_seen))
+            except Exception:
+                pass
 
         m_tot = float(max(int(resid.numel()), 1))
         loss_like = (quad / m_tot) + torch.log(sigma).mean()

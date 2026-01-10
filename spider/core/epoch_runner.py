@@ -518,6 +518,13 @@ def _run_epoch(
             state.params["_sl_re_solve_ms_sum"] = 0.0
             state.params["_sl_re_profiled_groups_sum"] = 0
             state.params["_sl_re_pcg_iters_sum"] = 0
+            # Workload (per batch)
+            state.params["_sl_re_groups_sum"] = 0
+            state.params["_sl_re_groups_woodbury_sum"] = 0
+            state.params["_sl_re_groups_fallback_sum"] = 0
+            state.params["_sl_re_max_rows_max"] = 0
+            state.params["_sl_re_max_nodes_max"] = 0
+            state.params["_sl_re_max_M_max"] = 0
     except Exception:
         pass
 
@@ -2178,14 +2185,25 @@ def _run_epoch(
                     metrics["slowness_re/time_ms_mean"] = float(s / float(c))
                     metrics["slowness_re/time_ms_sum"] = float(s)
                     metrics["slowness_re/time_batches"] = float(c)
+                # Grouping is measured once per batch; average over batches.
+                if c > 0:
+                    metrics["slowness_re/grouping_ms_mean"] = float(float(state.params.get("_sl_re_grouping_ms_sum", 0.0) or 0.0) / float(c))
+                # Kernel/assemble/solve are measured per *profiled group*; average over profiled groups.
                 gc = int(state.params.get("_sl_re_profiled_groups_sum", 0) or 0)
                 if gc > 0:
-                    metrics["slowness_re/grouping_ms_mean"] = float(float(state.params.get("_sl_re_grouping_ms_sum", 0.0) or 0.0) / float(gc))
                     metrics["slowness_re/kernel_ms_mean"] = float(float(state.params.get("_sl_re_kernel_ms_sum", 0.0) or 0.0) / float(gc))
                     metrics["slowness_re/assemble_ms_mean"] = float(float(state.params.get("_sl_re_assemble_ms_sum", 0.0) or 0.0) / float(gc))
                     metrics["slowness_re/solve_ms_mean"] = float(float(state.params.get("_sl_re_solve_ms_sum", 0.0) or 0.0) / float(gc))
                     metrics["slowness_re/profiled_groups"] = float(gc)
                     metrics["slowness_re/pcg_iters_mean"] = float(int(state.params.get("_sl_re_pcg_iters_sum", 0) or 0) / float(gc))
+                # Workload (means over batches + max over epoch)
+                if c > 0:
+                    metrics["slowness_re/groups_mean"] = float(int(state.params.get("_sl_re_groups_sum", 0) or 0) / float(c))
+                    metrics["slowness_re/groups_woodbury_mean"] = float(int(state.params.get("_sl_re_groups_woodbury_sum", 0) or 0) / float(c))
+                    metrics["slowness_re/groups_fallback_diag_mean"] = float(int(state.params.get("_sl_re_groups_fallback_sum", 0) or 0) / float(c))
+                    metrics["slowness_re/max_rows_max"] = float(int(state.params.get("_sl_re_max_rows_max", 0) or 0))
+                    metrics["slowness_re/max_nodes_max"] = float(int(state.params.get("_sl_re_max_nodes_max", 0) or 0))
+                    metrics["slowness_re/max_M_max"] = float(int(state.params.get("_sl_re_max_M_max", 0) or 0))
         except Exception:
             pass
         # Optional uncollapsed shared-event latent diagnostics.
