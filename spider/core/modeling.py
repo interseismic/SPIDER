@@ -477,6 +477,13 @@ def compute_likelihood_loss(
         pcg_min_inducing = int(params.get("_slowness_re_pcg_min_inducing", 128))
         pcg_min_rows = int(params.get("_slowness_re_pcg_min_rows", 2000))
 
+        # Phase id per row: 0=P, 1=S. Needed by both grouping and station-basis formulations.
+        ph_id = torch.where(
+            is_p,
+            torch.zeros_like(resid, dtype=torch.int64),
+            torch.ones_like(resid, dtype=torch.int64),
+        )
+
         # Optional: station basis for slowness_re (receiver-dependent, low-rank).
         # NOTE: This requires a per-row station index for the current batch.
         W_sta = params.get("_slowness_re_station_basis_W", None)
