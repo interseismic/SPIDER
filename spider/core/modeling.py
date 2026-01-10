@@ -619,6 +619,87 @@ def compute_likelihood_loss(
             else:
                 keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id  # type: ignore[union-attr]
 
+        # --- Bucket fast-path (event_batches + reorder_all): avoid torch.sort(keys) entirely ---
+        #
+        # If owner-buckets are built with reorder_all=true, each bucket slice is already partitioned
+        # into P then S (via _runtime_bucket_p_count). If additionally rows are ordered by
+        # (station, component) within each phase, we can form groups by a simple boundary scan.
+        use_bucket_fastpath = False
+        try:
+            use_bucket_fastpath = (
+                grouping != "phase"
+                and int(params.get("_runtime_bucket_id", -1)) >= 0
+                and bool(params.get("event_bucket_reorder_all", False))
+                and int(params.get("_runtime_bucket_p_count", -1)) >= 0
+                and isinstance(params.get("_runtime_bucket_station_index", None), torch.Tensor)
+                and isinstance(params.get("_runtime_bucket_comp_index", None), torch.Tensor)
+            )
+        except Exception:
+            use_bucket_fastpath = False
+
+        if use_bucket_fastpath:
+            sta_rt = params.get("_runtime_bucket_station_index", None)
+            comp_rt = params.get("_runtime_bucket_comp_index", None)
+            B_rt = int(resid.numel())
+            p_cnt = int(params.get("_runtime_bucket_p_count", -1))
+            if not (isinstance(sta_rt, torch.Tensor) and isinstance(comp_rt, torch.Tensor)):
+                use_bucket_fastpath = False
+            elif int(sta_rt.numel()) != B_rt or int(comp_rt.numel()) != B_rt:
+                use_bucket_fastpath = False
+            elif p_cnt < 0 or p_cnt > B_rt:
+                use_bucket_fastpath = False
+            else:
+                # Build group boundaries for P block and S block separately.
+                # Groups are constant in (station, component). Phase is implicit by block.
+                starts_list: list[torch.Tensor] = []
+                ends_list: list[torch.Tensor] = []
+                ph_list: list[int] = []
+                comp_list: list[int] = []
+
+                def _scan_block(i0: int, i1: int, ph_val: int) -> None:
+                    n = int(i1 - i0)
+                    if n <= 0:
+                        return
+                    sta = sta_rt[i0:i1].to(dtype=torch.int64)
+                    if prefer_componentwise:
+                        comp = comp_rt[i0:i1].to(dtype=torch.int64)
+                    else:
+                        # If not splitting by component, treat comp as constant to group by station only.
+                        comp = torch.zeros_like(sta)
+                    is_new = torch.ones((n,), device=sta.device, dtype=torch.bool)
+                    if n > 1:
+                        is_new[1:] = (sta[1:] != sta[:-1]) | (comp[1:] != comp[:-1])
+                    starts = torch.nonzero(is_new, as_tuple=False).reshape(-1) + int(i0)
+                    ends = torch.cat(
+                        [
+                            starts[1:],
+                            torch.tensor([int(i1)], device=starts.device, dtype=starts.dtype),
+                        ],
+                        dim=0,
+                    )
+                    starts_list.append(starts)
+                    ends_list.append(ends)
+                    # Decode representative comp id per group (CPU one-time sync).
+                    try:
+                        c0 = comp_rt.index_select(0, starts).detach().cpu().tolist()
+                    except Exception:
+                        c0 = [0 for _ in range(int(starts.numel()))]
+                    ph_list.extend([int(ph_val) for _ in range(int(starts.numel()))])
+                    comp_list.extend([int(x) for x in c0])
+
+                _scan_block(0, p_cnt, 0)
+                _scan_block(p_cnt, B_rt, 1)
+
+                if starts_list:
+                    starts = torch.cat(starts_list, dim=0)
+                    ends = torch.cat(ends_list, dim=0)
+                else:
+                    starts = torch.zeros((0,), device=resid.device, dtype=torch.int64)
+                    ends = torch.zeros((0,), device=resid.device, dtype=torch.int64)
+                perm = torch.arange(B_rt, device=resid.device, dtype=torch.int64)
+                group_ph = ph_list
+                group_comp = comp_list if prefer_componentwise else None
+
         # --- Optional caching of station_phase grouping ---
         #
         # Sorting `keys` each batch can be expensive when batch sizes are huge (100k–1M+).
@@ -631,6 +712,11 @@ def compute_likelihood_loss(
             cache_ok = False
         cache_key = None
         cache_entry = None
+        # If bucket fast-path was used, skip standard cache/sort.
+        if use_bucket_fastpath:
+            cache_ok = False
+            cache_key = None
+            cache_entry = {"perm": perm, "starts": starts, "ends": ends, "ph": group_ph, "comp": group_comp}
         if cache_ok:
             try:
                 bid = int(params.get("_runtime_batch_id", -1))

@@ -624,6 +624,14 @@ def _run_epoch(
                     state.params["_runtime_bucket_station_index"] = sta_b
                 except Exception:
                     state.params["_runtime_bucket_station_index"] = None
+                # Provide per-row component ids aligned to this bucket slice when available.
+                try:
+                    comp_b = None
+                    if reorder_all and getattr(state, "_bucket_comp_index", None) is not None:
+                        comp_b = state._bucket_comp_index[i0:i1]
+                    state.params["_runtime_bucket_comp_index"] = comp_b
+                except Exception:
+                    state.params["_runtime_bucket_comp_index"] = None
                 # Not a standard batch; clear standard ids to avoid accidental cache hits.
                 state.params["_runtime_batch_id"] = -1
                 state.params["_runtime_batch_i0"] = -1
@@ -664,6 +672,7 @@ def _run_epoch(
                         state.params["_runtime_bucket_station_index"] = None
                 except Exception:
                     state.params["_runtime_bucket_station_index"] = None
+                state.params["_runtime_bucket_comp_index"] = None
                 # Not a standard batch; clear standard ids to avoid accidental cache hits.
                 state.params["_runtime_batch_id"] = -1
                 state.params["_runtime_batch_i0"] = -1
@@ -702,6 +711,7 @@ def _run_epoch(
                     state.params["_runtime_bucket_station_index"] = None
             except Exception:
                 state.params["_runtime_bucket_station_index"] = None
+            state.params["_runtime_bucket_comp_index"] = None
 
         # --- DDP shard: split *this batch* across ranks (global batch size is the configured batch size) ---
         if ddp_enabled:

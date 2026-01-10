@@ -159,6 +159,7 @@ def _prepare_owner_buckets(
     p_counts: List[int] = []
     phase_cpu = None
     sta_cpu = None
+    comp_cpu = None
     if reorder_all:
         try:
             phase_cpu = state.YY[:, 4].detach().cpu().numpy()
@@ -169,10 +170,33 @@ def _prepare_owner_buckets(
                 sta_cpu = state.row_station_index.detach().cpu().numpy()
         except Exception:
             sta_cpu = None
+        # Optional: also sort by connected-component id (event cluster id) within each station/phase.
+        # This is mainly for correlated likelihoods like slowness_re where per-(station,phase,component)
+        # grouping is performance critical. It is opt-in to avoid extra CPU work on very large N.
+        sort_by_component = False
+        try:
+            inf = state.params.get("inference", None)
+            bat = inf.get("batching", None) if isinstance(inf, dict) else None
+            eb = bat.get("event_batches", None) if isinstance(bat, dict) else None
+            if isinstance(eb, dict):
+                sort_by_component = bool(eb.get("sort_by_component", False))
+        except Exception:
+            sort_by_component = False
+        if sort_by_component:
+            try:
+                if getattr(state, "cluster_ids", None) is not None:
+                    # Map each row -> component id via e1 index (edges do not cross components).
+                    II_cpu = state.II.detach().cpu().numpy()
+                    e1 = II_cpu[:, 0].astype(np.int64, copy=False)
+                    c_ev = state.cluster_ids.detach().cpu().numpy().astype(np.int64, copy=False)
+                    comp_cpu = c_ev[e1]
+            except Exception:
+                comp_cpu = None
 
     # If station indices are available, it can be beneficial to order each bucket by (phase, station)
     # for better memory locality in station-dependent latent models (e.g. shared_event_latent).
     sort_station_within_phase = bool(reorder_all and (sta_cpu is not None))
+    sort_comp_within_phase = bool(reorder_all and (comp_cpu is not None))
 
     for cid in range(num_chunks):
         s = int(offsets[cid]); e = int(offsets[cid + 1]); size = e - s
@@ -192,6 +216,19 @@ def _prepare_owner_buckets(
                     # Stable sort within each phase by station id.
                     p_rows = p_rows[np.argsort(sta_cpu[p_rows], kind="mergesort")]
                     s_rows = s_rows[np.argsort(sta_cpu[s_rows], kind="mergesort")]
+                if sort_comp_within_phase:
+                    # Sort within each phase by (station, component). This maximizes contiguity of
+                    # (station,phase,component) groups for correlated likelihoods.
+                    try:
+                        if sta_cpu is not None:
+                            p_rows = p_rows[np.lexsort((comp_cpu[p_rows], sta_cpu[p_rows]))]
+                            s_rows = s_rows[np.lexsort((comp_cpu[s_rows], sta_cpu[s_rows]))]
+                        else:
+                            # Phase-only: group by component if no station ids.
+                            p_rows = p_rows[np.argsort(comp_cpu[p_rows], kind="mergesort")]
+                            s_rows = s_rows[np.argsort(comp_cpu[s_rows], kind="mergesort")]
+                    except Exception:
+                        pass
                 sl = np.concatenate([p_rows, s_rows], axis=0)
                 p_counts.append(int(p_rows.size))
             else:
@@ -246,10 +283,20 @@ def _prepare_owner_buckets(
                 state._bucket_station_index = None
         except Exception:
             state._bucket_station_index = None
+        # Also stash per-row component id (connected component label), aligned with bucket order.
+        try:
+            if getattr(state, "cluster_ids", None) is not None and state._bucket_II is not None:
+                e1_b = state._bucket_II[:, 0].to(dtype=torch.int64)
+                state._bucket_comp_index = state.cluster_ids.index_select(0, e1_b).contiguous()
+            else:
+                state._bucket_comp_index = None
+        except Exception:
+            state._bucket_comp_index = None
     else:
         state._bucket_II = None
         state._bucket_YY = None
         state._bucket_station_index = None
+        state._bucket_comp_index = None
     # Per-bucket number of P rows (only meaningful when reorder_all=True and phase_cpu was available).
     try:
         if reorder_all and p_counts and (p_counts[0] >= 0):

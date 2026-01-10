@@ -100,6 +100,7 @@ class LocateState:
     _bucket_II: Optional[torch.Tensor] = None                # II reordered by bucket order (device)
     _bucket_YY: Optional[torch.Tensor] = None                # YY reordered by bucket order (device)
     _bucket_station_index: Optional[torch.Tensor] = None     # station index reordered by bucket order (device)
+    _bucket_comp_index: Optional[torch.Tensor] = None        # component id per row reordered by bucket order (device)
     _bucket_p_counts: Optional[torch.Tensor] = None          # int64 per-bucket P-row counts (when reorder_all=True)
     # Per-bucket per-phase precomputed event graph maps (when reorder_all=True).
     # These avoid per-batch torch.unique / remapping in correlated likelihood.
