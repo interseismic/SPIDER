@@ -16,6 +16,109 @@ from spider.core.modeling import (
     write_output,
 )
 from spider.utils.wandb_gates import want_wandb_group as _want_wandb_group
+from spider.optim.gauge import project_event_mean_inplace
+
+
+def _maybe_apply_gauge_projection_for_optimizer(state: LocateState, optimizer: torch.optim.Optimizer) -> None:
+    """
+    Apply gauge projection (remove translation mode) for optimizers that do NOT implement it internally.
+
+    Sampler backends in `spider.optim.*` already apply gauge projection inside their `step()` method
+    (to gradients and optionally to injected noise/momentum). Phase-1 MAP uses torch.optim.Adam,
+    which does not. This hook makes `runtime.gauge_projection` apply to locate-map as well.
+    """
+    try:
+        if not bool(state.params.get("gauge_project_enable", False)):
+            return
+    except Exception:
+        return
+
+    # Avoid double-projecting for SPIDER samplers which already do this in optimizer.step().
+    try:
+        mod = str(getattr(optimizer.__class__, "__module__", "") or "")
+        if mod.startswith("spider.optim"):
+            return
+    except Exception:
+        pass
+
+    try:
+        dims_v = state.params.get("gauge_project_dims", [0, 1, 2])
+        if not isinstance(dims_v, list) or len(dims_v) == 0:
+            dims_v = [0, 1, 2]
+        dims = tuple(int(d) for d in dims_v)
+    except Exception:
+        dims = (0, 1, 2)
+    try:
+        mode = str(state.params.get("gauge_project_mode", "global")).strip().lower()
+    except Exception:
+        mode = "global"
+    if mode not in {"global", "cluster"}:
+        mode = "global"
+
+    cid = state.cluster_ids if mode == "cluster" else None
+    cc = state.cluster_counts if mode == "cluster" else None
+
+    # Project the gradient of dX_src in-place.
+    try:
+        g = getattr(state.dX_src, "grad", None)
+        if isinstance(g, torch.Tensor) and g.ndim == 2 and int(g.shape[0]) == int(state.dX_src.shape[0]):
+            project_event_mean_inplace(g, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+    except Exception:
+        pass
+
+
+def _maybe_apply_gauge_projection_to_momentum_buffers(state: LocateState, optimizer: torch.optim.Optimizer) -> None:
+    """
+    Optionally project optimizer momentum buffers for non-sampler optimizers (e.g., Adam).
+
+    This prevents the gauge (translation) mode from accumulating in exp_avg / momentum buffers.
+    """
+    try:
+        if not bool(state.params.get("gauge_project_enable", False)):
+            return
+        if not bool(state.params.get("gauge_project_apply_momentum", True)):
+            return
+    except Exception:
+        return
+    # SPIDER samplers handle momentum/noise internally.
+    try:
+        mod = str(getattr(optimizer.__class__, "__module__", "") or "")
+        if mod.startswith("spider.optim"):
+            return
+    except Exception:
+        pass
+    try:
+        dims_v = state.params.get("gauge_project_dims", [0, 1, 2])
+        if not isinstance(dims_v, list) or len(dims_v) == 0:
+            dims_v = [0, 1, 2]
+        dims = tuple(int(d) for d in dims_v)
+    except Exception:
+        dims = (0, 1, 2)
+    try:
+        mode = str(state.params.get("gauge_project_mode", "global")).strip().lower()
+    except Exception:
+        mode = "global"
+    if mode not in {"global", "cluster"}:
+        mode = "global"
+    cid = state.cluster_ids if mode == "cluster" else None
+    cc = state.cluster_counts if mode == "cluster" else None
+
+    p = getattr(state, "dX_src", None)
+    if p is None:
+        return
+    st = getattr(optimizer, "state", {}).get(p, None)  # type: ignore[call-arg]
+    if not isinstance(st, dict):
+        return
+    # Common momentum buffer keys:
+    # - Adam/AdamW: 'exp_avg' (first moment)
+    # - SGD: 'momentum_buffer'
+    for k in ("exp_avg", "momentum_buffer"):
+        try:
+            buf = st.get(k, None)
+            if isinstance(buf, torch.Tensor) and buf.ndim == 2 and int(buf.shape[0]) == int(p.shape[0]):
+                project_event_mean_inplace(buf, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+        except Exception:
+            pass
 
 
 def _ddp_info(params: dict) -> tuple[bool, int, int, bool]:
@@ -1800,6 +1903,9 @@ def _run_epoch(
                     g[:, 3].mul_(dt_lr_mult)
         except Exception:
             pass
+
+        # Gauge projection (translation-mode removal): apply to MAP/Adam as well (sampler backends handle internally).
+        _maybe_apply_gauge_projection_for_optimizer(state, optimizer)
             
         # Clipping
         if grad_clip_norm > 0.0:
@@ -1812,6 +1918,7 @@ def _run_epoch(
         if ddp_enabled:
             _ddp_set_step_seed(state.params, int(state.global_step_count), device=state.device)
         optimizer.step()
+        _maybe_apply_gauge_projection_to_momentum_buffers(state, optimizer)
         
         # Safety Check
         if not torch.isfinite(state.dX_src).all():
