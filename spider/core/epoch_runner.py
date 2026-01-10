@@ -495,6 +495,29 @@ def _run_epoch(
             state.params["_se_re_groups_fallback_sum"] = 0
             state.params["_se_re_max_rows_max"] = 0
             state.params["_se_re_max_nodes_max"] = 0
+        # Optional profiling: collapsed slowness_re likelihood (inducing GP) cost + breakdown.
+        # Expected config location: inference.diagnostics.profile_slowness_re (bool).
+        if isinstance(diag0, dict) and bool(diag0.get("profile_slowness_re", False)):
+            # Runtime gate read by modeling.py
+            state.params["_profile_slowness_re"] = True
+            # Profiling knobs (optional)
+            try:
+                state.params["_profile_slowness_re_max_groups"] = int(diag0.get("profile_slowness_re_max_groups", 2))
+            except Exception:
+                state.params["_profile_slowness_re_max_groups"] = 2
+            try:
+                state.params["_profile_slowness_re_use_cuda_events"] = bool(diag0.get("profile_slowness_re_use_cuda_events", True))
+            except Exception:
+                state.params["_profile_slowness_re_use_cuda_events"] = True
+            # Aggregates (per-epoch)
+            state.params["_sl_re_time_ms_sum"] = 0.0
+            state.params["_sl_re_time_ms_count"] = 0
+            state.params["_sl_re_grouping_ms_sum"] = 0.0
+            state.params["_sl_re_kernel_ms_sum"] = 0.0
+            state.params["_sl_re_assemble_ms_sum"] = 0.0
+            state.params["_sl_re_solve_ms_sum"] = 0.0
+            state.params["_sl_re_profiled_groups_sum"] = 0
+            state.params["_sl_re_pcg_iters_sum"] = 0
     except Exception:
         pass
 
@@ -2143,6 +2166,26 @@ def _run_epoch(
                     metrics["shared_event_re/groups_fallback_diag_mean"] = float(int(state.params.get("_se_re_groups_fallback_sum", 0) or 0) / float(c))
                     metrics["shared_event_re/max_rows_max"] = float(int(state.params.get("_se_re_max_rows_max", 0) or 0))
                     metrics["shared_event_re/max_nodes_max"] = float(int(state.params.get("_se_re_max_nodes_max", 0) or 0))
+        except Exception:
+            pass
+        # Optional: timing + breakdown summary for collapsed slowness_re likelihood (per epoch).
+        try:
+            diag = _get_diagnostics_cfg(state.params)
+            if isinstance(diag, dict) and bool(diag.get("profile_slowness_re", False)) and bool(state.params.get("_slowness_re_enabled", False)):
+                c = int(state.params.get("_sl_re_time_ms_count", 0) or 0)
+                s = float(state.params.get("_sl_re_time_ms_sum", 0.0) or 0.0)
+                if c > 0:
+                    metrics["slowness_re/time_ms_mean"] = float(s / float(c))
+                    metrics["slowness_re/time_ms_sum"] = float(s)
+                    metrics["slowness_re/time_batches"] = float(c)
+                gc = int(state.params.get("_sl_re_profiled_groups_sum", 0) or 0)
+                if gc > 0:
+                    metrics["slowness_re/grouping_ms_mean"] = float(float(state.params.get("_sl_re_grouping_ms_sum", 0.0) or 0.0) / float(gc))
+                    metrics["slowness_re/kernel_ms_mean"] = float(float(state.params.get("_sl_re_kernel_ms_sum", 0.0) or 0.0) / float(gc))
+                    metrics["slowness_re/assemble_ms_mean"] = float(float(state.params.get("_sl_re_assemble_ms_sum", 0.0) or 0.0) / float(gc))
+                    metrics["slowness_re/solve_ms_mean"] = float(float(state.params.get("_sl_re_solve_ms_sum", 0.0) or 0.0) / float(gc))
+                    metrics["slowness_re/profiled_groups"] = float(gc)
+                    metrics["slowness_re/pcg_iters_mean"] = float(int(state.params.get("_sl_re_pcg_iters_sum", 0) or 0) / float(gc))
         except Exception:
             pass
         # Optional uncollapsed shared-event latent diagnostics.

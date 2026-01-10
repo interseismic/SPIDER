@@ -1,5 +1,6 @@
 import numpy as np
 import polars as pl
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -427,6 +428,35 @@ def compute_likelihood_loss(
     except Exception:
         sl_enable = False
     if sl_enable:
+        # Optional profiling (off by default). Enable via inference.diagnostics.profile_slowness_re=true.
+        prof_sl = bool(params.get("_profile_slowness_re", False))
+        prof_sl_use_cuda_events = False
+        prof_sl_max_groups = 0
+        if prof_sl:
+            try:
+                prof_sl_max_groups = int(params.get("_profile_slowness_re_max_groups", 2))
+            except Exception:
+                prof_sl_max_groups = 2
+            if prof_sl_max_groups < 0:
+                prof_sl_max_groups = 0
+            try:
+                prof_sl_use_cuda_events = bool(params.get("_profile_slowness_re_use_cuda_events", True))
+            except Exception:
+                prof_sl_use_cuda_events = True
+            prof_sl_use_cuda_events = bool(prof_sl_use_cuda_events and resid.is_cuda)
+            # Per-call state
+            params["_sl_re__groups_profiled_in_call"] = 0
+            if prof_sl_use_cuda_events:
+                try:
+                    e_total0 = torch.cuda.Event(enable_timing=True)
+                    e_total1 = torch.cuda.Event(enable_timing=True)
+                    e_total0.record()
+                except Exception:
+                    e_total0 = None
+                    e_total1 = None
+            else:
+                t_total0 = time.perf_counter()
+
         grouping = str(params.get("_slowness_re_grouping", "station_phase")).strip().lower()
         if grouping in {"stationphase", "station-phase"}:
             grouping = "station_phase"
@@ -579,6 +609,17 @@ def compute_likelihood_loss(
             return y0 + t * (y1 - y0)
 
         # Build group keys.
+        if prof_sl:
+            if prof_sl_use_cuda_events:
+                try:
+                    e_grp0 = torch.cuda.Event(enable_timing=True)
+                    e_grp1 = torch.cuda.Event(enable_timing=True)
+                    e_grp0.record()
+                except Exception:
+                    e_grp0 = None
+                    e_grp1 = None
+            else:
+                t_grp0 = time.perf_counter()
         #
         # IMPORTANT performance note:
         # If there are many connected components, using K_full (sum of all inducing points) can make the
@@ -816,6 +857,19 @@ def compute_likelihood_loss(
                                     pass
                 except Exception:
                     pass
+
+        # Profiling: grouping timing (keys/build/sort/cache). We count this once per slowness_re call.
+        if prof_sl:
+            try:
+                if prof_sl_use_cuda_events and e_grp0 is not None and e_grp1 is not None:
+                    e_grp1.record()
+                    e_grp1.synchronize()
+                    dt_ms = float(e_grp0.elapsed_time(e_grp1))
+                else:
+                    dt_ms = 1000.0 * float(time.perf_counter() - t_grp0)
+                params["_sl_re_grouping_ms_sum"] = float(params.get("_sl_re_grouping_ms_sum", 0.0) or 0.0) + float(dt_ms)
+            except Exception:
+                pass
 
         quad = torch.tensor(0.0, device=resid.device, dtype=resid.dtype)
         n_groups_total = 0
@@ -1082,6 +1136,27 @@ def compute_likelihood_loss(
                 continue
 
             # Kernel weights k(e,U). Prefer precomputed Matérn(3/2) at MAP for speed; fall back to dynamic eval.
+            prof_this_group = False
+            if prof_sl:
+                try:
+                    prof_this_group = int(params.get("_sl_re__groups_profiled_in_call", 0) or 0) < int(prof_sl_max_groups)
+                except Exception:
+                    prof_this_group = False
+            if prof_this_group:
+                if prof_sl_use_cuda_events:
+                    try:
+                        e_k0 = torch.cuda.Event(enable_timing=True)
+                        e_k1 = torch.cuda.Event(enable_timing=True)
+                        e_a0 = torch.cuda.Event(enable_timing=True)
+                        e_a1 = torch.cuda.Event(enable_timing=True)
+                        e_s0 = torch.cuda.Event(enable_timing=True)
+                        e_s1 = torch.cuda.Event(enable_timing=True)
+                        e_k0.record()
+                    except Exception:
+                        prof_this_group = False
+                else:
+                    t_k0 = time.perf_counter()
+
             k_map = params.get("_slowness_re_inducing_neighbor_k_matern32", None)
             if isinstance(k_map, torch.Tensor) and k_map.ndim == 2 and int(k_map.shape[0]) == int(X_src.shape[0]):
                 k_map = k_map.to(device=dev, dtype=torch.float32)
@@ -1099,6 +1174,17 @@ def compute_likelihood_loss(
             k_eu = torch.where(mask, k_eu, torch.zeros_like(k_eu))
             # 0.5 * (k(x1,U) + k(x2,U)) is represented by concatenation with a 0.5 scale
             kbar = 0.5 * k_eu  # (B,K)
+            if prof_this_group:
+                try:
+                    if prof_sl_use_cuda_events:
+                        e_k1.record()
+                        e_a0.record()
+                    else:
+                        dt_ms = 1000.0 * float(time.perf_counter() - t_k0)
+                        params["_sl_re_kernel_ms_sum"] = float(params.get("_sl_re_kernel_ms_sum", 0.0) or 0.0) + float(dt_ms)
+                        t_a0 = time.perf_counter()
+                except Exception:
+                    pass
 
             # Diagonal D = sigma^2 + FITC_diag (optional)
             s2 = sigma_g.square().clamp_min(1e-24).to(torch.float32)
@@ -1128,6 +1214,11 @@ def compute_likelihood_loss(
                 # This is typically beneficial when M is moderate/large (e.g. 100–300) and group size B is large.
                 use_pcg = bool(solver == "pcg") and (int(M) >= int(pcg_min_inducing)) and (int(B) >= int(pcg_min_rows))
                 if use_pcg:
+                    if prof_this_group and prof_sl_use_cuda_events:
+                        try:
+                            e_s0.record()
+                        except Exception:
+                            pass
                     # Kprior is cached for this block+phase later in the cholesky path; reuse that cache here too.
                     tau2 = float(tau) * float(tau)
                     inv_tau2 = float(1.0 / max(tau2, 1e-24))
@@ -1243,6 +1334,28 @@ def compute_likelihood_loss(
                         params["_slowness_re_runtime_last_pcg_iters"] = int(it_done)
                     except Exception:
                         pass
+                    # Profiling finalize (PCG group)
+                    if prof_this_group:
+                        try:
+                            params["_sl_re_pcg_iters_sum"] = int(params.get("_sl_re_pcg_iters_sum", 0) or 0) + int(it_done)
+                        except Exception:
+                            pass
+                        try:
+                            if prof_sl_use_cuda_events:
+                                e_s1.record()
+                                e_s1.synchronize()
+                                params["_sl_re_kernel_ms_sum"] = float(params.get("_sl_re_kernel_ms_sum", 0.0) or 0.0) + float(e_k0.elapsed_time(e_k1))
+                                params["_sl_re_assemble_ms_sum"] = float(params.get("_sl_re_assemble_ms_sum", 0.0) or 0.0) + float(e_a0.elapsed_time(e_s0))
+                                params["_sl_re_solve_ms_sum"] = float(params.get("_sl_re_solve_ms_sum", 0.0) or 0.0) + float(e_s0.elapsed_time(e_s1))
+                            else:
+                                params["_sl_re_assemble_ms_sum"] = float(params.get("_sl_re_assemble_ms_sum", 0.0) or 0.0) + (1000.0 * float(time.perf_counter() - t_a0))
+                        except Exception:
+                            pass
+                        try:
+                            params["_sl_re__groups_profiled_in_call"] = int(params.get("_sl_re__groups_profiled_in_call", 0) or 0) + 1
+                            params["_sl_re_profiled_groups_sum"] = int(params.get("_sl_re_profiled_groups_sum", 0) or 0) + 1
+                        except Exception:
+                            pass
                     continue
 
                 # Dense Kbar: (B,M) with Kbar[b,u] = sum_k kbar[b,k] for neighbors mapping to u.
@@ -1286,6 +1399,11 @@ def compute_likelihood_loss(
                 G[2 * M : 3 * M, 2 * M : 3 * M].add_(Kprior)
 
                 # Solve S y = rhs (best-effort; fall back to diag)
+                if prof_this_group and prof_sl_use_cuda_events:
+                    try:
+                        e_s0.record()
+                    except Exception:
+                        pass
                 try:
                     # Use cholesky with exception fallback. This avoids per-group `.item()` GPU syncs.
                     L = torch.linalg.cholesky(G)
@@ -1303,6 +1421,24 @@ def compute_likelihood_loss(
                         y = torch.cholesky_solve(rhs_vec.reshape(-1, 1), L).reshape(-1)
                     except Exception:
                         y = None
+                # Profiling finalize (Cholesky group)
+                if prof_this_group:
+                    try:
+                        if prof_sl_use_cuda_events:
+                            e_s1.record()
+                            e_s1.synchronize()
+                            params["_sl_re_kernel_ms_sum"] = float(params.get("_sl_re_kernel_ms_sum", 0.0) or 0.0) + float(e_k0.elapsed_time(e_k1))
+                            params["_sl_re_assemble_ms_sum"] = float(params.get("_sl_re_assemble_ms_sum", 0.0) or 0.0) + float(e_a0.elapsed_time(e_s0))
+                            params["_sl_re_solve_ms_sum"] = float(params.get("_sl_re_solve_ms_sum", 0.0) or 0.0) + float(e_s0.elapsed_time(e_s1))
+                        else:
+                            params["_sl_re_assemble_ms_sum"] = float(params.get("_sl_re_assemble_ms_sum", 0.0) or 0.0) + (1000.0 * float(time.perf_counter() - t_a0))
+                    except Exception:
+                        pass
+                    try:
+                        params["_sl_re__groups_profiled_in_call"] = int(params.get("_sl_re__groups_profiled_in_call", 0) or 0) + 1
+                        params["_sl_re_profiled_groups_sum"] = int(params.get("_sl_re_profiled_groups_sum", 0) or 0) + 1
+                    except Exception:
+                        pass
 
                 if y is None:
                     n_groups_fallback_diag += 1
@@ -1329,6 +1465,26 @@ def compute_likelihood_loss(
 
         m_tot = float(max(int(resid.numel()), 1))
         loss_like = (quad / m_tot) + torch.log(sigma).mean()
+        # Per-call (batch) profiling finalize.
+        if prof_sl:
+            try:
+                params["_sl_re_time_ms_count"] = int(params.get("_sl_re_time_ms_count", 0) or 0) + 1
+            except Exception:
+                pass
+            if prof_sl_use_cuda_events and "e_total0" in locals() and e_total0 is not None and e_total1 is not None:
+                try:
+                    e_total1.record()
+                    e_total1.synchronize()
+                    dt_ms = float(e_total0.elapsed_time(e_total1))
+                    params["_sl_re_time_ms_sum"] = float(params.get("_sl_re_time_ms_sum", 0.0) or 0.0) + float(dt_ms)
+                except Exception:
+                    pass
+            else:
+                try:
+                    dt_ms = 1000.0 * float(time.perf_counter() - t_total0)
+                    params["_sl_re_time_ms_sum"] = float(params.get("_sl_re_time_ms_sum", 0.0) or 0.0) + float(dt_ms)
+                except Exception:
+                    pass
         return float(alpha) * loss_like
 
     # Optional: collapsed shared-event random effects (Gaussian; marginalized b).
