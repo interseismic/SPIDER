@@ -885,6 +885,13 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     sl_plan_interpolation_outfile = None
     # FITC diagonal residual (recommended)
     sl_fitc_enabled = True
+    # Optional: fixed station-geometry basis (dimension reduction across stations) for slowness_re.
+    # This enables a receiver-dependent slowness formulation without per-station solves.
+    sl_sta_basis_enabled = False
+    sl_sta_basis_r = 0
+    sl_sta_basis_ell_km = 0.0
+    sl_sta_basis_jitter = 1e-6
+    sl_sta_basis_method = "eigh_rbf"
     # Solver for per-group Woodbury system:
     # - "cholesky" (default): exact dense solve in 3M (fast for small M)
     # - "pcg": iterative solve using sparse neighbor matvecs (better for large M and/or huge groups)
@@ -948,6 +955,28 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             sl_fallback_to_diag = bool(sl_cfg.get("fallback_to_diag", True))
         if "drop_logdet" in sl_cfg and sl_cfg.get("drop_logdet", None) is not None:
             sl_drop_logdet = bool(sl_cfg.get("drop_logdet", True))
+
+        # Optional: station basis
+        sta_basis = sl_cfg.get("station_basis", None)
+        if sta_basis is not None:
+            if not isinstance(sta_basis, dict):
+                raise _err("model.likelihood.slowness_re.station_basis", "expected object/dict or null")
+            sl_sta_basis_enabled = bool(sta_basis.get("enabled", False))
+            if sl_sta_basis_enabled:
+                sl_sta_basis_r = int(_require_num(_require(sta_basis, "r", "model.likelihood.slowness_re.station_basis"), "model.likelihood.slowness_re.station_basis.r"))
+                if sl_sta_basis_r < 1:
+                    raise _err("model.likelihood.slowness_re.station_basis.r", "must be >= 1")
+                sl_sta_basis_ell_km = float(_require_num(_require(sta_basis, "ell_km", "model.likelihood.slowness_re.station_basis"), "model.likelihood.slowness_re.station_basis.ell_km"))
+                if not (sl_sta_basis_ell_km > 0.0) or not math.isfinite(sl_sta_basis_ell_km):
+                    raise _err("model.likelihood.slowness_re.station_basis.ell_km", "must be finite and > 0")
+                if "jitter" in sta_basis and sta_basis.get("jitter", None) is not None:
+                    sl_sta_basis_jitter = float(_require_num(sta_basis.get("jitter"), "model.likelihood.slowness_re.station_basis.jitter"))
+                    if not math.isfinite(sl_sta_basis_jitter) or sl_sta_basis_jitter < 0.0:
+                        raise _err("model.likelihood.slowness_re.station_basis.jitter", "must be finite and >= 0")
+                if "method" in sta_basis and sta_basis.get("method", None) is not None:
+                    sl_sta_basis_method = str(sta_basis.get("method")).strip().lower()
+                    if sl_sta_basis_method not in {"eigh_rbf"}:
+                        raise _err("model.likelihood.slowness_re.station_basis.method", "supported: 'eigh_rbf'")
 
         if "solver" in sl_cfg and sl_cfg.get("solver", None) is not None:
             sl_solver = str(sl_cfg.get("solver", sl_solver)).strip().lower()
@@ -1765,6 +1794,12 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["_slowness_re_inducing_plan_interpolation_m"] = int(sl_plan_interpolation_m)
     params["_slowness_re_inducing_plan_interpolation_outfile"] = sl_plan_interpolation_outfile
     params["_slowness_re_inducing_fitc_enable"] = bool(sl_fitc_enabled)
+    # Station basis (optional)
+    params["_slowness_re_station_basis_enabled"] = bool(sl_sta_basis_enabled)
+    params["_slowness_re_station_basis_r"] = int(sl_sta_basis_r)
+    params["_slowness_re_station_basis_ell_km"] = float(sl_sta_basis_ell_km)
+    params["_slowness_re_station_basis_jitter"] = float(sl_sta_basis_jitter)
+    params["_slowness_re_station_basis_method"] = str(sl_sta_basis_method)
 
     # Uncollapsed shared-event latent random effects (optional)
     params["_shared_event_latent_enabled"] = bool(se_lat_enabled)

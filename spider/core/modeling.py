@@ -608,6 +608,370 @@ def compute_likelihood_loss(
             t = ((z - x0) / denom).clamp(0.0, 1.0)
             return y0 + t * (y1 - y0)
 
+        def _pcg_station_basis_solve(
+            *,
+            resid_g: torch.Tensor,          # (B,)
+            sta_g: torch.Tensor,            # (B,) int64
+            w_g: torch.Tensor,              # (B,3) float32
+            nei_loc: torch.Tensor,          # (B,K) int64 local inducing indices [0..M-1] with invalid->0
+            kbar: torch.Tensor,             # (B,K) float32 with invalid->0
+            alpha_d: torch.Tensor,          # (B,) float32 = D^{-1}
+            Kprior: torch.Tensor,           # (M,M) float32
+            W: torch.Tensor,                # (S,R) float32
+            max_iters: int,
+            tol: float,
+            check_every: int,
+        ) -> tuple[torch.Tensor, int]:
+            """
+            Basis-space PCG for station-dependent slowness_re:
+              (Kprior ⊗ I_{3R} + B^T D^{-1} B) y = B^T D^{-1} r
+            with station weights A = W[sta,:]. Returns u = D^{-1}(r - B y).
+            """
+            Bn = int(resid_g.numel())
+            K = int(nei_loc.shape[1])
+            M = int(Kprior.shape[0])
+            R = int(W.shape[1])
+            if Bn <= 0 or K <= 0 or M <= 0 or R <= 0:
+                return resid_g / torch.ones_like(resid_g).clamp_min(1e-24), 0
+
+            A = W.index_select(0, sta_g.to(torch.int64)).to(torch.float32)  # (B,R)
+            A_T = A.transpose(0, 1).contiguous()                            # (R,B)
+
+            idx_flat = nei_loc.reshape(-1).to(torch.int64)                  # (B*K,)
+            idx_exp = idx_flat.unsqueeze(0).expand(R, -1)                   # (R,B*K)
+            wx = w_g[:, 0].contiguous()
+            wy = w_g[:, 1].contiguous()
+            wz = w_g[:, 2].contiguous()
+
+            # rhs = B^T D^{-1} r
+            yr = (alpha_d * resid_g.detach().to(torch.float32)).contiguous()  # (B,)
+            rhs_x = torch.zeros((R, M), device=dev, dtype=torch.float32)
+            rhs_y = torch.zeros((R, M), device=dev, dtype=torch.float32)
+            rhs_z = torch.zeros((R, M), device=dev, dtype=torch.float32)
+            base_x = (kbar * (wx * yr).unsqueeze(1)).reshape(-1)  # (B*K,)
+            base_y = (kbar * (wy * yr).unsqueeze(1)).reshape(-1)
+            base_z = (kbar * (wz * yr).unsqueeze(1)).reshape(-1)
+            wv_x = (A_T.unsqueeze(2) * base_x.view(1, Bn, K)).reshape(R, -1)
+            wv_y = (A_T.unsqueeze(2) * base_y.view(1, Bn, K)).reshape(R, -1)
+            wv_z = (A_T.unsqueeze(2) * base_z.view(1, Bn, K)).reshape(R, -1)
+            rhs_x.scatter_add_(1, idx_exp, wv_x)
+            rhs_y.scatter_add_(1, idx_exp, wv_y)
+            rhs_z.scatter_add_(1, idx_exp, wv_z)
+            b_vec = torch.cat([rhs_x.reshape(-1), rhs_y.reshape(-1), rhs_z.reshape(-1)], dim=0)  # (3*R*M,)
+
+            # Jacobi preconditioner diag
+            k2 = (kbar * kbar).to(torch.float32)
+            a2_T = (A_T * A_T).contiguous()  # (R,B)
+            diag_x = torch.zeros((R, M), device=dev, dtype=torch.float32)
+            diag_y = torch.zeros((R, M), device=dev, dtype=torch.float32)
+            diag_z = torch.zeros((R, M), device=dev, dtype=torch.float32)
+            base_dx = (k2 * (alpha_d * (wx * wx)).unsqueeze(1)).reshape(-1)
+            base_dy = (k2 * (alpha_d * (wy * wy)).unsqueeze(1)).reshape(-1)
+            base_dz = (k2 * (alpha_d * (wz * wz)).unsqueeze(1)).reshape(-1)
+            dv_x = (a2_T.unsqueeze(2) * base_dx.view(1, Bn, K)).reshape(R, -1)
+            dv_y = (a2_T.unsqueeze(2) * base_dy.view(1, Bn, K)).reshape(R, -1)
+            dv_z = (a2_T.unsqueeze(2) * base_dz.view(1, Bn, K)).reshape(R, -1)
+            diag_x.scatter_add_(1, idx_exp, dv_x)
+            diag_y.scatter_add_(1, idx_exp, dv_y)
+            diag_z.scatter_add_(1, idx_exp, dv_z)
+            kd = torch.diagonal(Kprior).contiguous().view(1, M).expand(R, M)
+            diag_x.add_(kd)
+            diag_y.add_(kd)
+            diag_z.add_(kd)
+            diag_inv = torch.cat(
+                [
+                    (1.0 / diag_x.clamp_min(1e-12)).reshape(-1),
+                    (1.0 / diag_y.clamp_min(1e-12)).reshape(-1),
+                    (1.0 / diag_z.clamp_min(1e-12)).reshape(-1),
+                ],
+                dim=0,
+            )  # (3*R*M,)
+
+            def _A_mul(p_vec: torch.Tensor) -> torch.Tensor:
+                p = p_vec.view(3, R, M)
+                px = p[0]
+                py = p[1]
+                pz = p[2]
+                # Prior term
+                ax = (Kprior @ px.transpose(0, 1)).transpose(0, 1).contiguous()
+                ay = (Kprior @ py.transpose(0, 1)).transpose(0, 1).contiguous()
+                az = (Kprior @ pz.transpose(0, 1)).transpose(0, 1).contiguous()
+                # Data term: Bt D^{-1} B p
+                px_g = px.index_select(1, idx_flat).view(R, Bn, K)
+                py_g = py.index_select(1, idx_flat).view(R, Bn, K)
+                pz_g = pz.index_select(1, idx_flat).view(R, Bn, K)
+                dot = (wx.view(1, Bn, 1) * px_g) + (wy.view(1, Bn, 1) * py_g) + (wz.view(1, Bn, 1) * pz_g)
+                tmp = (kbar.view(1, Bn, K) * dot).sum(dim=2)  # (R,B)
+                t = (tmp * A_T).sum(dim=0)                   # (B,)
+                yb = (alpha_d * t).contiguous()              # (B,)
+                base_x2 = (kbar * (wx * yb).unsqueeze(1)).reshape(-1)
+                base_y2 = (kbar * (wy * yb).unsqueeze(1)).reshape(-1)
+                base_z2 = (kbar * (wz * yb).unsqueeze(1)).reshape(-1)
+                sv_x = (A_T.unsqueeze(2) * base_x2.view(1, Bn, K)).reshape(R, -1)
+                sv_y = (A_T.unsqueeze(2) * base_y2.view(1, Bn, K)).reshape(R, -1)
+                sv_z = (A_T.unsqueeze(2) * base_z2.view(1, Bn, K)).reshape(R, -1)
+                ax.scatter_add_(1, idx_exp, sv_x)
+                ay.scatter_add_(1, idx_exp, sv_y)
+                az.scatter_add_(1, idx_exp, sv_z)
+                return torch.cat([ax.reshape(-1), ay.reshape(-1), az.reshape(-1)], dim=0)
+
+            # PCG (optionally check every N iterations; checks incur device->host sync)
+            x = torch.zeros_like(b_vec)
+            r0 = b_vec.clone()
+            z0 = diag_inv * r0
+            p = z0.clone()
+            rz = (r0 * z0).sum()
+            bnorm = torch.sqrt((b_vec * b_vec).sum()).clamp_min(1e-12)
+            it_done = 0
+            for it in range(int(max_iters)):
+                Ap = _A_mul(p)
+                denom = (p * Ap).sum().clamp_min(1e-24)
+                a = rz / denom
+                x = x + a * p
+                r0 = r0 - a * Ap
+                it_done = it + 1
+                if int(check_every) > 0 and ((it_done % int(check_every)) == 0):
+                    rel = torch.sqrt((r0 * r0).sum()) / bnorm
+                    if float(rel) < float(tol):
+                        break
+                z1 = diag_inv * r0
+                rz_new = (r0 * z1).sum()
+                beta = rz_new / rz.clamp_min(1e-24)
+                p = z1 + beta * p
+                rz = rz_new
+
+            y = x.view(3, R, M)
+            yx = y[0]; yy2 = y[1]; yz2 = y[2]
+            yx_g = yx.index_select(1, idx_flat).view(R, Bn, K)
+            yy_g = yy2.index_select(1, idx_flat).view(R, Bn, K)
+            yz_g = yz2.index_select(1, idx_flat).view(R, Bn, K)
+            dot_y = (wx.view(1, Bn, 1) * yx_g) + (wy.view(1, Bn, 1) * yy_g) + (wz.view(1, Bn, 1) * yz_g)
+            tmp_y = (kbar.view(1, Bn, K) * dot_y).sum(dim=2)  # (R,B)
+            by = (tmp_y * A_T).sum(dim=0)                     # (B,)
+            u = alpha_d * (resid_g.detach().to(torch.float32) - by)
+            return u.to(dtype=resid_g.dtype), int(it_done)
+
+        # If station basis is enabled and W is available, use the basis formulation.
+        if use_sta_basis:
+            # Move/cached W to device.
+            W_t = params.get("_slowness_re_station_basis_W_t", None)
+            if not isinstance(W_t, torch.Tensor):
+                if not isinstance(W_sta, torch.Tensor):
+                    raise ValueError("slowness_re.station_basis enabled but W was not a torch.Tensor")
+                W_t = W_sta.to(device=dev, dtype=torch.float32).contiguous()
+                params["_slowness_re_station_basis_W_t"] = W_t
+            else:
+                W_t = W_t.to(device=dev, dtype=torch.float32)
+
+            if not bool(params.get("_slowness_re_warned_station_basis_grouping", False)):
+                if grouping == "station_phase":
+                    print("Info: slowness_re.station_basis enabled; solving per (phase,component) in station-basis space (not per-station groups).")
+                params["_slowness_re_warned_station_basis_grouping"] = True
+
+            # Component id per row (for blockwise Kuu)
+            if isinstance(cid_ev, torch.Tensor):
+                comp_row_all = cid_ev.index_select(0, idx[:, 0].to(dtype=torch.int64))
+            else:
+                comp_row_all = torch.zeros((int(idx.shape[0]),), device=dev, dtype=torch.int64)
+
+            quad = torch.tensor(0.0, device=dev, dtype=resid.dtype)
+            n_groups_total = 0
+            n_groups_woodbury = 0
+            n_groups_fallback_diag = 0
+            max_rows_seen = 0
+            max_nodes_seen = 0
+            max_M_seen = 0
+
+            # Indices per phase
+            for ph_g in (0, 1):
+                tau = float(tau_p if ph_g == 0 else tau_s)
+                sigma_g = σ_p if ph_g == 0 else σ_s
+                idxs_ph = torch.nonzero(ph_id == int(ph_g), as_tuple=False).reshape(-1)
+                if int(idxs_ph.numel()) == 0:
+                    continue
+                # For basis solve we keep all stations but still split by component blocks when available.
+                comps = torch.unique(comp_row_all.index_select(0, idxs_ph))
+                for comp_id in comps.tolist():
+                    idxs = idxs_ph[comp_row_all.index_select(0, idxs_ph) == int(comp_id)]
+                    m_g = int(idxs.numel())
+                    if m_g <= 0:
+                        continue
+                    n_groups_total += 1
+                    max_rows_seen = max(max_rows_seen, m_g)
+
+                    idx_g = idx.index_select(0, idxs)
+                    try:
+                        n_nodes = int(torch.unique(idx_g.reshape(-1)).numel())
+                    except Exception:
+                        n_nodes = m_g * 2
+                    max_nodes_seen = max(max_nodes_seen, int(n_nodes))
+                    if m_g > int(max_rows_per_group) or n_nodes > int(max_nodes_per_group):
+                        if not fallback_to_diag:
+                            raise ValueError("slowness_re.station_basis: group exceeded max_rows/max_nodes and fallback_to_diag is false.")
+                        n_groups_fallback_diag += 1
+                        resid_g = resid.index_select(0, idxs)
+                        u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                        quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                        continue
+
+                    resid_g = resid.index_select(0, idxs)
+                    if not (tau > 0.0):
+                        u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                        quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                        continue
+
+                    # Select inducing block for this component (or global).
+                    bi = -1
+                    if prefer_componentwise and isinstance(comp_to_block, torch.Tensor) and isinstance(K_blocks, list) and K_blocks:
+                        try:
+                            bi = int(comp_to_block[int(comp_id)].item())
+                        except Exception:
+                            bi = -1
+                    if have_full and isinstance(K_full, torch.Tensor):
+                        Kuu = K_full
+                        off0 = 0
+                        off1 = int(Kuu.shape[0])
+                    else:
+                        if bi < 0 or bi >= int(len(K_blocks)):
+                            if not fallback_to_diag:
+                                raise ValueError("slowness_re.station_basis: missing inducing block for component.")
+                            n_groups_fallback_diag += 1
+                            u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                            quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                            continue
+                        Kuu = K_blocks[bi].to(device=dev, dtype=torch.float32)
+                        off0 = int(offs[bi].item())
+                        off1 = int(offs[bi + 1].item())
+                    M = int(Kuu.shape[0])
+                    max_M_seen = max(max_M_seen, int(M))
+
+                    # Endpoints and geometry
+                    e1 = idx_g[:, 0].to(dtype=torch.int64)
+                    e2 = idx_g[:, 1].to(dtype=torch.int64)
+                    x1 = X_cur.index_select(0, e1)
+                    x2 = X_cur.index_select(0, e2)
+                    dx = x2 - x1
+                    if tau_units == "vel_frac":
+                        zbar = 0.5 * (x1[:, 2] + x2[:, 2])
+                        if isinstance(zc, torch.Tensor) and isinstance(vp, torch.Tensor) and isinstance(vs, torch.Tensor):
+                            v = _interp1d_linear(zbar.to(torch.float32), zc.to(torch.float32), (vp if ph_g == 0 else vs).to(torch.float32))
+                        else:
+                            v = torch.full((int(zbar.numel()),), 6.0 if ph_g == 0 else 3.5, device=dev, dtype=torch.float32)
+                        w = (dx * (1.0 / v.clamp_min(1e-3)).unsqueeze(1)).to(torch.float32)
+                    else:
+                        w = dx.to(torch.float32)
+
+                    # Neighbor rows
+                    nei1 = nei_idx_ev.index_select(0, e1)
+                    nei2 = nei_idx_ev.index_select(0, e2)
+                    nei_g = torch.cat([nei1, nei2], dim=1)
+                    mask = (nei_g >= 0)
+                    nei_clamped = torch.where(mask, nei_g, torch.zeros_like(nei_g))
+                    in_block = (nei_clamped >= int(off0)) & (nei_clamped < int(off1))
+                    mask = mask & in_block
+                    nei_loc = (nei_clamped - int(off0)).to(torch.int64)
+                    nei_loc = torch.where(mask, nei_loc, torch.zeros_like(nei_loc))
+                    Bg = int(nei_loc.shape[0])
+                    Kg = int(nei_loc.shape[1])
+                    if Kg <= 0:
+                        n_groups_fallback_diag += 1
+                        u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                        quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                        continue
+
+                    # Kernel weights (event->inducing)
+                    k_map = params.get("_slowness_re_inducing_neighbor_k_matern32", None)
+                    if isinstance(k_map, torch.Tensor) and k_map.ndim == 2 and int(k_map.shape[0]) == int(X_src.shape[0]):
+                        k_map = k_map.to(device=dev, dtype=torch.float32)
+                        k1 = k_map.index_select(0, e1)
+                        k2 = k_map.index_select(0, e2)
+                        k_eu = torch.cat([k1, k2], dim=1)
+                    else:
+                        U = inducing_xyz.index_select(0, nei_clamped.reshape(-1)).reshape(Bg, Kg, 3)
+                        xe = torch.cat(
+                            [x1.unsqueeze(1).expand(Bg, Kg // 2, 3), x2.unsqueeze(1).expand(Bg, Kg // 2, 3)],
+                            dim=1,
+                        )
+                        d = torch.linalg.norm(U - xe, dim=2)
+                        k_eu = _matern32(d, ell_km)
+                    k_eu = torch.where(mask, k_eu, torch.zeros_like(k_eu))
+                    kbar = 0.5 * k_eu
+
+                    # Diagonal D and alpha
+                    s2 = sigma_g.square().clamp_min(1e-24).to(torch.float32)
+                    if isinstance(fitc_resid_ev, torch.Tensor):
+                        lam1 = fitc_resid_ev.index_select(0, e1).to(torch.float32)
+                        lam2 = fitc_resid_ev.index_select(0, e2).to(torch.float32)
+                        lam_bar = 0.5 * (lam1 + lam2)
+                        w2 = (w * w).sum(dim=1).to(torch.float32)
+                        diag_extra = (float(tau) * float(tau)) * (lam_bar.clamp_min(0.0)) * w2
+                        D = (s2 + diag_extra).clamp_min(1e-24)
+                    else:
+                        D = s2.expand(Bg).clamp_min(1e-24)
+                    alpha_d = (1.0 / D).to(torch.float32)
+
+                    # Prior precision Kprior = (1/tau^2)Kuu
+                    inv_tau2 = float(1.0 / max(float(tau) * float(tau), 1e-24))
+                    Kprior = (inv_tau2 * Kuu).to(device=dev, dtype=torch.float32)
+
+                    sta_g = sta_idx.index_select(0, idxs).to(torch.int64)  # (B,)
+                    with torch.no_grad():
+                        u_float, it_done = _pcg_station_basis_solve(
+                            resid_g=resid_g,
+                            sta_g=sta_g,
+                            w_g=w,
+                            nei_loc=nei_loc,
+                            kbar=kbar.to(torch.float32),
+                            alpha_d=alpha_d,
+                            Kprior=Kprior,
+                            W=W_t,
+                            max_iters=int(pcg_max_iters),
+                            tol=float(pcg_tol),
+                            check_every=int(pcg_check_every),
+                        )
+                    n_groups_woodbury += 1
+                    quad = quad + _CollapsedQuad.apply(resid_g, u_float)
+                    if prof_sl:
+                        try:
+                            params["_sl_re_pcg_iters_sum"] = int(params.get("_sl_re_pcg_iters_sum", 0) or 0) + int(it_done)
+                        except Exception:
+                            pass
+
+            # Stash stats for caller + profiler
+            try:
+                params["_slowness_re_runtime_last_grouping"] = "station_basis"
+                params["_slowness_re_runtime_last_groups"] = int(n_groups_total)
+                params["_slowness_re_runtime_last_groups_woodbury"] = int(n_groups_woodbury)
+                params["_slowness_re_runtime_last_groups_fallback_diag"] = int(n_groups_fallback_diag)
+                params["_slowness_re_runtime_last_max_rows"] = int(max_rows_seen)
+                params["_slowness_re_runtime_last_max_nodes"] = int(max_nodes_seen)
+            except Exception:
+                pass
+
+            m_tot = float(max(int(resid.numel()), 1))
+            loss_like = (quad / m_tot) + torch.log(sigma).mean()
+            # Profiling finalize (total time)
+            if prof_sl:
+                try:
+                    params["_sl_re_time_ms_count"] = int(params.get("_sl_re_time_ms_count", 0) or 0) + 1
+                except Exception:
+                    pass
+                if prof_sl_use_cuda_events and "e_total0" in locals() and e_total0 is not None and e_total1 is not None:
+                    try:
+                        e_total1.record()
+                        e_total1.synchronize()
+                        dt_ms = float(e_total0.elapsed_time(e_total1))
+                        params["_sl_re_time_ms_sum"] = float(params.get("_sl_re_time_ms_sum", 0.0) or 0.0) + float(dt_ms)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        dt_ms = 1000.0 * float(time.perf_counter() - t_total0)
+                        params["_sl_re_time_ms_sum"] = float(params.get("_sl_re_time_ms_sum", 0.0) or 0.0) + float(dt_ms)
+                    except Exception:
+                        pass
+            return float(alpha) * loss_like
+
         # Build group keys.
         if prof_sl:
             if prof_sl_use_cuda_events:

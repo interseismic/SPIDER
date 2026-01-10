@@ -64,6 +64,43 @@ def _build_initial_state(
         row_station_index = None
         n_stations = 0
 
+    # Optional: station-geometry basis for slowness_re (dimension reduction across stations).
+    # This is rebuilt at runtime and stored in params for modeling.py (it is not a Parameter).
+    try:
+        use_sl_sta_basis = bool(params.get("_slowness_re_station_basis_enabled", False))
+    except Exception:
+        use_sl_sta_basis = False
+    if use_sl_sta_basis and (row_station_index is not None) and (n_stations > 0):
+        try:
+            r_sta = int(params.get("_slowness_re_station_basis_r", 0) or 0)
+            ell_sta = float(params.get("_slowness_re_station_basis_ell_km", 0.0) or 0.0)
+            jitter_sta = float(params.get("_slowness_re_station_basis_jitter", 1e-6) or 1e-6)
+            method = str(params.get("_slowness_re_station_basis_method", "eigh_rbf")).strip().lower()
+            if r_sta >= 1 and r_sta <= int(n_stations) and method == "eigh_rbf" and (ell_sta > 0.0):
+                if "sta_idx" in dtimes.columns and "X" in dtimes.columns and "Y" in dtimes.columns:
+                    sta_xy = (
+                        dtimes.select([pl.col("sta_idx"), pl.col("X"), pl.col("Y")])
+                        .unique(subset=["sta_idx"], maintain_order=True)
+                        .sort("sta_idx")
+                    )
+                    xy_np = sta_xy.select([pl.col("X"), pl.col("Y")]).to_numpy().astype(np.float32, copy=False)
+                    XY = torch.from_numpy(xy_np).to(device=device, dtype=torch.float32)
+                    D_sta = torch.cdist(XY, XY).to(torch.float32)
+                    K_sta = torch.exp(-0.5 * (D_sta / float(ell_sta)).square())
+                    j = 1e-6 if (not math.isfinite(jitter_sta) or jitter_sta <= 0.0) else float(jitter_sta)
+                    K_sta = K_sta + (j * torch.eye(int(K_sta.shape[0]), device=device, dtype=K_sta.dtype))
+                    evals, evecs = torch.linalg.eigh(K_sta)
+                    evals = evals.clamp_min(0.0)
+                    evals_r = evals[-r_sta:]
+                    evecs_r = evecs[:, -r_sta:]
+                    W_sta = evecs_r * torch.sqrt(evals_r).unsqueeze(0)  # (S,R)
+                    # Store on CPU in params (bundle-friendly); modeling.py will move to device as needed.
+                    params["_slowness_re_station_basis_W"] = W_sta.detach().to("cpu", dtype=torch.float32).contiguous()
+                    params["_slowness_re_station_basis_r_runtime"] = int(r_sta)
+        except Exception:
+            # If basis build fails, silently fall back to no basis.
+            pass
+
     projector = Proj(
         proj="laea",
         lat_0=params["lat_min"],
