@@ -835,6 +835,17 @@ def compute_likelihood_loss(
             comp_to_block_cpu = None
             offs_cpu = None
 
+        # Cache device-resident Kuu blocks and per-phase Kprior=(1/tau^2)Kuu to avoid repeated host->device
+        # copies and repeated scaling inside the group loop.
+        kuu_dev_cache = None
+        kprior_cache = None
+        try:
+            kuu_dev_cache = params.setdefault("_slowness_re_kuu_device_cache", {})
+            kprior_cache = params.setdefault("_slowness_re_kprior_cache", {})
+        except Exception:
+            kuu_dev_cache = None
+            kprior_cache = None
+
         # main group loop
         if starts_cpu is not None and ends_cpu is not None and isinstance(group_ph, list) and len(group_ph) == int(starts.numel()):
             if prefer_componentwise and isinstance(group_comp, list) and len(group_comp) == int(starts.numel()):
@@ -901,6 +912,7 @@ def compute_likelihood_loss(
 
             # Choose K_UU block and inducing index window.
             # Prefer component-wise blocks when there are multiple components.
+            bi = -1
             if prefer_componentwise:
                 # Ensure we have a component id (decode from key when possible; else fall back to GPU).
                 if comp_id is None:
@@ -920,7 +932,29 @@ def compute_likelihood_loss(
                     u_g = resid_g / sigma_g.square().clamp_min(1e-24)
                     quad = quad + _CollapsedQuad.apply(resid_g, u_g)
                     continue
-                Kuu = K_blocks[bi].to(device=dev, dtype=torch.float32)
+                # Get device-resident Kuu for this block (cache to avoid repeated .to()).
+                Kuu = None
+                try:
+                    if isinstance(kuu_dev_cache, dict) and int(bi) in kuu_dev_cache:
+                        Kuu = kuu_dev_cache[int(bi)]
+                except Exception:
+                    Kuu = None
+                if not (isinstance(Kuu, torch.Tensor) and (Kuu.device == dev) and (Kuu.dtype == torch.float32)):
+                    Kuu0 = K_blocks[bi]
+                    if not isinstance(Kuu0, torch.Tensor):
+                        n_groups_fallback_diag += 1
+                        u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                        quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                        continue
+                    if (Kuu0.device != dev) or (Kuu0.dtype != torch.float32):
+                        Kuu = Kuu0.to(device=dev, dtype=torch.float32)
+                    else:
+                        Kuu = Kuu0
+                    try:
+                        if isinstance(kuu_dev_cache, dict):
+                            kuu_dev_cache[int(bi)] = Kuu
+                    except Exception:
+                        pass
                 try:
                     if offs_cpu is not None:
                         off0 = int(offs_cpu[int(bi)])
@@ -961,7 +995,29 @@ def compute_likelihood_loss(
                         u_g = resid_g / sigma_g.square().clamp_min(1e-24)
                         quad = quad + _CollapsedQuad.apply(resid_g, u_g)
                         continue
-                    Kuu = K_blocks[bi].to(device=dev, dtype=torch.float32)
+                    # Cache device-resident Kuu
+                    Kuu = None
+                    try:
+                        if isinstance(kuu_dev_cache, dict) and int(bi) in kuu_dev_cache:
+                            Kuu = kuu_dev_cache[int(bi)]
+                    except Exception:
+                        Kuu = None
+                    if not (isinstance(Kuu, torch.Tensor) and (Kuu.device == dev) and (Kuu.dtype == torch.float32)):
+                        Kuu0 = K_blocks[bi]
+                        if not isinstance(Kuu0, torch.Tensor):
+                            n_groups_fallback_diag += 1
+                            u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                            quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                            continue
+                        if (Kuu0.device != dev) or (Kuu0.dtype != torch.float32):
+                            Kuu = Kuu0.to(device=dev, dtype=torch.float32)
+                        else:
+                            Kuu = Kuu0
+                        try:
+                            if isinstance(kuu_dev_cache, dict):
+                                kuu_dev_cache[int(bi)] = Kuu
+                        except Exception:
+                            pass
                     off0 = int(offs[bi].item())
                     off1 = int(offs[bi + 1].item())
                     M = int(Kuu.shape[0])
@@ -1078,25 +1134,46 @@ def compute_likelihood_loss(
                 rhs_vec = WB.transpose(0, 1) @ wr      # (3M,)
 
                 # Add prior term A^{-1} = (1/tau^2) * (Kuu ⊗ I3)
-                inv_tau2 = float(1.0 / (float(tau) * float(tau)))
-                # We only need Kuu for this block; use a block-diagonal add.
-                Kprior = (inv_tau2 * Kuu.to(device=dev, dtype=torch.float32))
-                G = BtDB + torch.block_diag(Kprior, Kprior, Kprior)
+                tau2 = float(tau) * float(tau)
+                inv_tau2 = float(1.0 / max(tau2, 1e-24))
+                # Cache Kprior=(1/tau^2)Kuu per (block, phase). For K_full mode use bi=-1.
+                Kprior = None
+                try:
+                    if isinstance(kprior_cache, dict):
+                        Kprior = kprior_cache.get((int(bi), int(ph_g)), None)
+                except Exception:
+                    Kprior = None
+                if not (isinstance(Kprior, torch.Tensor) and (Kprior.device == dev) and (Kprior.dtype == torch.float32) and int(Kprior.shape[0]) == int(M)):
+                    Kprior = (inv_tau2 * Kuu).to(device=dev, dtype=torch.float32)
+                    try:
+                        if isinstance(kprior_cache, dict):
+                            kprior_cache[(int(bi), int(ph_g))] = Kprior
+                    except Exception:
+                        pass
+                # Avoid allocating a separate block-diagonal matrix: add Kprior into the 3 diagonal blocks in-place.
+                G = BtDB
+                G[0:M, 0:M].add_(Kprior)
+                G[M : 2 * M, M : 2 * M].add_(Kprior)
+                G[2 * M : 3 * M, 2 * M : 3 * M].add_(Kprior)
 
                 # Solve S y = rhs (best-effort; fall back to diag)
                 try:
-                    # Prefer cholesky_ex to avoid Python exception overhead in the common case.
-                    L, info0 = torch.linalg.cholesky_ex(G)
-                    if int(info0.item()) != 0:
-                        # Escalate jitter a bit (rare)
-                        j = 1e-4
-                        I = torch.eye(int(G.shape[0]), device=dev, dtype=G.dtype)
-                        L, info1 = torch.linalg.cholesky_ex(G + (j * I))
-                        if int(info1.item()) != 0:
-                            raise RuntimeError("cholesky failed")
+                    # Use cholesky with exception fallback. This avoids per-group `.item()` GPU syncs.
+                    L = torch.linalg.cholesky(G)
                     y = torch.cholesky_solve(rhs_vec.reshape(-1, 1), L).reshape(-1)  # (3M,)
                 except Exception:
-                    y = None
+                    # Escalate jitter on diagonal and retry once (rare).
+                    try:
+                        j = float(params.get("_slowness_re_cholesky_jitter", 1e-4))
+                    except Exception:
+                        j = 1e-4
+                    try:
+                        if j > 0.0:
+                            G.diagonal().add_(float(j))
+                        L = torch.linalg.cholesky(G)
+                        y = torch.cholesky_solve(rhs_vec.reshape(-1, 1), L).reshape(-1)
+                    except Exception:
+                        y = None
 
                 if y is None:
                     n_groups_fallback_diag += 1
