@@ -430,6 +430,9 @@ def compute_likelihood_loss(
         grouping = str(params.get("_slowness_re_grouping", "station_phase")).strip().lower()
         if grouping in {"stationphase", "station-phase"}:
             grouping = "station_phase"
+        solver = str(params.get("_slowness_re_solver", "cholesky")).strip().lower()
+        if solver in {"chol"}:
+            solver = "cholesky"
         tau_ps = params.get("_slowness_re_tau_s", [0.0, 0.0])
         tau_p = float(tau_ps[0]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
         tau_s = float(tau_ps[1]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
@@ -438,6 +441,11 @@ def compute_likelihood_loss(
         max_rows_per_group = int(params.get("_slowness_re_max_rows_per_group", 200000))
         max_nodes_per_group = int(params.get("_slowness_re_max_nodes_per_group", 2048))
         fallback_to_diag = bool(params.get("_slowness_re_fallback_to_diag", True))
+        pcg_max_iters = int(params.get("_slowness_re_pcg_max_iters", 30))
+        pcg_tol = float(params.get("_slowness_re_pcg_tol", 1e-4))
+        pcg_check_every = int(params.get("_slowness_re_pcg_check_every", 0))
+        pcg_min_inducing = int(params.get("_slowness_re_pcg_min_inducing", 128))
+        pcg_min_rows = int(params.get("_slowness_re_pcg_min_rows", 2000))
 
         # We currently rely on a homoscedastic base sigma and incorporate only our own diagonal correction (FITC).
         # sigma_extra_var may already have been applied above (e.g., by shared_event_latent); we accept it here.
@@ -1116,6 +1124,127 @@ def compute_likelihood_loss(
             # Solve path: do NOT build autograd graphs here (covariance depends on detached X_cur anyway,
             # and _CollapsedQuad applies the correct d/dr=u without differentiating through the solve).
             with torch.no_grad():
+                # Optional PCG solver in 3M that avoids forming BtDB / cholesky.
+                # This is typically beneficial when M is moderate/large (e.g. 100–300) and group size B is large.
+                use_pcg = bool(solver == "pcg") and (int(M) >= int(pcg_min_inducing)) and (int(B) >= int(pcg_min_rows))
+                if use_pcg:
+                    # Kprior is cached for this block+phase later in the cholesky path; reuse that cache here too.
+                    tau2 = float(tau) * float(tau)
+                    inv_tau2 = float(1.0 / max(tau2, 1e-24))
+                    Kprior = None
+                    try:
+                        if isinstance(kprior_cache, dict):
+                            Kprior = kprior_cache.get((int(bi), int(ph_g)), None)
+                    except Exception:
+                        Kprior = None
+                    if not (isinstance(Kprior, torch.Tensor) and (Kprior.device == dev) and (Kprior.dtype == torch.float32) and int(Kprior.shape[0]) == int(M)):
+                        Kprior = (inv_tau2 * Kuu).to(device=dev, dtype=torch.float32)
+                        try:
+                            if isinstance(kprior_cache, dict):
+                                kprior_cache[(int(bi), int(ph_g))] = Kprior
+                        except Exception:
+                            pass
+
+                    idx_flat = nei_loc.reshape(-1).to(dtype=torch.int64)
+                    wx = w_f[:, 0].contiguous()
+                    wy = w_f[:, 1].contiguous()
+                    wz = w_f[:, 2].contiguous()
+
+                    # rhs = B^T D^{-1} r
+                    yr = (alpha_d * resid_g.detach().to(torch.float32)).contiguous()  # (B,)
+                    rhs_x = torch.zeros((M,), device=dev, dtype=torch.float32)
+                    rhs_y = torch.zeros((M,), device=dev, dtype=torch.float32)
+                    rhs_z = torch.zeros((M,), device=dev, dtype=torch.float32)
+                    rhs_x.scatter_add_(0, idx_flat, (kbar * (wx * yr).unsqueeze(1)).reshape(-1))
+                    rhs_y.scatter_add_(0, idx_flat, (kbar * (wy * yr).unsqueeze(1)).reshape(-1))
+                    rhs_z.scatter_add_(0, idx_flat, (kbar * (wz * yr).unsqueeze(1)).reshape(-1))
+                    b_vec = torch.cat([rhs_x, rhs_y, rhs_z], dim=0)  # (3M,)
+
+                    # Jacobi preconditioner: diag(Kprior) + diag(B^T D^{-1} B) per dimension.
+                    k2 = (kbar * kbar).to(torch.float32)
+                    diag_x = torch.zeros((M,), device=dev, dtype=torch.float32)
+                    diag_y = torch.zeros((M,), device=dev, dtype=torch.float32)
+                    diag_z = torch.zeros((M,), device=dev, dtype=torch.float32)
+                    diag_x.scatter_add_(0, idx_flat, (k2 * (alpha_d * (wx * wx)).unsqueeze(1)).reshape(-1))
+                    diag_y.scatter_add_(0, idx_flat, (k2 * (alpha_d * (wy * wy)).unsqueeze(1)).reshape(-1))
+                    diag_z.scatter_add_(0, idx_flat, (k2 * (alpha_d * (wz * wz)).unsqueeze(1)).reshape(-1))
+                    kd = torch.diagonal(Kprior).contiguous()
+                    diag_x.add_(kd)
+                    diag_y.add_(kd)
+                    diag_z.add_(kd)
+                    diag_inv = torch.cat(
+                        [
+                            (1.0 / diag_x.clamp_min(1e-12)),
+                            (1.0 / diag_y.clamp_min(1e-12)),
+                            (1.0 / diag_z.clamp_min(1e-12)),
+                        ],
+                        dim=0,
+                    )
+
+                    def _A_mul(p_vec: torch.Tensor) -> torch.Tensor:
+                        px = p_vec[0:M]
+                        py = p_vec[M : 2 * M]
+                        pz = p_vec[2 * M : 3 * M]
+                        # Kprior ⊗ I3 term
+                        ax = Kprior @ px
+                        ay = Kprior @ py
+                        az = Kprior @ pz
+                        # BtDB term via sparse neighbor matvecs
+                        px_g = torch.index_select(px, 0, idx_flat).reshape(B, K)
+                        py_g = torch.index_select(py, 0, idx_flat).reshape(B, K)
+                        pz_g = torch.index_select(pz, 0, idx_flat).reshape(B, K)
+                        t = (kbar * (wx.unsqueeze(1) * px_g + wy.unsqueeze(1) * py_g + wz.unsqueeze(1) * pz_g)).sum(dim=1)  # (B,)
+                        yb = (alpha_d * t).contiguous()
+                        ax.scatter_add_(0, idx_flat, (kbar * (wx * yb).unsqueeze(1)).reshape(-1))
+                        ay.scatter_add_(0, idx_flat, (kbar * (wy * yb).unsqueeze(1)).reshape(-1))
+                        az.scatter_add_(0, idx_flat, (kbar * (wz * yb).unsqueeze(1)).reshape(-1))
+                        return torch.cat([ax, ay, az], dim=0)
+
+                    # Fixed-iteration PCG (no early-exit by default to avoid per-iter device sync).
+                    x = torch.zeros_like(b_vec)
+                    r = b_vec.clone()
+                    z = diag_inv * r
+                    p = z.clone()
+                    rz = (r * z).sum()
+                    bnorm = torch.sqrt((b_vec * b_vec).sum()).clamp_min(1e-12)
+                    it_done = 0
+                    for it in range(int(pcg_max_iters)):
+                        Ap = _A_mul(p)
+                        denom = (p * Ap).sum().clamp_min(1e-24)
+                        a = rz / denom
+                        x = x + a * p
+                        r = r - a * Ap
+                        it_done = it + 1
+                        if int(pcg_check_every) > 0 and ((it_done % int(pcg_check_every)) == 0):
+                            rel = torch.sqrt((r * r).sum()) / bnorm
+                            if float(rel) < float(pcg_tol):
+                                break
+                        z = diag_inv * r
+                        rz_new = (r * z).sum()
+                        beta = rz_new / rz.clamp_min(1e-24)
+                        p = z + beta * p
+                        rz = rz_new
+
+                    y = x
+                    # u = D^{-1}(r - B y)
+                    yx = y[0:M]
+                    yy = y[M : 2 * M]
+                    yz = y[2 * M : 3 * M]
+                    yx_g = torch.index_select(yx, 0, idx_flat).reshape(B, K)
+                    yy_g = torch.index_select(yy, 0, idx_flat).reshape(B, K)
+                    yz_g = torch.index_select(yz, 0, idx_flat).reshape(B, K)
+                    by = (kbar * (wx.unsqueeze(1) * yx_g + wy.unsqueeze(1) * yy_g + wz.unsqueeze(1) * yz_g)).sum(dim=1)  # (B,)
+                    u_g = alpha_d * (resid_g.detach().to(torch.float32) - by)
+                    u_g = u_g.to(dtype=resid_g.dtype)
+                    n_groups_woodbury += 1
+                    quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                    try:
+                        params["_slowness_re_runtime_last_solver"] = "pcg"
+                        params["_slowness_re_runtime_last_pcg_iters"] = int(it_done)
+                    except Exception:
+                        pass
+                    continue
+
                 # Dense Kbar: (B,M) with Kbar[b,u] = sum_k kbar[b,k] for neighbors mapping to u.
                 Kbar_dense = torch.zeros((B, M), device=dev, dtype=torch.float32)
                 # nei_loc is (B,K) with invalid entries mapped to 0 and kbar already zeroed for invalid => safe scatter_add

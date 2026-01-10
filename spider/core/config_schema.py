@@ -885,6 +885,15 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     sl_plan_interpolation_outfile = None
     # FITC diagonal residual (recommended)
     sl_fitc_enabled = True
+    # Solver for per-group Woodbury system:
+    # - "cholesky" (default): exact dense solve in 3M (fast for small M)
+    # - "pcg": iterative solve using sparse neighbor matvecs (better for large M and/or huge groups)
+    sl_solver = "cholesky"
+    sl_pcg_max_iters = 30
+    sl_pcg_tol = 1e-4
+    sl_pcg_check_every = 0
+    sl_pcg_min_inducing = 128
+    sl_pcg_min_rows = 2000
     if isinstance(sl_cfg, dict):
         sl_enabled = bool(sl_cfg.get("enabled", False))
         if "grouping" in sl_cfg and sl_cfg.get("grouping", None) is not None:
@@ -939,6 +948,35 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             sl_fallback_to_diag = bool(sl_cfg.get("fallback_to_diag", True))
         if "drop_logdet" in sl_cfg and sl_cfg.get("drop_logdet", None) is not None:
             sl_drop_logdet = bool(sl_cfg.get("drop_logdet", True))
+
+        if "solver" in sl_cfg and sl_cfg.get("solver", None) is not None:
+            sl_solver = str(sl_cfg.get("solver", sl_solver)).strip().lower()
+        if sl_solver in {"chol", "cholesky"}:
+            sl_solver = "cholesky"
+        if sl_solver not in {"cholesky", "pcg"}:
+            raise _err("model.likelihood.slowness_re.solver", "supported: 'cholesky', 'pcg'")
+        pcg = sl_cfg.get("pcg", None)
+        if isinstance(pcg, dict):
+            if "max_iters" in pcg and pcg.get("max_iters", None) is not None:
+                sl_pcg_max_iters = int(_require_num(pcg.get("max_iters"), "model.likelihood.slowness_re.pcg.max_iters"))
+                if sl_pcg_max_iters < 1:
+                    raise _err("model.likelihood.slowness_re.pcg.max_iters", "must be >= 1")
+            if "tol" in pcg and pcg.get("tol", None) is not None:
+                sl_pcg_tol = float(_require_num(pcg.get("tol"), "model.likelihood.slowness_re.pcg.tol"))
+                if (not math.isfinite(sl_pcg_tol)) or (not (sl_pcg_tol > 0.0)):
+                    raise _err("model.likelihood.slowness_re.pcg.tol", "must be finite and > 0")
+            if "check_every" in pcg and pcg.get("check_every", None) is not None:
+                sl_pcg_check_every = int(_require_num(pcg.get("check_every"), "model.likelihood.slowness_re.pcg.check_every"))
+                if sl_pcg_check_every < 0:
+                    raise _err("model.likelihood.slowness_re.pcg.check_every", "must be >= 0")
+            if "min_inducing" in pcg and pcg.get("min_inducing", None) is not None:
+                sl_pcg_min_inducing = int(_require_num(pcg.get("min_inducing"), "model.likelihood.slowness_re.pcg.min_inducing"))
+                if sl_pcg_min_inducing < 1:
+                    raise _err("model.likelihood.slowness_re.pcg.min_inducing", "must be >= 1")
+            if "min_rows" in pcg and pcg.get("min_rows", None) is not None:
+                sl_pcg_min_rows = int(_require_num(pcg.get("min_rows"), "model.likelihood.slowness_re.pcg.min_rows"))
+                if sl_pcg_min_rows < 1:
+                    raise _err("model.likelihood.slowness_re.pcg.min_rows", "must be >= 1")
 
         plan = sl_cfg.get("inducing_plan", None)
         if isinstance(plan, dict):
@@ -1707,6 +1745,12 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["_slowness_re_max_rows_per_group"] = int(sl_max_rows_per_group)
     params["_slowness_re_fallback_to_diag"] = bool(sl_fallback_to_diag)
     params["_slowness_re_drop_logdet"] = bool(sl_drop_logdet)
+    params["_slowness_re_solver"] = str(sl_solver)
+    params["_slowness_re_pcg_max_iters"] = int(sl_pcg_max_iters)
+    params["_slowness_re_pcg_tol"] = float(sl_pcg_tol)
+    params["_slowness_re_pcg_check_every"] = int(sl_pcg_check_every)
+    params["_slowness_re_pcg_min_inducing"] = int(sl_pcg_min_inducing)
+    params["_slowness_re_pcg_min_rows"] = int(sl_pcg_min_rows)
     # Inducing plan (required for slowness_re)
     params["_slowness_re_inducing_plan_enable"] = bool(sl_plan_enabled)
     params["_slowness_re_inducing_plan_cover_frac_of_ell"] = float(sl_plan_cover_frac)
