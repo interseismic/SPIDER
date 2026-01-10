@@ -524,7 +524,25 @@ def _run_epoch(
             state.params["_sl_re_groups_fallback_sum"] = 0
             state.params["_sl_re_max_rows_max"] = 0
             state.params["_sl_re_max_nodes_max"] = 0
-            state.params["_sl_re_max_M_max"] = 0
+            # Also compute a static upper bound for M from stored inducing artifacts (cheap, one-time).
+            M_static = 0
+            try:
+                K_full = state.params.get("_slowness_re_inducing_K_full", None)
+                if isinstance(K_full, torch.Tensor) and K_full.ndim == 2:
+                    M_static = int(K_full.shape[0])
+                else:
+                    K_blocks = state.params.get("_slowness_re_inducing_K_blocks", None)
+                    if isinstance(K_blocks, list) and K_blocks:
+                        ms = []
+                        for K in K_blocks:
+                            if isinstance(K, torch.Tensor) and K.ndim == 2:
+                                ms.append(int(K.shape[0]))
+                        if ms:
+                            M_static = int(max(ms))
+            except Exception:
+                M_static = 0
+            state.params["_sl_re_max_M_static"] = int(M_static)
+            state.params["_sl_re_max_M_max"] = int(M_static)
     except Exception:
         pass
 
@@ -1565,6 +1583,13 @@ def _run_epoch(
                         state.params["_slowness_re_groups_fallback_sum"] = int(state.params.get("_slowness_re_groups_fallback_sum", 0) or 0) + g_fb
                         state.params["_slowness_re_max_rows_max"] = max(int(state.params.get("_slowness_re_max_rows_max", 0) or 0), mr)
                         state.params["_slowness_re_max_nodes_max"] = max(int(state.params.get("_slowness_re_max_nodes_max", 0) or 0), mn)
+                        # Also update new slowness_re profiler workload counters so W&B plots are consistent.
+                        state.params["_sl_re_groups_sum"] = int(state.params.get("_sl_re_groups_sum", 0) or 0) + g
+                        state.params["_sl_re_groups_woodbury_sum"] = int(state.params.get("_sl_re_groups_woodbury_sum", 0) or 0) + g_w
+                        state.params["_sl_re_groups_fallback_sum"] = int(state.params.get("_sl_re_groups_fallback_sum", 0) or 0) + g_fb
+                        state.params["_sl_re_max_rows_max"] = max(int(state.params.get("_sl_re_max_rows_max", 0) or 0), mr)
+                        state.params["_sl_re_max_nodes_max"] = max(int(state.params.get("_sl_re_max_nodes_max", 0) or 0), mn)
+                        state.params["_sl_re_max_M_max"] = max(int(state.params.get("_sl_re_max_M_max", 0) or 0), int(state.params.get("_sl_re_max_M_static", 0) or 0))
                     except Exception:
                         pass
             else:
@@ -1675,6 +1700,13 @@ def _run_epoch(
                         state.params["_slowness_re_groups_fallback_sum"] = int(state.params.get("_slowness_re_groups_fallback_sum", 0) or 0) + g_fb
                         state.params["_slowness_re_max_rows_max"] = max(int(state.params.get("_slowness_re_max_rows_max", 0) or 0), mr)
                         state.params["_slowness_re_max_nodes_max"] = max(int(state.params.get("_slowness_re_max_nodes_max", 0) or 0), mn)
+                        # Also update new slowness_re profiler workload counters so W&B plots are consistent.
+                        state.params["_sl_re_groups_sum"] = int(state.params.get("_sl_re_groups_sum", 0) or 0) + g
+                        state.params["_sl_re_groups_woodbury_sum"] = int(state.params.get("_sl_re_groups_woodbury_sum", 0) or 0) + g_w
+                        state.params["_sl_re_groups_fallback_sum"] = int(state.params.get("_sl_re_groups_fallback_sum", 0) or 0) + g_fb
+                        state.params["_sl_re_max_rows_max"] = max(int(state.params.get("_sl_re_max_rows_max", 0) or 0), mr)
+                        state.params["_sl_re_max_nodes_max"] = max(int(state.params.get("_sl_re_max_nodes_max", 0) or 0), mn)
+                        state.params["_sl_re_max_M_max"] = max(int(state.params.get("_sl_re_max_M_max", 0) or 0), int(state.params.get("_sl_re_max_M_static", 0) or 0))
                     except Exception:
                         pass
             else:
