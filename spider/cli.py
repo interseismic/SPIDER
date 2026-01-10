@@ -904,6 +904,14 @@ def _cmd_synth(args: argparse.Namespace) -> int:
 		sigma_obs = np.where(phase_int8.astype(np.float32) < 0.5, float(σp), float(σs)).astype(np.float32)
 		if lik in {"gaussian", "mse", "l2"}:
 			return rng.normal(loc=0.0, scale=sigma_obs).astype(np.float32)
+		if lik in {"student_t", "student-t", "studentt"}:
+			try:
+				nu = float(params.get("_student_t_nu", 4.0))
+			except Exception:
+				nu = 4.0
+			if not (nu > 0.0):
+				nu = 4.0
+			return (rng.standard_t(df=nu, size=sigma_obs.shape).astype(np.float32) * sigma_obs).astype(np.float32)
 		if lik in {"laplace", "l1", "mae"}:
 			return rng.laplace(loc=0.0, scale=sigma_obs).astype(np.float32)
 		# Default: Gaussian for huber/unknown

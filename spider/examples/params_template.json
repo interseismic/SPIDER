@@ -46,6 +46,7 @@
     "likelihood": {
       "type": "gaussian",
       "huber_delta": 1.0,
+      "student_t": { "nu": 4.0 },
       "phase_unc": [0.03, 0.03],
       "learn_noise_scale": false,
       "tempering": { "enabled": false, "alpha": 0.2 },

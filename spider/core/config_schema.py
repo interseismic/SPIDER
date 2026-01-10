@@ -584,12 +584,38 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
 
     # ---- likelihood ----
     lk = _require_dict(_require(model, "likelihood", "model"), "model.likelihood")
-    lk_type = _require_str(_require(lk, "type", "model.likelihood"), "model.likelihood.type").lower()
+    lk_type = _require_str(_require(lk, "type", "model.likelihood"), "model.likelihood.type").lower().strip()
     # Accept common aliases; `compute_likelihood_loss` handles the mapping.
-    if lk_type not in {"huber", "l2", "gaussian", "laplace", "l1", "mae", "mse"}:
-        raise _err("model.likelihood.type", "supported: 'huber', 'l2'/'gaussian' (aliases: 'mse'), 'laplace' (aliases: 'l1','mae')")
+    if lk_type in {"student-t", "studentt"}:
+        lk_type = "student_t"
+    if lk_type not in {"huber", "l2", "gaussian", "laplace", "l1", "mae", "mse", "student_t"}:
+        raise _err(
+            "model.likelihood.type",
+            "supported: 'huber', 'l2'/'gaussian' (aliases: 'mse'), 'laplace' (aliases: 'l1','mae'), 'student_t'",
+        )
     phase_unc = _require_float_list(_require(lk, "phase_unc", "model.likelihood"), "model.likelihood.phase_unc", length=2)
     learn_noise_scale = _require_bool(_require(lk, "learn_noise_scale", "model.likelihood"), "model.likelihood.learn_noise_scale")
+
+    # Optional: Student-t likelihood parameters.
+    #
+    # NLL per obs (up to a constant) is:
+    #   log(sigma) + (nu+1)/2 * log(1 + (r/sigma)^2 / nu)
+    #
+    # We keep nu fixed (not learned) for now.
+    student_t_cfg = lk.get("student_t", None)
+    student_t_nu = 4.0
+    if student_t_cfg is not None:
+        if not isinstance(student_t_cfg, dict):
+            raise _err("model.likelihood.student_t", "expected object/dict or null")
+        if "nu" in student_t_cfg and student_t_cfg.get("nu", None) is not None:
+            student_t_nu = float(_require_num(student_t_cfg.get("nu"), "model.likelihood.student_t.nu"))
+            if (not math.isfinite(student_t_nu)) or (not (student_t_nu > 0.0)):
+                raise _err("model.likelihood.student_t.nu", "must be finite and > 0")
+    if lk_type == "student_t":
+        if not isinstance(student_t_cfg, dict):
+            raise _err("model.likelihood.student_t", "required when model.likelihood.type='student_t'")
+        if ("nu" not in student_t_cfg) or (student_t_cfg.get("nu", None) is None):
+            raise _err("model.likelihood.student_t.nu", "required when model.likelihood.type='student_t'")
 
     # Optional: likelihood-only tempering (power posterior) for scalable uncertainty calibration.
     #
@@ -828,7 +854,8 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             raise _err(
                 "model.likelihood.type",
                 "must be 'gaussian'/'l2'/'mse' when likelihood.shared_event_re.enabled=true "
-                "(collapsed shared-event random effects is implemented for Gaussian likelihood only)",
+                "(collapsed shared-event random effects relies on Gaussian conjugacy; "
+                "'student_t'/'huber'/'laplace' are not supported in the collapsed formulation)",
             )
         # Phase-A implementation is "quadratic-only": we do not include the correlated logdet term.
         # Until we implement Phase-B (SLQ logdet), we forbid learning σ under this likelihood to
@@ -1063,7 +1090,8 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             raise _err(
                 "model.likelihood.type",
                 "must be 'gaussian'/'l2'/'mse' when model.likelihood.slowness_re.enabled=true "
-                "(collapsed slowness covariance is implemented for Gaussian likelihood only)",
+                "(collapsed slowness covariance relies on Gaussian conjugacy; "
+                "'student_t'/'huber'/'laplace' are not supported in the collapsed formulation)",
             )
         if bool(learn_noise_scale):
             raise _err(
@@ -1268,10 +1296,10 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
         # Uncollapsed shared-event latent b is an explicit nuisance parameter sampled/optimized alongside θ.
         # Unlike the *collapsed* shared_event_re model, this does NOT rely on Gaussian conjugacy, so robust
         # likelihood families (Huber/Laplace) are valid here.
-        if str(lk_type).strip().lower() not in {"gaussian", "l2", "mse", "huber", "laplace", "l1", "mae"}:
+        if str(lk_type).strip().lower() not in {"gaussian", "l2", "mse", "huber", "laplace", "l1", "mae", "student_t"}:
             raise _err(
                 "model.likelihood.type",
-                "must be one of: 'gaussian'/'l2'/'mse', 'huber', 'laplace' (aliases: 'l1','mae') when "
+                "must be one of: 'gaussian'/'l2'/'mse', 'huber', 'laplace' (aliases: 'l1','mae'), 'student_t' when "
                 "model.likelihood.shared_event_latent.enabled=true",
             )
 
@@ -1732,6 +1760,7 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["likelihood"] = lk_type
     params["phase_unc"] = phase_unc
     params["learn_noise_scale"] = bool(learn_noise_scale)
+    params["_student_t_nu"] = float(student_t_nu)
     params["_likelihood_tempering_enabled"] = bool(temp_enabled)
     params["_likelihood_tempering_alpha"] = float(temp_alpha)
     params["_likelihood_sigma_inflation_enabled"] = bool(sigma_infl_enabled)

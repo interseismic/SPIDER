@@ -2171,6 +2171,22 @@ def compute_likelihood_loss(
     if loss_type in {"gaussian", "mse", "l2"}:
         # NLL ~ 0.5 * r^2
         data_loss = 0.5 * (scaled_resid ** 2)
+    elif loss_type in {"student_t", "student-t", "studentt"}:
+        # Student-t NLL:
+        #   log(sigma) + 0.5*log(nu*pi) + lgamma(nu/2) - lgamma((nu+1)/2)
+        #   + (nu+1)/2 * log(1 + (r/sigma)^2 / nu)
+        #
+        # nu is treated as fixed (configured) here.
+        try:
+            nu_f = float(params.get("_student_t_nu", 4.0))
+        except Exception:
+            nu_f = 4.0
+        if not (nu_f > 0.0):
+            nu_f = 4.0
+        nu = scaled_resid.new_tensor(nu_f)
+        pi = scaled_resid.new_tensor(float(np.pi))
+        t_const = 0.5 * torch.log(nu * pi) + torch.lgamma(0.5 * nu) - torch.lgamma(0.5 * (nu + 1.0))
+        data_loss = 0.5 * (nu + 1.0) * torch.log1p((scaled_resid ** 2) / nu) + t_const
     elif loss_type in {"laplace", "l1", "mae"}:
         # NLL ~ |r|
         data_loss = torch.abs(scaled_resid)
