@@ -36,23 +36,13 @@
         "enabled": false,
         "type": "gaussian",
         "params": { "std": [0.01, 0.01, 0.01, 0.01] }
-      },
-      "noise": {
-        "enabled": false,
-        "type": "lognormal",
-        "params": { "loc": [-5.29, -5.29], "scale": [0.35, 0.33] }
       }
     },
     "likelihood": {
       "type": "gaussian",
       "huber_delta": 1.0,
       "student_t": { "nu": 4.0 },
-      "phase_unc": [0.03, 0.03],
-      "learn_noise_scale": false,
-      "tempering": { "enabled": false, "alpha": 0.2 },
-      "slowness_re": { "enabled": false },
-      "shared_event_re": { "enabled": false },
-      "shared_event_latent": { "enabled": false, "rho_ps": 0.75, "ell_km": 5.0, "tau_s": { "vel_frac": [0.05, 0.05] } }
+      "phase_unc": [0.03, 0.03]
     },
     "filters": {
       "dtimes": {
@@ -118,7 +108,6 @@
     },
     "safety": { "max_abs_dX": null },
     "runtime": {
-      "shared_event_latent_phase_split": false,
       "phase_mads_interval": { "phase2": 0, "phase3": 0, "phase4": 0 },
       "cuda_empty_cache_every": 0,
       "reset_batch_numbers": true,

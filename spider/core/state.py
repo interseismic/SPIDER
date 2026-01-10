@@ -46,15 +46,13 @@ class LocateState:
     batch_size_warmup: int = 0
     batch_size_sgld: int = 0
     scale_theta: Optional[torch.Tensor] = None  # [σ_p, σ_s] (fixed, if not learning)
-    log_scale_theta: Optional[torch.nn.Parameter] = None  # trainable log σ if enabled
-    learn_noise_scale: bool = False
 
     # Stats/samples
     stats_tensor: Optional[torch.Tensor] = None
     samples: Optional[List[torch.Tensor]] = None
     sample_count: int = 0
     global_step_count: int = 0
-    noise_log_scales: Optional[List[torch.Tensor]] = None
+    # Noise learning removed; no per-step noise traces.
 
     II_epoch: Optional[torch.Tensor] = None
     YY_epoch: Optional[torch.Tensor] = None
@@ -380,9 +378,6 @@ def _attach_dd_preconditioner_metric(state: LocateState) -> None:
 
 def _current_noise_scales(state: LocateState) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (σ_p, σ_s) as tensors on the correct device."""
-    if state.learn_noise_scale and state.log_scale_theta is not None:
-        σ = torch.exp(state.log_scale_theta)
-        return σ[0], σ[1]
     assert state.scale_theta is not None, "Noise scales not initialized"
     return state.scale_theta[0], state.scale_theta[1]
 

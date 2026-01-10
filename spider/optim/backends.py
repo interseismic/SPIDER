@@ -59,16 +59,9 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
     Legacy aliases are no longer supported; use the canonical backend names above.
     """
     backend = str(params["sampler_backend"]).strip().lower()
-    # Parameter list: ΔX_src plus optional log noise scales
+    # Parameter list: ΔX_src only (noise learning removed; fixed phase_unc only)
     base_params_list: List[torch.nn.Parameter] = [state.dX_src]
-    if state.learn_noise_scale and state.log_scale_theta is not None:
-        base_params_list.append(state.log_scale_theta)
 
-    # Optional: uncollapsed shared-event latent b (sampled as a *separate* param group).
-    # This field is very high-dimensional and often needs smaller step/noise to remain stable.
-    b_lat = getattr(state, "shared_event_latent_b", None)
-    use_b_lat = bool((b_lat is not None) and bool(params.get("_shared_event_latent_enabled", False)))
-    overrides_active = bool(params.get("_shared_event_latent_sampler_overrides_active", False))
     lr = float(params["lr_sampler"])
     lr_mode = str(params["sampler_lr_mode"]).strip().lower()
     n_obs = int(getattr(state, "N", params.get("n_obs", 1)))
@@ -81,23 +74,8 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
             # pSGLD multiplies minibatch-mean grads by n_obs internally; scale lr down by n_obs to keep
             # the user-facing lr more stable across dataset sizes, while still targeting the true posterior.
             lr_eff = lr / float(n_obs)
-        # Use per-group settings when latent b is active.
         base_group = {"params": base_params_list, "group_name": "core"}
         param_groups = [base_group]
-        if use_b_lat:
-            g_lat = {"params": [b_lat], "group_name": "shared_event_latent"}
-            # Only apply per-group knobs if the user explicitly provided overrides.
-            if overrides_active:
-                eps_b = float(
-                    params.get(
-                        "_shared_event_latent_eps",
-                        max(float(params["sampler_eps"]), 1e-3),
-                    )
-                )
-                include_gamma_b = bool(params.get("_shared_event_latent_include_gamma", False))
-                freeze_b = bool(params.get("_shared_event_latent_freeze_preconditioner_sampling", False))
-                g_lat.update({"eps": eps_b, "include_gamma": include_gamma_b, "freeze_preconditioner": freeze_b})
-            param_groups.append(g_lat)
         opt = pSGLD(
             params=param_groups,
             n_obs=state.N,
@@ -142,18 +120,6 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
             lr_eff = lr / float(n_obs)
         base_group = {"params": base_params_list, "group_name": "core"}
         param_groups = [base_group]
-        if use_b_lat:
-            g_lat = {"params": [b_lat], "group_name": "shared_event_latent"}
-            if overrides_active:
-                eps_b = float(
-                    params.get(
-                        "_shared_event_latent_eps",
-                        max(float(params["sampler_eps"]), 1e-3),
-                    )
-                )
-                freeze_b = bool(params.get("_shared_event_latent_freeze_preconditioner_sampling", False))
-                g_lat.update({"eps": eps_b, "freeze_preconditioner": freeze_b})
-            param_groups.append(g_lat)
         opt = SGHMC(
             params=param_groups,
             n_obs=state.N,
@@ -199,20 +165,6 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
             lr_eff = float(max(lr_eff, 0.0)) ** 0.5
         base_group = {"params": base_params_list, "group_name": "core"}
         param_groups = [base_group]
-        if use_b_lat:
-            # AdaptiveSGHMC uses `epsilon` (and also honors `eps`) for numerical stability.
-            # Do not apply lr/temperature multipliers here; locate._apply_sampler_group_overrides() will.
-            g_lat = {"params": [b_lat], "group_name": "shared_event_latent"}
-            if overrides_active:
-                eps_b = float(
-                    params.get(
-                        "_shared_event_latent_eps",
-                        max(float(params["sampler_eps"]), 1e-3),
-                    )
-                )
-                freeze_b = bool(params.get("_shared_event_latent_freeze_preconditioner_sampling", False))
-                g_lat.update({"epsilon": eps_b, "eps": eps_b, "freeze_preconditioner": freeze_b})
-            param_groups.append(g_lat)
         opt = AdaptiveSGHMC(
             params=param_groups,
             lr=lr_eff,
@@ -247,18 +199,6 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         # Simple SGD-based backend with no preconditioning; acts as placeholder
         base_group = {"params": base_params_list, "group_name": "core"}
         param_groups = [base_group]
-        if use_b_lat:
-            g_lat = {"params": [b_lat], "group_name": "shared_event_latent"}
-            if overrides_active:
-                eps_b = float(
-                    params.get(
-                        "_shared_event_latent_eps",
-                        max(float(params["sampler_eps"]), 1e-3),
-                    )
-                )
-                freeze_b = bool(params.get("_shared_event_latent_freeze_preconditioner_sampling", False))
-                g_lat.update({"eps": eps_b, "freeze_preconditioner": freeze_b})
-            param_groups.append(g_lat)
         opt = torch.optim.SGD(param_groups, lr=lr)
         _attach_set_lr(opt)
         _ensure_common_group_keys(opt, params=params, n_obs=state.N)

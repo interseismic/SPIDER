@@ -370,7 +370,7 @@ def _latent_field_map_update(
     metrics_out: Dict[str, float] = {}
     if bool(state.params.get("_latent_field_enabled", False)):
         raise RuntimeError(
-            "likelihood.latent_field has been removed from this codebase; delete the config block and use likelihood.shared_event_latent instead"
+            "likelihood.latent_field has been removed from this codebase; delete the config block"
         )
     return metrics_out
 
@@ -1140,7 +1140,6 @@ def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=No
             try:
                 σp_now, σs_now = _current_noise_scales(state)
                 wandb_metrics.update({
-                    "noise/learn_noise_scale": int(bool(state.learn_noise_scale)),
                     "noise/sigma_p": float(σp_now.detach().cpu().item()),
                     "noise/sigma_s": float(σs_now.detach().cpu().item()),
                     "noise/log_sigma_p": float(torch.log(σp_now).detach().cpu().item()),
@@ -1184,7 +1183,7 @@ def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=No
                 state.stats_tensor,
                 phase="phase1",
                 global_step_count=state.global_step_count,
-                noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
+                noise_log_scale=None,
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -1530,25 +1529,7 @@ def _finalize_phase1(state: LocateState) -> None:
         except Exception as e:
             warn(f"Station-basis ell_km estimate failed: {e}", section="DIAG")
 
-        # Optional: estimate a reasonable event-space ell_km for shared_event_latent from MAP residual structure.
-        # This is useful for tuning model.likelihood.shared_event_latent.ell_km (the event kernel length scale).
-        try:
-            from spider.diagnostics.shared_event_latent_event_ell import (
-                maybe_estimate_shared_event_latent_event_ell_after_phase1,
-            )
-            maybe_estimate_shared_event_latent_event_ell_after_phase1(state=state)
-        except Exception as e:
-            warn(f"Shared-event-latent event ell_km estimate failed: {e}", section="DIAG")
-
-        # Optional: estimate a reasonable shared-event-latent amplitude tau_s (and tau_p) from MAP residuals.
-        # This is useful for tuning model.likelihood.shared_event_latent.tau_s.
-        try:
-            from spider.diagnostics.shared_event_latent_tau import (
-                maybe_estimate_shared_event_latent_tau_after_phase1,
-            )
-            maybe_estimate_shared_event_latent_tau_after_phase1(state=state)
-        except Exception as e:
-            warn(f"Shared-event-latent tau estimate failed: {e}", section="DIAG")
+        # Structured likelihood components removed; no shared_event_latent diagnostics.
     except Exception as e:
         warn(f"Post-Phase1 filters failed: {e}", section="FILTER")
     
@@ -1562,7 +1543,7 @@ def _finalize_phase1(state: LocateState) -> None:
         state.stats_tensor,
         phase="phase1",
         global_step_count=state.global_step_count,
-        noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
+        noise_log_scale=None,
         event_precision_matrix=state.event_precision_matrix,
     )
 
@@ -1657,22 +1638,7 @@ def _resume_or_initialize(state: LocateState):
         state.optimizer.param_groups[0]['params'][0] = state.dX_src  # type: ignore[index]
     except Exception as e:
         warn(f"Could not reset optimizer parameter reference: {e}", section="RUN")
-    # Adopt noise log-scale if learning is enabled and checkpoint provides it
-    if state.learn_noise_scale:
-        nls = ckpt.get("noise_log_scale", None)
-        if nls is not None:
-            try:
-                nls_t = nls.to(device=state.device, dtype=torch.float32)
-            except Exception:
-                nls_t = torch.as_tensor(nls, dtype=torch.float32, device=state.device)
-            state.log_scale_theta = torch.nn.Parameter(nls_t.detach().clone())
-            try:
-                if len(state.optimizer.param_groups[0]['params']) == 1:
-                    state.optimizer.param_groups[0]['params'].append(state.log_scale_theta)  # type: ignore[attr-defined]
-                else:
-                    state.optimizer.param_groups[0]['params'][1] = state.log_scale_theta  # type: ignore[index]
-            except Exception as e:
-                print(f"Warning: could not reset optimizer noise parameter reference: {e}")
+    # Noise learning removed: ignore any checkpoint-provided noise_log_scale.
     state.stats_tensor = ckpt.get("stats_tensor", state.stats_tensor)
     # SSST removed entirely (no backward compatibility): do not load or compute SSST from checkpoints.
         
@@ -1798,7 +1764,6 @@ def _phase2_preconditioner(
                 if _want_wandb_group(state.params, "noise"):
                     σp_now, σs_now = _current_noise_scales(state)
                     wandb_metrics.update({
-                        "noise/learn_noise_scale": int(bool(state.learn_noise_scale)),
                         "noise/sigma_p": float(σp_now.detach().cpu().item()),
                         "noise/sigma_s": float(σs_now.detach().cpu().item()),
                         "noise/log_sigma_p": float(torch.log(σp_now).detach().cpu().item()),
@@ -1856,7 +1821,7 @@ def _phase2_preconditioner(
                 stats_tensor=state.stats_tensor,
                 phase="phase2",
                 global_step_count=state.global_step_count,
-                noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
+                noise_log_scale=None,
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -1878,7 +1843,7 @@ def _phase2_preconditioner(
             stats_tensor=state.stats_tensor,
             phase="phase2",
             global_step_count=state.global_step_count,
-            noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
+            noise_log_scale=None,
             event_precision_matrix=state.event_precision_matrix,
         )
     
@@ -2139,7 +2104,6 @@ def _phase3_noise_ramp(
                 if _want_wandb_group(state.params, "noise"):
                     σp_now, σs_now = _current_noise_scales(state)
                     wandb_metrics.update({
-                        "noise/learn_noise_scale": int(bool(state.learn_noise_scale)),
                         "noise/sigma_p": float(σp_now.detach().cpu().item()),
                         "noise/sigma_s": float(σs_now.detach().cpu().item()),
                         "noise/log_sigma_p": float(torch.log(σp_now).detach().cpu().item()),
@@ -2200,7 +2164,7 @@ def _phase3_noise_ramp(
                 stats_tensor=state.stats_tensor,
                 phase="phase3",
                 global_step_count=state.global_step_count,
-                noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
+                noise_log_scale=None,
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -2222,7 +2186,7 @@ def _phase3_noise_ramp(
             stats_tensor=state.stats_tensor,
             phase="phase3",
             global_step_count=state.global_step_count,
-            noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
+            noise_log_scale=None,
             event_precision_matrix=state.event_precision_matrix,
         )
 
@@ -2320,7 +2284,6 @@ def _phase4_sampling(
                 if _want_wandb_group(state.params, "noise"):
                     σp_now, σs_now = _current_noise_scales(state)
                     wandb_metrics.update({
-                        "noise/learn_noise_scale": int(bool(state.learn_noise_scale)),
                         "noise/sigma_p": float(σp_now.detach().cpu().item()),
                         "noise/sigma_s": float(σs_now.detach().cpu().item()),
                         "noise/log_sigma_p": float(torch.log(σp_now).detach().cpu().item()),
@@ -2375,7 +2338,7 @@ def _phase4_sampling(
                 state.stats_tensor,
                 phase="phase4",
                 global_step_count=state.global_step_count,
-                noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
+                noise_log_scale=None,
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -2399,13 +2362,12 @@ def _phase4_sampling(
                 state.samples,
                 state.projector,
                 state.sample_count,
-                noise_log_scales=state.noise_log_scales,
+                noise_log_scales=None,
                 global_step_count=int(state.global_step_count),
                 epoch=int(epoch),
                 phase="phase4",
             )
             state.samples = []
-            state.noise_log_scales = []
 
         if skip_saving_first_epoch:
             skip_saving_first_epoch = False
@@ -2420,7 +2382,7 @@ def _phase4_sampling(
                 state.samples,
                 state.projector,
                 state.sample_count,
-                noise_log_scales=state.noise_log_scales,
+                noise_log_scales=None,
                 global_step_count=int(state.global_step_count),
                 epoch=int(last_epoch),
                 phase="phase4",
@@ -2436,7 +2398,7 @@ def _phase4_sampling(
             state.stats_tensor,
             phase="phase4",
             global_step_count=state.global_step_count,
-            noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
+            noise_log_scale=None,
             event_precision_matrix=state.event_precision_matrix,
         )  # type: ignore[arg-type]
     return
@@ -5219,16 +5181,7 @@ def locate_all(
         _phase1_map_warmup(state, start_epoch, wandb_logger)
         phase = "phase2"
 
-    # Build fixed event-kernel graph at MAP + initialize latent shared-event b if enabled.
-    _maybe_report_shared_event_latent_inducing_plan(state)
-    _maybe_select_shared_event_latent_inducing_points(state)
-    _maybe_build_shared_event_latent_inducing_interpolation(state)
-    _maybe_init_shared_event_latent(state)
-    # Build inducing artifacts for the collapsed slowness covariance likelihood (if enabled).
-    _maybe_select_slowness_re_inducing_points(state)
-    _maybe_build_slowness_re_inducing_interpolation(state)
-    _maybe_init_slowness_re(state)
-    _maybe_estimate_eikonet_v1d_speed(state)
+    # Structured likelihood components (shared_event_latent/shared_event_re/slowness_re) removed.
 
     # Set up sampler and optionally load state if resuming from sampling phases
     sampler = _setup_sampler(state)
@@ -5491,14 +5444,7 @@ def locate_sample_from_bundle(
     skip_saving_first_epoch = False
     ckpt = None
 
-    _maybe_report_shared_event_latent_inducing_plan(state)
-    _maybe_select_shared_event_latent_inducing_points(state)
-    _maybe_build_shared_event_latent_inducing_interpolation(state)
-    _maybe_init_shared_event_latent(state)
-    _maybe_select_slowness_re_inducing_points(state)
-    _maybe_build_slowness_re_inducing_interpolation(state)
-    _maybe_init_slowness_re(state)
-    _maybe_estimate_eikonet_v1d_speed(state)
+    # Structured likelihood components (shared_event_latent/shared_event_re/slowness_re) removed.
 
     sampler = _setup_sampler(state)
 

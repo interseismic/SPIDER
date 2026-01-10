@@ -473,61 +473,17 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     params["sampler_preconditioning_include_gamma_proxy"] = bool(precond_include_gamma_proxy)
 
     # ---- sampler parameter-group overrides (hard-break schema) ----
-    # These are inference-only controls. Model hyperparameters for the latent itself live under:
-    #   model.likelihood.shared_event_latent
-    #
-    # Defaults are chosen to be conservative for the high-dimensional latent b.
-    se_lat_lr_mult = 0.05
-    se_lat_temperature_mult = 0.25
-    se_lat_eps = 1e-3
-    se_lat_include_gamma = False
-    se_lat_freeze_precond_sampling = False
-    se_lat_overrides_active = False
+    # Structured likelihood components have been removed; disallow legacy override blocks.
     overrides = sampler.get("overrides", None)
     if overrides is None:
         overrides = {}
     if not isinstance(overrides, dict):
         raise _err("inference.sampler.overrides", "expected object/dict or null")
-    se_lat_ov = overrides.get("shared_event_latent", None)
-    if se_lat_ov is None:
-        se_lat_ov = {}
-    if not isinstance(se_lat_ov, dict):
-        raise _err("inference.sampler.overrides.shared_event_latent", "expected object/dict or null")
-    # Track whether the user explicitly provided any shared_event_latent override knobs.
-    # This lets the runtime skip group-specific edits entirely when the overrides block is absent.
-    for k in ("lr_mult", "temperature_mult", "eps", "include_gamma", "freeze_preconditioner_sampling"):
-        if k in se_lat_ov and se_lat_ov.get(k, None) is not None:
-            se_lat_overrides_active = True
-            break
-    if "lr_mult" in se_lat_ov and se_lat_ov.get("lr_mult", None) is not None:
-        se_lat_lr_mult = float(_require_num(se_lat_ov.get("lr_mult"), "inference.sampler.overrides.shared_event_latent.lr_mult"))
-        if not (se_lat_lr_mult > 0.0):
-            raise _err("inference.sampler.overrides.shared_event_latent.lr_mult", "must be > 0")
-    if "temperature_mult" in se_lat_ov and se_lat_ov.get("temperature_mult", None) is not None:
-        se_lat_temperature_mult = float(
-            _require_num(se_lat_ov.get("temperature_mult"), "inference.sampler.overrides.shared_event_latent.temperature_mult")
+    if "shared_event_latent" in overrides:
+        raise _err(
+            "inference.sampler.overrides.shared_event_latent",
+            "removed; shared_event_latent has been removed from SPIDER (delete this block)",
         )
-        if not (se_lat_temperature_mult > 0.0):
-            raise _err("inference.sampler.overrides.shared_event_latent.temperature_mult", "must be > 0")
-    if "eps" in se_lat_ov and se_lat_ov.get("eps", None) is not None:
-        se_lat_eps = float(_require_num(se_lat_ov.get("eps"), "inference.sampler.overrides.shared_event_latent.eps"))
-        if not (se_lat_eps >= 0.0):
-            raise _err("inference.sampler.overrides.shared_event_latent.eps", "must be >= 0")
-    if "include_gamma" in se_lat_ov and se_lat_ov.get("include_gamma", None) is not None:
-        se_lat_include_gamma = _require_bool(se_lat_ov.get("include_gamma"), "inference.sampler.overrides.shared_event_latent.include_gamma")
-    if "freeze_preconditioner_sampling" in se_lat_ov and se_lat_ov.get("freeze_preconditioner_sampling", None) is not None:
-        se_lat_freeze_precond_sampling = _require_bool(
-            se_lat_ov.get("freeze_preconditioner_sampling"),
-            "inference.sampler.overrides.shared_event_latent.freeze_preconditioner_sampling",
-        )
-
-    # Materialize internal keys consumed by the sampler/backend plumbing.
-    params["_shared_event_latent_lr_mult"] = float(se_lat_lr_mult)
-    params["_shared_event_latent_temperature_mult"] = float(se_lat_temperature_mult)
-    params["_shared_event_latent_eps"] = float(se_lat_eps)
-    params["_shared_event_latent_include_gamma"] = bool(se_lat_include_gamma)
-    params["_shared_event_latent_freeze_preconditioner_sampling"] = bool(se_lat_freeze_precond_sampling)
-    params["_shared_event_latent_sampler_overrides_active"] = bool(se_lat_overrides_active)
 
     return params
 
@@ -594,7 +550,11 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             "supported: 'huber', 'l2'/'gaussian' (aliases: 'mse'), 'laplace' (aliases: 'l1','mae'), 'student_t'",
         )
     phase_unc = _require_float_list(_require(lk, "phase_unc", "model.likelihood"), "model.likelihood.phase_unc", length=2)
-    learn_noise_scale = _require_bool(_require(lk, "learn_noise_scale", "model.likelihood"), "model.likelihood.learn_noise_scale")
+    # We keep only the fixed scalar phase uncertainty (phase_unc). Noise learning is removed.
+    if "learn_noise_scale" in lk:
+        raise _err("model.likelihood.learn_noise_scale", "removed; SPIDER now uses fixed `model.likelihood.phase_unc` only")
+    # Internal legacy variable used by some older compatibility checks below.
+    learn_noise_scale = False
 
     # Optional: Student-t likelihood parameters.
     #
@@ -617,101 +577,25 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
         if ("nu" not in student_t_cfg) or (student_t_cfg.get("nu", None) is None):
             raise _err("model.likelihood.student_t.nu", "required when model.likelihood.type='student_t'")
 
-    # Optional: likelihood-only tempering (power posterior) for scalable uncertainty calibration.
-    #
-    # This multiplies the data likelihood term by alpha while leaving priors unchanged, i.e.
-    #   posterior(theta | y) ∝ prior(theta) * likelihood(y | theta)^alpha
-    # with alpha in (0, 1] typically (alpha<1 inflates uncertainty).
-    temp_cfg = lk.get("tempering", None)
-    temp_enabled = False
-    temp_alpha = 1.0
-    if isinstance(temp_cfg, dict):
-        temp_enabled = bool(temp_cfg.get("enabled", False))
-        if "alpha" in temp_cfg and temp_cfg["alpha"] is not None:
-            a = float(_require_num(temp_cfg["alpha"], "model.likelihood.tempering.alpha"))
-            if not (a > 0.0) or (not math.isfinite(a)):
-                raise _err("model.likelihood.tempering.alpha", "must be finite and > 0")
-            temp_alpha = a
-    if not temp_enabled:
-        temp_alpha = 1.0
+    # Tempering removed (start fresh; keep core residual distributions only).
+    if "tempering" in lk:
+        raise _err("model.likelihood.tempering", "removed; delete this block from your config")
 
-    # Optional: additional heteroscedastic noise inflation for the likelihood (no latent term).
-    #
-    # This adds a per-observation variance term in quadrature with the base noise scale:
-    #   sigma_eff^2 = sigma_phase^2 + sigma_extra_var
-    #
-    # Intended use: represent unmodeled path/velocity-structure uncertainty that scales with
-    # event-pair separation, while still allowing `shared_event_latent` to learn coherent mean
-    # corrections (nuisance_delta).
-    #
-    # Config:
-    #   model.likelihood.sigma_inflation:
-    #     enabled: bool
-    #     mode: "vel_frac_linear_dd"   # sigma_struct(d) = (vel_frac / v_km_s) * d_km
-    #     vel_frac: [P,S]              # fractional velocity error (e.g., 0.02 for 2%)
-    #     v_km_s: [P,S]                # reference phase speeds in km/s (e.g., [6.0, 3.5])
-    #     max_d_km: number|null        # optional clamp on d_km (stability / conservative cap)
-    #     use_3d: bool                 # if true use sqrt(dx^2+dy^2+dz^2), else horizontal only
-    #
-    # Note: this is currently NOT supported with `shared_event_re` (pcg_sparse) because that
-    # solver assumes a homoscedastic diagonal; we validate that below.
-    sigma_infl_cfg = lk.get("sigma_inflation", None)
-    sigma_infl_enabled = False
-    sigma_infl_mode = "vel_frac_linear_dd"
-    sigma_infl_vel_frac = [0.0, 0.0]
-    sigma_infl_v_km_s = [6.0, 3.5]
-    sigma_infl_max_d_km = None
-    sigma_infl_use_3d = True
-    if isinstance(sigma_infl_cfg, dict):
-        sigma_infl_enabled = bool(sigma_infl_cfg.get("enabled", False))
-        if "mode" in sigma_infl_cfg and sigma_infl_cfg.get("mode", None) is not None:
-            sigma_infl_mode = str(sigma_infl_cfg.get("mode", "vel_frac_linear_dd")).strip().lower()
-        if sigma_infl_mode not in {"vel_frac_linear_dd"}:
-            raise _err("model.likelihood.sigma_inflation.mode", "supported: 'vel_frac_linear_dd'")
-        if "vel_frac" in sigma_infl_cfg and sigma_infl_cfg.get("vel_frac", None) is not None:
-            v = sigma_infl_cfg["vel_frac"]
-            if isinstance(v, (int, float)):
-                f = float(v)
-                sigma_infl_vel_frac = [f, f]
-            elif isinstance(v, list):
-                sigma_infl_vel_frac = _require_float_list(v, "model.likelihood.sigma_inflation.vel_frac", length=2)
-            else:
-                raise _err("model.likelihood.sigma_inflation.vel_frac", f"expected number or [P,S] list, got {type(v).__name__}")
-        if not (sigma_infl_vel_frac[0] >= 0.0 and sigma_infl_vel_frac[1] >= 0.0):
-            raise _err("model.likelihood.sigma_inflation.vel_frac", "must be >= 0")
-        if "v_km_s" in sigma_infl_cfg and sigma_infl_cfg.get("v_km_s", None) is not None:
-            v = sigma_infl_cfg["v_km_s"]
-            if isinstance(v, (int, float)):
-                f = float(v)
-                sigma_infl_v_km_s = [f, f]
-            elif isinstance(v, list):
-                sigma_infl_v_km_s = _require_float_list(v, "model.likelihood.sigma_inflation.v_km_s", length=2)
-            else:
-                raise _err("model.likelihood.sigma_inflation.v_km_s", f"expected number or [P,S] list, got {type(v).__name__}")
-        if not (sigma_infl_v_km_s[0] > 0.0 and sigma_infl_v_km_s[1] > 0.0):
-            raise _err("model.likelihood.sigma_inflation.v_km_s", "must be > 0")
-        if "max_d_km" in sigma_infl_cfg and sigma_infl_cfg.get("max_d_km", None) is not None:
-            sigma_infl_max_d_km = float(_require_num(sigma_infl_cfg["max_d_km"], "model.likelihood.sigma_inflation.max_d_km"))
-            if not (sigma_infl_max_d_km > 0.0) or (not math.isfinite(sigma_infl_max_d_km)):
-                raise _err("model.likelihood.sigma_inflation.max_d_km", "must be finite and > 0 (or null)")
-        if "use_3d" in sigma_infl_cfg and sigma_infl_cfg.get("use_3d", None) is not None:
-            sigma_infl_use_3d = _require_bool(sigma_infl_cfg.get("use_3d"), "model.likelihood.sigma_inflation.use_3d")
-    if not sigma_infl_enabled:
-        # Materialize safe defaults (disabled)
-        sigma_infl_mode = "vel_frac_linear_dd"
-        sigma_infl_vel_frac = [0.0, 0.0]
-        sigma_infl_max_d_km = None
-        sigma_infl_use_3d = True
+    # Heteroscedastic sigma inflation removed (start fresh).
+    if "sigma_inflation" in lk:
+        raise _err("model.likelihood.sigma_inflation", "removed; delete this block from your config")
 
     # Residual-correlation block removed entirely (no backward compatibility).
     if "residual_correlation" in lk:
         raise _err("model.likelihood.residual_correlation", "removed; structured residual correlation models are no longer supported")
 
-    # The following likelihood extensions have been removed from SPIDER.
-    # Keep the config surface area focused on `likelihood.shared_event_latent`.
-    #
-    # NOTE: `shared_event_re` is supported again as an OPTIONAL *collapsed* (marginalized) Gaussian
-    # likelihood. The uncollapsed/latent version remains implemented under `shared_event_latent`.
+    # Structured likelihood components removed (start fresh).
+    if "shared_event_latent" in lk:
+        raise _err("model.likelihood.shared_event_latent", "removed; delete this block from your config")
+    if "shared_event_re" in lk:
+        raise _err("model.likelihood.shared_event_re", "removed; delete this block from your config")
+    if "slowness_re" in lk:
+        raise _err("model.likelihood.slowness_re", "removed; delete this block from your config")
     if "latent_field" in lk:
         raise _err("model.likelihood.latent_field", "removed; use model.likelihood.shared_event_latent instead")
 
@@ -1759,124 +1643,7 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     # ---- materialize legacy flat keys (implementation detail) ----
     params["likelihood"] = lk_type
     params["phase_unc"] = phase_unc
-    params["learn_noise_scale"] = bool(learn_noise_scale)
     params["_student_t_nu"] = float(student_t_nu)
-    params["_likelihood_tempering_enabled"] = bool(temp_enabled)
-    params["_likelihood_tempering_alpha"] = float(temp_alpha)
-    params["_likelihood_sigma_inflation_enabled"] = bool(sigma_infl_enabled)
-    params["_likelihood_sigma_inflation_mode"] = str(sigma_infl_mode)
-    params["_likelihood_sigma_inflation_vel_frac"] = [float(sigma_infl_vel_frac[0]), float(sigma_infl_vel_frac[1])]
-    params["_likelihood_sigma_inflation_v_km_s"] = [float(sigma_infl_v_km_s[0]), float(sigma_infl_v_km_s[1])]
-    params["_likelihood_sigma_inflation_max_d_km"] = (float(sigma_infl_max_d_km) if sigma_infl_max_d_km is not None else None)
-    params["_likelihood_sigma_inflation_use_3d"] = bool(sigma_infl_use_3d)
-
-    # Collapsed shared-event random effects (optional)
-    params["_shared_event_re_enabled"] = bool(se_enabled)
-    params["_shared_event_re_grouping"] = str(se_grouping)
-    params["_shared_event_re_tau_s"] = [float(se_tau_ps[0]), float(se_tau_ps[1])]
-    params["_shared_event_re_joint_ps"] = bool(se_joint_ps)
-    params["_shared_event_re_rho_ps"] = float(se_rho_ps)
-    params["_shared_event_re_max_nodes_per_group"] = int(se_max_nodes_per_group)
-    params["_shared_event_re_max_rows_per_group"] = int(se_max_rows_per_group)
-    params["_shared_event_re_fallback_to_diag"] = bool(se_fallback_to_diag)
-    params["_shared_event_re_jitter0"] = float(se_jitter0)
-    params["_shared_event_re_jitter_max"] = float(se_jitter_max)
-    params["_shared_event_re_cache_max_entries"] = int(se_cache_max_entries)
-    params["_shared_event_re_cache_log_every"] = int(se_cache_log_every)
-    params["_shared_event_re_solver"] = str(se_solver)
-    params["_shared_event_re_drop_logdet"] = bool(se_drop_logdet)
-    params["_shared_event_re_pcg_max_iters"] = int(se_pcg_max_iters)
-    params["_shared_event_re_pcg_tol"] = float(se_pcg_tol)
-    params["_shared_event_re_diag_log_every_epochs"] = int(se_diag_log_every_epochs)
-    params["_shared_event_re_diag_max_groups"] = int(se_diag_max_groups)
-    params["_shared_event_re_diag_max_rows_per_group"] = int(se_diag_max_rows_per_group)
-    params["_shared_event_re_diag_max_nodes"] = int(se_diag_max_nodes)
-    params["_shared_event_re_diag_seed"] = int(se_diag_seed)
-
-    # Collapsed slowness covariance likelihood (optional)
-    params["_slowness_re_enabled"] = bool(sl_enabled)
-    params["_slowness_re_grouping"] = str(sl_grouping)
-    params["_slowness_re_ell_km"] = float(sl_ell_km)
-    params["_slowness_re_tau_s"] = [float(sl_tau_ps[0]), float(sl_tau_ps[1])]
-    params["_slowness_re_tau_units"] = str(sl_tau_units)
-    params["_slowness_re_max_nodes_per_group"] = int(sl_max_nodes_per_group)
-    params["_slowness_re_max_rows_per_group"] = int(sl_max_rows_per_group)
-    params["_slowness_re_fallback_to_diag"] = bool(sl_fallback_to_diag)
-    params["_slowness_re_drop_logdet"] = bool(sl_drop_logdet)
-    params["_slowness_re_solver"] = str(sl_solver)
-    params["_slowness_re_pcg_max_iters"] = int(sl_pcg_max_iters)
-    params["_slowness_re_pcg_tol"] = float(sl_pcg_tol)
-    params["_slowness_re_pcg_check_every"] = int(sl_pcg_check_every)
-    params["_slowness_re_pcg_min_inducing"] = int(sl_pcg_min_inducing)
-    params["_slowness_re_pcg_min_rows"] = int(sl_pcg_min_rows)
-    # Inducing plan (required for slowness_re)
-    params["_slowness_re_inducing_plan_enable"] = bool(sl_plan_enabled)
-    params["_slowness_re_inducing_plan_cover_frac_of_ell"] = float(sl_plan_cover_frac)
-    params["_slowness_re_inducing_plan_min_inducing_per_component"] = int(sl_plan_min_m)
-    params["_slowness_re_inducing_plan_max_inducing_per_component"] = int(sl_plan_max_m)
-    params["_slowness_re_inducing_plan_top_k"] = int(sl_plan_top_k)
-    params["_slowness_re_inducing_plan_seed_strategy"] = str(sl_plan_seed_strategy)
-    params["_slowness_re_inducing_fixed_xyz"] = bool(sl_plan_fixed_xyz)
-    params["_slowness_re_inducing_jitter"] = float(sl_plan_kernel_jitter)
-    params["_slowness_re_inducing_plan_selection_outfile"] = sl_plan_selection_outfile
-    params["_slowness_re_inducing_plan_interpolation_enable"] = bool(sl_plan_interpolation_enabled)
-    params["_slowness_re_inducing_plan_interpolation_m"] = int(sl_plan_interpolation_m)
-    params["_slowness_re_inducing_plan_interpolation_outfile"] = sl_plan_interpolation_outfile
-    params["_slowness_re_inducing_fitc_enable"] = bool(sl_fitc_enabled)
-    # Station basis (optional)
-    params["_slowness_re_station_basis_enabled"] = bool(sl_sta_basis_enabled)
-    params["_slowness_re_station_basis_r"] = int(sl_sta_basis_r)
-    params["_slowness_re_station_basis_ell_km"] = float(sl_sta_basis_ell_km)
-    params["_slowness_re_station_basis_jitter"] = float(sl_sta_basis_jitter)
-    params["_slowness_re_station_basis_method"] = str(sl_sta_basis_method)
-
-    # Uncollapsed shared-event latent random effects (optional)
-    params["_shared_event_latent_enabled"] = bool(se_lat_enabled)
-    params["_shared_event_latent_parameterization"] = str(se_lat_param)
-    params["_shared_event_latent_knn"] = int(se_lat_knn)
-    params["_shared_event_latent_ell_km"] = float(se_lat_ell_km)
-    params["_shared_event_latent_q_diag"] = float(se_lat_q_diag)
-    params["_shared_event_latent_graph_lambda"] = float(se_lat_graph_lambda)
-    params["_shared_event_latent_graph_max_degree"] = int(se_lat_graph_max_degree)
-    params["_shared_event_latent_graph_max_edge_km"] = (float(se_lat_graph_max_edge_km) if se_lat_graph_max_edge_km is not None else None)
-    params["_shared_event_latent_tau_s"] = [float(se_lat_tau_ps[0]), float(se_lat_tau_ps[1])]
-    # Units for tau_s in slowness_inducing_gp:
-    # - "abs": tau_s is interpreted as s/km (slowness amplitude)
-    # - "vel_frac": tau_s is interpreted as fractional velocity perturbation δv/v (dimensionless)
-    params["_shared_event_latent_slowness_tau_units"] = str(tau_units)
-    params["_shared_event_latent_rho_ps"] = float(se_lat_rho_ps)
-    params["_shared_event_latent_drop_station_common_mode"] = bool(se_lat_drop_station_common_mode)
-    # Inducing plan diagnostics (optional)
-    params["_shared_event_latent_inducing_plan_enable"] = bool(se_lat_plan_enable)
-    params["_shared_event_latent_inducing_plan_cover_frac_of_ell"] = float(se_lat_plan_cover_frac)
-    params["_shared_event_latent_inducing_plan_min_inducing_per_component"] = int(se_lat_plan_min_m)
-    params["_shared_event_latent_inducing_plan_max_inducing_per_component"] = int(se_lat_plan_max_m)
-    params["_shared_event_latent_inducing_plan_top_k"] = int(se_lat_plan_top_k)
-    params["_shared_event_latent_inducing_plan_outfile"] = se_lat_plan_outfile
-    params["_shared_event_latent_inducing_plan_select"] = bool(se_lat_plan_select)
-    params["_shared_event_latent_inducing_plan_selection_outfile"] = se_lat_plan_selection_outfile
-    params["_shared_event_latent_inducing_plan_seed_strategy"] = str(se_lat_plan_seed_strategy)
-    params["_shared_event_latent_inducing_plan_use_xyz"] = bool(se_lat_plan_use_xyz)
-    # Fixed inducing geometry (Option-B) defaulting:
-    # - slowness_inducing_gp: True unless explicitly overridden
-    # - other modes: False unless explicitly overridden
-    if se_lat_plan_fixed_xyz is None:
-        se_lat_plan_fixed_xyz = bool(se_lat_param == "slowness_inducing_gp")
-    params["_shared_event_latent_inducing_fixed_xyz"] = bool(se_lat_plan_fixed_xyz)
-    params["_shared_event_latent_inducing_plan_interpolation_enable"] = bool(se_lat_plan_interp)
-    params["_shared_event_latent_inducing_plan_interpolation_m"] = int(se_lat_plan_interp_m)
-    params["_shared_event_latent_inducing_plan_interpolation_outfile"] = se_lat_plan_interp_outfile
-    params["_shared_event_latent_inducing_plan_interpolation_store_distances"] = bool(se_lat_plan_interp_store_dist)
-    # K_UU diagonal jitter (regularization) for inducing_gp prior construction
-    params["_shared_event_latent_inducing_jitter"] = float(se_lat_plan_kernel_jitter)
-    params["_shared_event_latent_inducing_fitc_enable"] = bool(se_lat_fitc_enable)
-
-    # Station-geometry basis (fixed), optional
-    params["_shared_event_latent_station_basis_enabled"] = bool(se_lat_sta_basis_enabled)
-    params["_shared_event_latent_station_basis_r"] = int(se_lat_sta_basis_r)
-    params["_shared_event_latent_station_basis_ell_km"] = float(se_lat_sta_basis_ell_km)
-    params["_shared_event_latent_station_basis_jitter"] = float(se_lat_sta_basis_jitter)
-    params["_shared_event_latent_station_basis_method"] = str(se_lat_sta_basis_method)
 
     # Latent field (NNGP + ESS) materialized keys (optional)
     params["_latent_field_enabled"] = bool(lf_enabled)

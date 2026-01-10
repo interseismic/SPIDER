@@ -378,14 +378,8 @@ def compute_likelihood_loss(
     
     Loss = Mean( DataLoss(residual / sigma) + log(sigma) )
     """
-    # Likelihood-only tempering (power posterior): posterior ∝ prior * likelihood^alpha
-    # This scales ONLY the likelihood term, leaving priors unchanged.
-    try:
-        alpha = float(params.get("_likelihood_tempering_alpha", 1.0))
-        if not (alpha > 0.0) or not np.isfinite(alpha):
-            alpha = 1.0
-    except Exception:
-        alpha = 1.0
+    # Tempering removed; keep core residual distributions only.
+    alpha = 1.0
 
     # 1. Predict
     dt_pred = compute_travel_times(idx, y, X_src, ΔX_src, model)
@@ -417,6 +411,14 @@ def compute_likelihood_loss(
             pass
     resid = dt_obs - dt_pred
     scaled_resid = resid / sigma
+
+    # Structured likelihood components were removed (start fresh). If an old bundle/checkpoint
+    # carried internal enable flags, fail fast with a clear message.
+    if bool(params.get("_slowness_re_enabled", False)) or bool(params.get("_shared_event_re_enabled", False)) or bool(params.get("_shared_event_latent_enabled", False)):
+        raise ValueError(
+            "Structured likelihood components (slowness_re/shared_event_re/shared_event_latent) have been removed from SPIDER. "
+            "Delete these blocks from your config and regenerate any bundles/checkpoints from a clean run."
+        )
 
     # Optional: collapsed slowness inducing-GP covariance likelihood (Gaussian; marginalized; no latent state).
     #
@@ -2205,7 +2207,7 @@ def compute_likelihood_loss(
     total_nll = data_loss + torch.log(sigma)
     
     # Return MEAN (Average Loss)
-    return float(alpha) * total_nll.mean()
+    return total_nll.mean()
 
 
 def compute_prior_loss(
@@ -2229,11 +2231,14 @@ def compute_prior_loss(
     # Explicit enable flags (defaults preserve legacy behavior)
     event_prior_enable = bool(params.get("prior_event_enable", True))
     centroid_prior_enable = bool(params.get("prior_centroid_enable", True))
-    noise_prior_enable = bool(params.get("prior_noise_enable", True))
     # Runtime gates for other priors (set by the epoch runner). Defaults keep legacy behavior.
     event_runtime_enable = bool(params.get("_prior_event_runtime_enable", True))
     centroid_runtime_enable = bool(params.get("_prior_centroid_runtime_enable", True))
-    noise_runtime_enable = bool(params.get("_prior_noise_runtime_enable", True))
+
+    if bool(params.get("_shared_event_latent_enabled", False)):
+        raise ValueError(
+            "shared_event_latent has been removed from SPIDER. Delete this block from your config and rerun from scratch."
+        )
 
     # 1. Event Location Prior (sum over M events)
     # P(ΔX)
@@ -2330,11 +2335,8 @@ def compute_prior_loss(
         global_centroid = ΔX_src.mean(dim=0)
         log_prob_centroid = prior_centroid.log_prob(global_centroid).sum() * float(ΔX_src.shape[0])
     
-    # 3. Noise Prior (P(sigma))
-    if noise_prior_enable and noise_runtime_enable:
-        log_prob_noise = _compute_noise_prior_log_prob(σ_p, σ_s, params)
-    else:
-        log_prob_noise = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
+    # 3. Noise prior removed: SPIDER uses fixed `phase_unc` only (no σ learning).
+    log_prob_noise = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
     
     # 4. Optional uncollapsed shared-event latent prior p(b)
     # This uses a fixed event-kernel precision Q (kNN Laplacian + q_diag I) built from MAP.
@@ -2463,51 +2465,6 @@ def compute_prior_loss(
     
     base_prior_loss = -total_log_prior / float(N_total)
     return base_prior_loss
-
-
-def _compute_noise_prior_log_prob(σ_p, σ_s, params) -> torch.Tensor:
-    """Helper to compute log_prob for noise scales based on config."""
-    prior_type = str(params.get("noise_prior", "none")).strip().lower()
-    if prior_type in {"none", "", "false", "off"}:
-        return torch.tensor(0.0, device=σ_p.device)
-
-    # Ensure valid inputs
-    s_p = σ_p.clamp_min(1e-12)
-    s_s = σ_s.clamp_min(1e-12)
-    
-    # Extract params
-    def get_loc_scale():
-        l = params.get("noise_prior_loc", [0.0, 0.0])
-        s = params.get("noise_prior_scale", [1.0, 1.0])
-        l_t = torch.tensor(l, device=σ_p.device)
-        s_t = torch.tensor(s, device=σ_p.device).abs().clamp_min(1e-12)
-        return l_t, s_t
-
-    loc, scale = get_loc_scale()
-    weight = float(params.get("noise_prior_weight", 1.0))
-    
-    lp = 0.0
-    
-    if prior_type in {"lognormal", "log_normal"}:
-        # LogNormal(loc, scale)
-        # log_prob(x) = -log(x) - log(scale*sqrt(2pi)) - (log(x)-loc)^2 / (2*scale^2)
-        d_p = torch.distributions.LogNormal(loc[0], scale[0])
-        d_s = torch.distributions.LogNormal(loc[1], scale[1])
-        lp = d_p.log_prob(s_p) + d_s.log_prob(s_s)
-        
-    elif prior_type in {"half_normal", "halfnormal"}:
-        # HalfNormal(scale)
-        d_p = torch.distributions.HalfNormal(scale[0])
-        d_s = torch.distributions.HalfNormal(scale[1])
-        lp = d_p.log_prob(s_p) + d_s.log_prob(s_s)
-        
-    elif prior_type in {"half_cauchy", "halfcauchy"}:
-        # HalfCauchy(scale)
-        d_p = torch.distributions.HalfCauchy(scale[0])
-        d_s = torch.distributions.HalfCauchy(scale[1])
-        lp = d_p.log_prob(s_p) + d_s.log_prob(s_s)
-        
-    return lp * weight
 
 
 def total_loss(

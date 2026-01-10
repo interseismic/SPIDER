@@ -21,21 +21,15 @@ def _standardized_residuals(state) -> torch.Tensor:
         state.II, state.YY, state.X_src, state.dX_src, state.model, bs, state.N
     )  # observed - predicted
 
-    # Build per-row σ from current noise scales
-    # Prefer learned scales if present; otherwise, fixed phase_unc from params.
-    if getattr(state, "learn_noise_scale", False) and getattr(state, "log_scale_theta", None) is not None:
-        σ = torch.exp(state.log_scale_theta.to(resid.device))
-        σ_p = σ[0]
-        σ_s = σ[1]
-    else:
-        try:
-            σ_pair = state.scale_theta.to(resid.device)  # type: ignore[union-attr]
-            σ_p = σ_pair[0]
-            σ_s = σ_pair[1]
-        except Exception:
-            vals = state.params.get("phase_unc", [0.05, 0.08])
-            σ_p = torch.tensor(float(vals[0]), device=resid.device)
-            σ_s = torch.tensor(float(vals[1]), device=resid.device)
+    # Build per-row σ from fixed phase_unc (noise learning removed).
+    try:
+        σ_pair = state.scale_theta.to(resid.device)  # type: ignore[union-attr]
+        σ_p = σ_pair[0]
+        σ_s = σ_pair[1]
+    except Exception:
+        vals = state.params.get("phase_unc", [0.05, 0.08])
+        σ_p = torch.tensor(float(vals[0]), device=resid.device)
+        σ_s = torch.tensor(float(vals[1]), device=resid.device)
     phase_mask = state.YY[:, 4] < 0.5
     σ_row = torch.where(phase_mask, σ_p, σ_s).clamp_min(1e-12)
     return resid / σ_row

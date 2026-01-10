@@ -212,37 +212,13 @@ def _build_initial_state(
         covariance_matrix=torch.diag(torch.tensor(prior_centroid_std, device=device, dtype=torch.float32) ** 2),
     )
 
-    # Noise scales: fixed or learnable
+    # Noise scales: fixed (scalar phase_unc only)
     phase_unc_list = params.get("phase_unc", [0.05, 0.08])
     scale_theta = torch.tensor(phase_unc_list, device=device, dtype=torch.float32)
-    # Noise scale learning is controlled only by the hard-break schema key:
-    #   model.likelihood.learn_noise_scale  -> materialized as params["learn_noise_scale"]
-    #
-    # Do NOT honor legacy aliases like `learn_phase_unc` here, because Phase-2 bundles may carry
-    # stale keys from older runs. That can silently re-enable noise learning even when the current
-    # config sets learn_noise_scale=false.
-    learn_noise = bool(params.get("learn_noise_scale", False))
 
-    # Optimizer parameters
+    # Optimizer parameters (ΔX only; noise learning removed)
     opt_params: List[torch.nn.Parameter] = [dX_src]
     log_scale_theta: Optional[torch.nn.Parameter] = None
-    if learn_noise:
-        # log σ parameters (ensure positivity via exp)
-        log_scale_init = torch.log(scale_theta.clamp_min(1e-8)).detach()
-        # If a noise prior is enabled, initialize to the *median* of that prior.
-        # For LogNormal(loc, scale): median = exp(loc) ⇒ log(median) = loc.
-        try:
-            if bool(params.get("prior_noise_enable", False)):
-                prior_type = str(params.get("noise_prior", "none")).strip().lower()
-                if prior_type in {"lognormal", "log_normal"}:
-                    loc = params.get("noise_prior_loc", None)
-                    if isinstance(loc, (list, tuple)) and len(loc) == 2:
-                        log_scale_init = torch.tensor(loc, device=device, dtype=torch.float32)
-        except Exception:
-            # Fall back to phase_unc-based initialization.
-            pass
-        log_scale_theta = torch.nn.Parameter(log_scale_init.clone())
-        opt_params.append(log_scale_theta)
 
     optimizer = torch.optim.Adam(opt_params, lr=params["lr_warmup"])
     clamp_abs_dX = _parse_clamp_tensor(params, device)
@@ -431,9 +407,7 @@ def _build_initial_state(
         N=N,
         batch_size_warmup=batch_size_warmup,
         batch_size_sgld=batch_size_sgld,
-        scale_theta=None if learn_noise else scale_theta,
-        log_scale_theta=log_scale_theta,
-        learn_noise_scale=learn_noise,
+        scale_theta=scale_theta,
         nuisance_enable=False,
         nuisance_alpha=None,
         nuisance_k_index=None,
@@ -441,7 +415,6 @@ def _build_initial_state(
         nuisance_M=0,
         stats_tensor=torch.zeros(8, device=device),
         samples=[],
-        noise_log_scales=[],
         sample_count=0,
         global_step_count=0,
         clamp_abs_dX=clamp_abs_dX,

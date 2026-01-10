@@ -434,7 +434,7 @@ def _run_epoch(
     # Hard break: priors are active in all phases when enabled (no per-phase scheduling).
     state.params["_prior_event_runtime_enable"] = bool(state.params.get("prior_event_enable", True))
     state.params["_prior_centroid_runtime_enable"] = bool(state.params.get("prior_centroid_enable", True))
-    state.params["_prior_noise_runtime_enable"] = bool(state.params.get("prior_noise_enable", True))
+    # Noise prior removed (fixed phase_unc only).
 
     ddp_enabled, ddp_rank, ddp_world_size, ddp_is_main = _ddp_info(state.params)
     
@@ -1463,84 +1463,7 @@ def _run_epoch(
                 except Exception:
                     pass
 
-        # Optional: heteroscedastic likelihood inflation (no latent term).
-        # Adds extra per-observation variance in quadrature with the base phase noise:
-        #   sigma_eff^2 = sigma_phase^2 + sigma_extra_var
-        #
-        # IMPORTANT: we detach the distance computation from gradients w.r.t. event locations to avoid
-        # a perverse incentive to increase inter-event distances to reduce likelihood weight.
-        try:
-            if bool(state.params.get("_likelihood_sigma_inflation_enabled", False)) and isinstance(II_b, torch.Tensor) and II_b.numel() > 0:
-                mode = str(state.params.get("_likelihood_sigma_inflation_mode", "vel_frac_linear_dd")).strip().lower()
-                if mode == "vel_frac_linear_dd":
-                    vel_frac = state.params.get("_likelihood_sigma_inflation_vel_frac", [0.0, 0.0])
-                    v_km_s = state.params.get("_likelihood_sigma_inflation_v_km_s", [6.0, 3.5])
-                    max_d_km = state.params.get("_likelihood_sigma_inflation_max_d_km", None)
-                    use_3d = bool(state.params.get("_likelihood_sigma_inflation_use_3d", True))
-                    try:
-                        f_p = float(vel_frac[0]); f_s = float(vel_frac[1])
-                    except Exception:
-                        f_p = float(vel_frac); f_s = float(vel_frac)
-                    try:
-                        v_p = float(v_km_s[0]); v_s = float(v_km_s[1])
-                    except Exception:
-                        v_p = float(v_km_s); v_s = float(v_km_s)
-                    if (f_p > 0.0 or f_s > 0.0) and (v_p > 0.0 and v_s > 0.0):
-                        e1 = II_b[:, 0].to(torch.int64)
-                        e2 = II_b[:, 1].to(torch.int64)
-                        # Current event coordinates (km); detach to avoid gradients through sigma.
-                        Xcur = (state.X_src[:, :3] + state.dX_src[:, :3].detach()).to(torch.float32)
-                        x1 = Xcur.index_select(0, e1)
-                        x2 = Xcur.index_select(0, e2)
-                        dxyz = (x2 - x1)
-                        if not use_3d:
-                            dxyz = dxyz[:, :2]
-                        d_km = torch.linalg.norm(dxyz, dim=1).clamp_min(0.0)
-                        if max_d_km is not None:
-                            try:
-                                md = float(max_d_km)
-                                if md > 0.0 and math.isfinite(md):
-                                    d_km = d_km.clamp_max(md)
-                            except Exception:
-                                pass
-                        ph = YY_b[:, 4]
-                        is_s = (ph >= 0.5)
-                        # sigma_struct(d) = (f / v) * d  [seconds]
-                        slope_p = float(f_p) / float(v_p)
-                        slope_s = float(f_s) / float(v_s)
-                        sigma_struct = torch.where(is_s, d_km * float(slope_s), d_km * float(slope_p)).to(torch.float32)
-                        extra_var = sigma_struct.square().clamp_min(0.0)
-                        sigma_extra_var = extra_var if sigma_extra_var is None else (sigma_extra_var + extra_var)
-
-                        # Accumulate per-epoch summary stats (cheap; means only).
-                        try:
-                            if "_sigma_infl_vel_sum_ms" not in state.params:
-                                state.params["_sigma_infl_vel_sum_ms"] = 0.0
-                                state.params["_sigma_infl_vel_count"] = 0
-                                state.params["_sigma_infl_vel_sum_ms_P"] = 0.0
-                                state.params["_sigma_infl_vel_count_P"] = 0
-                                state.params["_sigma_infl_vel_sum_ms_S"] = 0.0
-                                state.params["_sigma_infl_vel_count_S"] = 0
-                                state.params["_sigma_infl_vel_d_km_sum"] = 0.0
-                                state.params["_sigma_infl_vel_d_km_count"] = 0
-                            ms = (1000.0 * sigma_struct.detach()).to(torch.float32)
-                            state.params["_sigma_infl_vel_sum_ms"] = float(state.params.get("_sigma_infl_vel_sum_ms", 0.0) or 0.0) + float(ms.sum().item())
-                            state.params["_sigma_infl_vel_count"] = int(state.params.get("_sigma_infl_vel_count", 0) or 0) + int(ms.numel())
-                            msP = ms[~is_s]
-                            msS = ms[is_s]
-                            if int(msP.numel()) > 0:
-                                state.params["_sigma_infl_vel_sum_ms_P"] = float(state.params.get("_sigma_infl_vel_sum_ms_P", 0.0) or 0.0) + float(msP.sum().item())
-                                state.params["_sigma_infl_vel_count_P"] = int(state.params.get("_sigma_infl_vel_count_P", 0) or 0) + int(msP.numel())
-                            if int(msS.numel()) > 0:
-                                state.params["_sigma_infl_vel_sum_ms_S"] = float(state.params.get("_sigma_infl_vel_sum_ms_S", 0.0) or 0.0) + float(msS.sum().item())
-                                state.params["_sigma_infl_vel_count_S"] = int(state.params.get("_sigma_infl_vel_count_S", 0) or 0) + int(msS.numel())
-                            dk = d_km.detach()
-                            state.params["_sigma_infl_vel_d_km_sum"] = float(state.params.get("_sigma_infl_vel_d_km_sum", 0.0) or 0.0) + float(dk.sum().item())
-                            state.params["_sigma_infl_vel_d_km_count"] = int(state.params.get("_sigma_infl_vel_d_km_count", 0) or 0) + int(dk.numel())
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+        # sigma_inflation removed (start fresh).
 
         b_lat_for_prior = (getattr(state, "shared_event_latent_b", None) if bool(state.params.get("_shared_event_latent_enabled", False)) else None)
         if ddp_enabled:
@@ -1944,10 +1867,7 @@ def _run_epoch(
                         pass
 
                     state.samples.append(state.dX_src.detach().cpu().clone())
-                    σp_now, σs_now = _current_noise_scales(state)
-                    logσ = torch.stack([torch.log(σp_now).detach().cpu(), torch.log(σs_now).detach().cpu()], dim=0)
-                    if state.noise_log_scales is not None:
-                        state.noise_log_scales.append(logσ)
+                    # Noise learning removed (fixed phase_unc only).
 
                     # Optional online ESS/IACT diagnostic using the in-memory samples buffer.
                     try:
@@ -2224,23 +2144,7 @@ def _run_epoch(
             "dt_centered_med_abs": dt_centered_med_abs,
             "dt_centered_p90_abs": dt_centered_p90_abs,
         }
-        # Optional: per-epoch summary for likelihood sigma_inflation (distance/%vel dependent).
-        try:
-            if bool(state.params.get("_likelihood_sigma_inflation_enabled", False)):
-                c = int(state.params.get("_sigma_infl_vel_count", 0) or 0)
-                if c > 0:
-                    metrics["likelihood/sigma_inflation_struct_mean_ms"] = float(state.params.get("_sigma_infl_vel_sum_ms", 0.0) or 0.0) / float(c)
-                cP = int(state.params.get("_sigma_infl_vel_count_P", 0) or 0)
-                if cP > 0:
-                    metrics["likelihood/sigma_inflation_struct_P_mean_ms"] = float(state.params.get("_sigma_infl_vel_sum_ms_P", 0.0) or 0.0) / float(cP)
-                cS = int(state.params.get("_sigma_infl_vel_count_S", 0) or 0)
-                if cS > 0:
-                    metrics["likelihood/sigma_inflation_struct_S_mean_ms"] = float(state.params.get("_sigma_infl_vel_sum_ms_S", 0.0) or 0.0) / float(cS)
-                cd = int(state.params.get("_sigma_infl_vel_d_km_count", 0) or 0)
-                if cd > 0:
-                    metrics["likelihood/sigma_inflation_d_km_mean"] = float(state.params.get("_sigma_infl_vel_d_km_sum", 0.0) or 0.0) / float(cd)
-        except Exception:
-            pass
+        # sigma_inflation removed (start fresh).
         # Optional: timing summary for shared_event_latent nuisance reconstruction (per epoch).
         try:
             diag = _get_diagnostics_cfg(state.params)

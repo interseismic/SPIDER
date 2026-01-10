@@ -219,28 +219,14 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
     if "schedule" in cen:
         raise _err("priors.centroid.schedule", "removed; priors are active in all phases when enabled (delete this block)")
 
-    # ---- Noise prior ----
-    nz = _require_dict(_require(priors, "noise", "priors"), "priors.noise")
-    nz_enabled = _require_bool(_require(nz, "enabled", "priors.noise"), "priors.noise.enabled")
-    nz_type = _require_str(_require(nz, "type", "priors.noise"), "priors.noise.type").lower()
-    if nz_type not in {"lognormal"}:
-        raise _err("priors.noise.type", "supported types: 'lognormal'")
-    nz_params = _require_dict(_require(nz, "params", "priors.noise"), "priors.noise.params")
-    if nz_enabled:
-        nz_loc = _require_float_list(_require(nz_params, "loc", "priors.noise.params"), "priors.noise.params.loc", length=2)
-        nz_scale = _require_float_list(_require(nz_params, "scale", "priors.noise.params"), "priors.noise.params.scale", length=2)
-    else:
-        nz_loc = None
-        nz_scale = None
-
-    if "schedule" in nz:
-        raise _err("priors.noise.schedule", "removed; priors are active in all phases when enabled (delete this block)")
+    # Noise prior removed (start fresh): fixed phase_unc only, no σ learning.
+    if "noise" in priors:
+        raise _err("priors.noise", "removed; delete this block from your config")
 
     # ---- Materialize internal flat keys (used elsewhere in the codebase) ----
     # Enables
     params["prior_event_enable"] = ev_enabled
     params["prior_centroid_enable"] = cen_enabled
-    params["prior_noise_enable"] = nz_enabled
 
     # Event prior
     if ev_enabled:
@@ -255,12 +241,6 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
     # Centroid prior
     if cen_enabled:
         params["prior_centroid_std"] = cen_std
-
-    # Noise prior
-    if nz_enabled:
-        params["noise_prior"] = nz_type
-        params["noise_prior_loc"] = nz_loc
-        params["noise_prior_scale"] = nz_scale
 
     return params
 

@@ -1753,16 +1753,12 @@ def analyze_resid_from_bundle(
             except Exception:
                 sta = None
 
-            # Sigma scales (for z=r/sigma standardization)
+            # Sigma scales (for z=r/sigma standardization): fixed phase_unc only (noise learning removed)
             sigma_p: Optional[float]
             sigma_s: Optional[float]
             try:
-                if getattr(state, "log_scale_theta", None) is not None:
-                    sig_ps = torch.exp(state.log_scale_theta.detach().to("cpu")).numpy().astype(np.float64, copy=False)  # type: ignore[union-attr]
-                    sigma_p = float(sig_ps[0]); sigma_s = float(sig_ps[1])
-                else:
-                    vv = state.params.get("phase_unc", [float("nan"), float("nan")])
-                    sigma_p = float(vv[0]); sigma_s = float(vv[1])
+                vv = state.params.get("phase_unc", [float("nan"), float("nan")])
+                sigma_p = float(vv[0]); sigma_s = float(vv[1])
             except Exception:
                 sigma_p = None; sigma_s = None
             if sigma_p is not None and (not np.isfinite(sigma_p) or sigma_p <= 0):

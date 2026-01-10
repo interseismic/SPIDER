@@ -448,56 +448,6 @@ def _cmd_analyze_resid(args: argparse.Namespace) -> int:
 	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
 	_apply_torch_runtime_settings(params)
 
-	# Optional CLI overrides for shared_event_latent tau estimation inside analyze-resid.
-	# analyze_resid_from_bundle() already calls maybe_estimate_shared_event_latent_tau_after_phase1(state=...),
-	# which reads inference.diagnostics.shared_event_latent_tau_estimate.* from params.
-	try:
-		inf = params.setdefault("inference", {})
-		if not isinstance(inf, dict):
-			inf = {}
-			params["inference"] = inf
-		dg = inf.setdefault("diagnostics", {})
-		if not isinstance(dg, dict):
-			dg = {}
-			inf["diagnostics"] = dg
-		tau_cfg = dg.setdefault("shared_event_latent_tau_estimate", {})
-		if not isinstance(tau_cfg, dict):
-			tau_cfg = {}
-			dg["shared_event_latent_tau_estimate"] = tau_cfg
-
-		# Only override keys when the CLI flag was provided.
-		if getattr(args, "tau_method", None) is not None:
-			tau_cfg["method"] = str(getattr(args, "tau_method")).strip().lower()
-		if getattr(args, "tau_apply", None) is not None:
-			tau_cfg["apply"] = bool(getattr(args, "tau_apply"))
-		if getattr(args, "tau_apply_scale", None) is not None:
-			tau_cfg["apply_scale"] = float(getattr(args, "tau_apply_scale"))
-		if getattr(args, "tau_n_rows", None) is not None:
-			tau_cfg["n_rows"] = int(getattr(args, "tau_n_rows"))
-		if getattr(args, "tau_seed", None) is not None:
-			tau_cfg["seed"] = int(getattr(args, "tau_seed"))
-		if getattr(args, "tau_batch_size", None) is not None:
-			tau_cfg["batch_size"] = int(getattr(args, "tau_batch_size"))
-		if getattr(args, "tau_holdout_frac", None) is not None:
-			tau_cfg["holdout_frac"] = float(getattr(args, "tau_holdout_frac"))
-		if getattr(args, "tau_min_edges_per_group", None) is not None:
-			tau_cfg["min_edges_per_group"] = int(getattr(args, "tau_min_edges_per_group"))
-		if getattr(args, "tau_max_edges_per_group", None) is not None:
-			tau_cfg["max_edges_per_group"] = int(getattr(args, "tau_max_edges_per_group"))
-		if getattr(args, "tau_max_groups_per_phase", None) is not None:
-			tau_cfg["max_groups_per_phase"] = int(getattr(args, "tau_max_groups_per_phase"))
-		if getattr(args, "tau_grid_decades", None) is not None:
-			tau_cfg["grid_decades"] = float(getattr(args, "tau_grid_decades"))
-		if getattr(args, "tau_grid_size", None) is not None:
-			tau_cfg["grid_size"] = int(getattr(args, "tau_grid_size"))
-		if getattr(args, "tau_cg_rtol", None) is not None:
-			tau_cfg["cg_rtol"] = float(getattr(args, "tau_cg_rtol"))
-		if getattr(args, "tau_cg_maxiter", None) is not None:
-			tau_cfg["cg_maxiter"] = int(getattr(args, "tau_cg_maxiter"))
-	except Exception:
-		# Best-effort only; analyze-resid should still run.
-		pass
-
 	dev_list = list(params.get("devices", []))
 	if not dev_list:
 		raise ValueError("No devices configured. Set inference.compute.devices in the config, or pass --device.")
@@ -1119,33 +1069,6 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	g_plot.add_argument("--no-plot-variograms", dest="plot_variograms", action="store_false", help="Disable variogram plotting")
 	p_ar.set_defaults(plot_variograms=True)
 	p_ar.add_argument("--plot-dir", type=str, default=None, help="Directory for variogram PNGs (default: bundle directory)")
-
-	# Optional: shared_event_latent tau estimation overrides (post-Phase1 diagnostics)
-	p_tau = p_ar.add_argument_group("shared_event_latent tau estimation (diagnostics)")
-	p_tau.add_argument(
-		"--tau-method",
-		type=str,
-		default=None,
-		choices=["moment", "cv"],
-		help="Tau estimator for shared_event_latent: 'moment' (fast heuristic) or 'cv' (held-out predictive, slower).",
-	)
-	g_apply = p_tau.add_mutually_exclusive_group()
-	g_apply.set_defaults(tau_apply=None)
-	g_apply.add_argument("--tau-apply", dest="tau_apply", action="store_true", help="Apply estimated tau into params for this analyze-resid run.")
-	g_apply.add_argument("--no-tau-apply", dest="tau_apply", action="store_false", help="Do not apply estimated tau (just print).")
-	p_tau.add_argument("--tau-apply-scale", type=float, default=None, help="Scale factor applied to estimated tau before applying (e.g. 0.5 to be more conservative).")
-	p_tau.add_argument("--tau-n-rows", type=int, default=None, help="Rows to subsample for tau estimation (default depends on method).")
-	p_tau.add_argument("--tau-seed", type=int, default=None, help="RNG seed for tau estimation subsampling/splits.")
-	p_tau.add_argument("--tau-batch-size", type=int, default=None, help="Batch size for residual evaluation during tau estimation.")
-	# CV-only knobs (ignored for moment)
-	p_tau.add_argument("--tau-holdout-frac", type=float, default=None, help="Holdout fraction per station-phase group for CV tau.")
-	p_tau.add_argument("--tau-min-edges-per-group", type=int, default=None, help="Minimum edges per station-phase group to include in CV.")
-	p_tau.add_argument("--tau-max-edges-per-group", type=int, default=None, help="Max edges per station-phase group (cap for compute).")
-	p_tau.add_argument("--tau-max-groups-per-phase", type=int, default=None, help="Max station groups per phase to include in CV.")
-	p_tau.add_argument("--tau-grid-decades", type=float, default=None, help="Log10 half-width for tau grid around center (e.g. 1.0 -> ×[0.1,10]).")
-	p_tau.add_argument("--tau-grid-size", type=int, default=None, help="Number of tau candidates in the grid (odd recommended).")
-	p_tau.add_argument("--tau-cg-rtol", type=float, default=None, help="CG relative tolerance for CV ridge solves.")
-	p_tau.add_argument("--tau-cg-maxiter", type=int, default=None, help="CG max iterations for CV ridge solves.")
 
 	p_ar.set_defaults(func=_cmd_analyze_resid)
 
