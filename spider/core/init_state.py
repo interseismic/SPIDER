@@ -421,6 +421,7 @@ def _build_initial_state(
     try:
         params["_runtime_event_cluster_ids"] = cluster_ids
         params["_runtime_n_stations"] = int(n_stations)
+        params["_runtime_n_components"] = int(n_components)
     except Exception:
         pass
     _attach_dd_preconditioner_metric(state)

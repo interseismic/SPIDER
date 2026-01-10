@@ -570,42 +570,54 @@ def compute_likelihood_loss(
             t = ((z - x0) / denom).clamp(0.0, 1.0)
             return y0 + t * (y1 - y0)
 
-        # Build group keys:
-        # - Fast path (K_full available): group by (station, phase) only (no explicit component split).
-        # - Fallback: preserve previous component-wise grouping if K_full not available.
+        # Build group keys.
+        #
+        # IMPORTANT performance note:
+        # If there are many connected components, using K_full (sum of all inducing points) can make the
+        # per-group linear solve enormous (3*M_total). Even though K_full is block-diagonal and each row
+        # only touches its own component's inducing points, the dense solve cost scales with M_total.
+        #
+        # For many components (common in practice), we therefore prefer *component-wise* grouping even
+        # when K_full is available: group by (component, station, phase) and solve against the component's
+        # K_UU block only. This is mathematically equivalent when K_full is block-diagonal and neighbor
+        # supports are disjoint across components, but it is vastly faster.
         ph_id = torch.where(is_p, torch.zeros_like(resid, dtype=torch.int64), torch.ones_like(resid, dtype=torch.int64))
-        if have_full:
-            if grouping == "phase":
-                keys = ph_id
-            else:
-                n_sta = params.get("_runtime_n_stations", None)
-                if (not isinstance(n_sta, int)) or n_sta <= 0:
-                    try:
-                        n_sta = int(sta_idx.max().item()) + 1  # type: ignore[union-attr]
-                    except Exception:
-                        n_sta = 1
-                keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id  # type: ignore[union-attr]
+        # Decide whether to force component-wise grouping.
+        n_comp = params.get("_runtime_n_components", 1)
+        try:
+            n_comp_i = int(n_comp) if n_comp is not None else 1
+        except Exception:
+            n_comp_i = 1
+        prefer_componentwise = (
+            n_comp_i > 1
+            and isinstance(cid_ev, torch.Tensor)
+            and isinstance(comp_to_block, torch.Tensor)
+            and isinstance(K_blocks, list) and len(K_blocks) > 0
+            and isinstance(offs, torch.Tensor)
+        )
+
+        if cid_ev is None:
+            comp_row = torch.zeros_like(ph_id, dtype=torch.int64)
         else:
-            if cid_ev is None:
-                comp_row = torch.zeros_like(ph_id, dtype=torch.int64)
-            else:
-                comp_row = cid_ev.index_select(0, idx[:, 0].to(dtype=torch.int64))
-            if grouping == "phase":
-                keys = (comp_row * 2) + ph_id
-            else:
-                n_sta = params.get("_runtime_n_stations", None)
-                if not isinstance(n_sta, int) or n_sta <= 0:
-                    try:
-                        n_sta = int(getattr(params.get("_runtime_state_n_stations", None), "item", lambda: 0)())
-                    except Exception:
-                        n_sta = 0
-                if (not isinstance(n_sta, int)) or n_sta <= 0:
-                    # fall back to local max+1
-                    try:
-                        n_sta = int(sta_idx.max().item()) + 1  # type: ignore[union-attr]
-                    except Exception:
-                        n_sta = 1
+            comp_row = cid_ev.index_select(0, idx[:, 0].to(dtype=torch.int64))
+
+        if grouping == "phase":
+            # For phase grouping, include component id when componentwise to keep solves small.
+            keys = (comp_row * 2) + ph_id if prefer_componentwise else ph_id
+            n_sta = None
+        else:
+            # station_phase
+            n_sta = params.get("_runtime_n_stations", None)
+            if (not isinstance(n_sta, int)) or n_sta <= 0:
+                # fall back to local max+1 (best-effort)
+                try:
+                    n_sta = int(sta_idx.max().item()) + 1  # type: ignore[union-attr]
+                except Exception:
+                    n_sta = 1
+            if prefer_componentwise:
                 keys = ((comp_row * int(n_sta)) + sta_idx.to(dtype=torch.int64)) * 2 + ph_id  # type: ignore[union-attr]
+            else:
+                keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id  # type: ignore[union-attr]
 
         keys_sorted, perm = torch.sort(keys)
         if keys_sorted.numel() > 0:
@@ -623,8 +635,38 @@ def compute_likelihood_loss(
         n_groups_fallback_diag = 0
         max_rows_seen = 0
         max_nodes_seen = 0
+        # Precompute a single representative key per group on CPU to avoid per-group GPU syncs.
+        # (We still slice idx tensors on GPU for compute, but key decoding happens on CPU.)
+        try:
+            group_keys = keys_sorted.index_select(0, starts) if starts.numel() > 0 else torch.zeros((0,), device=keys_sorted.device, dtype=keys_sorted.dtype)
+            group_keys_cpu = group_keys.detach().cpu().numpy()
+            starts_cpu = starts.detach().cpu().numpy()
+            ends_cpu = ends.detach().cpu().numpy()
+        except Exception:
+            group_keys_cpu = None
+            starts_cpu = None
+            ends_cpu = None
+
+        # Cache small lookup tables on CPU to avoid .item() syncs in the group loop.
+        comp_to_block_cpu = None
+        offs_cpu = None
+        try:
+            if prefer_componentwise and isinstance(comp_to_block, torch.Tensor):
+                comp_to_block_cpu = comp_to_block.detach().cpu().numpy()
+            if prefer_componentwise and isinstance(offs, torch.Tensor):
+                offs_cpu = offs.detach().cpu().numpy()
+        except Exception:
+            comp_to_block_cpu = None
+            offs_cpu = None
+
         # main group loop
-        for si, ei in zip(starts.tolist(), ends.tolist()):
+        if group_keys_cpu is not None and starts_cpu is not None and ends_cpu is not None:
+            group_iter = zip(starts_cpu.tolist(), ends_cpu.tolist(), [int(k) for k in group_keys_cpu.tolist()])
+        else:
+            # Fallback (older behavior)
+            group_iter = zip(starts.tolist(), ends.tolist(), [None] * int(starts.numel()))
+
+        for si, ei, key_i in group_iter:
             idxs = perm[si:ei]
             m_g = int(idxs.numel())
             if m_g <= 0:
@@ -632,8 +674,23 @@ def compute_likelihood_loss(
             n_groups_total += 1
             if m_g > max_rows_seen:
                 max_rows_seen = m_g
-            # Phase for this group
-            ph_g = int(ph_id.index_select(0, idxs[:1]).item())
+            # Phase for this group (decode from key if possible; else fall back to GPU lookup).
+            if key_i is not None:
+                ph_g = int(key_i & 1)
+                comp_id = None
+                if prefer_componentwise:
+                    # key = ((comp*n_sta + sta)*2 + ph) for station_phase
+                    # key = (comp*2 + ph) for phase
+                    if grouping == "phase":
+                        comp_id = int(key_i >> 1)
+                    else:
+                        try:
+                            comp_id = int((key_i >> 1) // int(n_sta)) if isinstance(n_sta, int) and n_sta > 0 else None
+                        except Exception:
+                            comp_id = None
+            else:
+                ph_g = int(ph_id.index_select(0, idxs[:1]).item())
+                comp_id = None
             tau0 = tau_p if ph_g == 0 else tau_s
             tau = float(tau0)
             sigma_g = σ_p if ph_g == 0 else σ_s
@@ -674,45 +731,79 @@ def compute_likelihood_loss(
                 quad = quad + _CollapsedQuad.apply(resid_g, u_g)
                 continue
 
-            if have_full:
-                Kuu = K_full
-                M = int(Kuu.shape[0])
-                if M <= 0:
-                    n_groups_fallback_diag += 1
-                    u_g = resid_g / sigma_g.square().clamp_min(1e-24)
-                    quad = quad + _CollapsedQuad.apply(resid_g, u_g)
-                    continue
-                # No component-bound offsets in this mode.
-                off0 = 0
-                off1 = M
-            else:
-                # Component id for this group (from the first row; keys enforce constness)
-                if cid_ev is None:
-                    comp_id = 0
-                else:
-                    comp_id = int(cid_ev.index_select(0, idx_g[:1, 0].to(dtype=torch.int64)).item())
-                if comp_id < 0 or comp_id >= int(comp_to_block.numel()):
-                    n_groups_fallback_diag += 1
-                    u_g = resid_g / sigma_g.square().clamp_min(1e-24)
-                    quad = quad + _CollapsedQuad.apply(resid_g, u_g)
-                    continue
-                bi = int(comp_to_block[comp_id].item())
+            # Choose K_UU block and inducing index window.
+            # Prefer component-wise blocks when there are multiple components.
+            if prefer_componentwise:
+                # Ensure we have a component id (decode from key when possible; else fall back to GPU).
+                if comp_id is None:
+                    try:
+                        comp_id = int(cid_ev.index_select(0, idx_g[:1, 0].to(dtype=torch.int64)).item()) if isinstance(cid_ev, torch.Tensor) else 0
+                    except Exception:
+                        comp_id = 0
+                try:
+                    if comp_to_block_cpu is not None:
+                        bi = int(comp_to_block_cpu[int(comp_id)])
+                    else:
+                        bi = int(comp_to_block[int(comp_id)].item())  # may sync (fallback)
+                except Exception:
+                    bi = -1
                 if bi < 0 or bi >= int(len(K_blocks)):
                     n_groups_fallback_diag += 1
                     u_g = resid_g / sigma_g.square().clamp_min(1e-24)
                     quad = quad + _CollapsedQuad.apply(resid_g, u_g)
                     continue
                 Kuu = K_blocks[bi].to(device=dev, dtype=torch.float32)
-                off0 = int(offs[bi].item())
-                off1 = int(offs[bi + 1].item())
+                try:
+                    if offs_cpu is not None:
+                        off0 = int(offs_cpu[int(bi)])
+                        off1 = int(offs_cpu[int(bi) + 1])
+                    else:
+                        off0 = int(offs[int(bi)].item())
+                        off1 = int(offs[int(bi) + 1].item())
+                except Exception:
+                    off0 = 0
+                    off1 = int(Kuu.shape[0])
                 M = int(Kuu.shape[0])
                 if M <= 0 or (off1 - off0) != M:
                     n_groups_fallback_diag += 1
                     u_g = resid_g / sigma_g.square().clamp_min(1e-24)
                     quad = quad + _CollapsedQuad.apply(resid_g, u_g)
                     continue
+            else:
+                # Single-component (or explicitly not splitting): use K_full if available, else fall back to blocks.
+                if have_full and isinstance(K_full, torch.Tensor):
+                    Kuu = K_full
+                    M = int(Kuu.shape[0])
+                    off0 = 0
+                    off1 = M
+                    if M <= 0:
+                        n_groups_fallback_diag += 1
+                        u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                        quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                        continue
+                else:
+                    # Fallback to blocks (component id from GPU).
+                    try:
+                        comp_id2 = int(cid_ev.index_select(0, idx_g[:1, 0].to(dtype=torch.int64)).item()) if isinstance(cid_ev, torch.Tensor) else 0
+                        bi = int(comp_to_block[int(comp_id2)].item()) if isinstance(comp_to_block, torch.Tensor) else -1
+                    except Exception:
+                        bi = -1
+                    if bi < 0 or bi >= int(len(K_blocks)):
+                        n_groups_fallback_diag += 1
+                        u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                        quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                        continue
+                    Kuu = K_blocks[bi].to(device=dev, dtype=torch.float32)
+                    off0 = int(offs[bi].item())
+                    off1 = int(offs[bi + 1].item())
+                    M = int(Kuu.shape[0])
+                    if M <= 0 or (off1 - off0) != M:
+                        n_groups_fallback_diag += 1
+                        u_g = resid_g / sigma_g.square().clamp_min(1e-24)
+                        quad = quad + _CollapsedQuad.apply(resid_g, u_g)
+                        continue
 
-            # Endpoints and geometry (detach)
+            # Endpoints and geometry (X_cur is already detached by construction).
             e1 = idx_g[:, 0].to(dtype=torch.int64)
             e2 = idx_g[:, 1].to(dtype=torch.int64)
             x1 = X_cur.index_select(0, e1)
@@ -798,56 +889,56 @@ def compute_likelihood_loss(
             # using scatter_add into (B×M), then use a weighted matmul to get BtDB and rhs. For the common case
             # in compact clusters with long ell, M is tiny (1–8) and this is very fast.
             w_f = w.to(torch.float32)
-            # Dense Kbar: (B,M) with Kbar[b,u] = sum_k kbar[b,k] for neighbors mapping to u.
-            Kbar_dense = torch.zeros((B, M), device=dev, dtype=torch.float32)
-            # nei_loc is (B,K) with invalid entries mapped to 0 and kbar already zeroed for invalid => safe scatter_add
-            Kbar_dense.scatter_add_(1, nei_loc, kbar)
-            # B_dense: (B,3M)
-            B0 = (w_f[:, 0:1] * Kbar_dense)
-            B1 = (w_f[:, 1:2] * Kbar_dense)
-            B2 = (w_f[:, 2:3] * Kbar_dense)
-            B_dense = torch.cat([B0, B1, B2], dim=1).contiguous()
+            # Solve path: do NOT build autograd graphs here (covariance depends on detached X_cur anyway,
+            # and _CollapsedQuad applies the correct d/dr=u without differentiating through the solve).
+            with torch.no_grad():
+                # Dense Kbar: (B,M) with Kbar[b,u] = sum_k kbar[b,k] for neighbors mapping to u.
+                Kbar_dense = torch.zeros((B, M), device=dev, dtype=torch.float32)
+                # nei_loc is (B,K) with invalid entries mapped to 0 and kbar already zeroed for invalid => safe scatter_add
+                Kbar_dense.scatter_add_(1, nei_loc, kbar)
+                # B_dense: (B,3M)
+                B0 = (w_f[:, 0:1] * Kbar_dense)
+                B1 = (w_f[:, 1:2] * Kbar_dense)
+                B2 = (w_f[:, 2:3] * Kbar_dense)
+                B_dense = torch.cat([B0, B1, B2], dim=1).contiguous()
 
-            # Weighted system using sqrt(alpha_d): BtDB = (sqrtA*B)^T (sqrtA*B), rhs = (sqrtA*B)^T (sqrtA*r)
-            sA = alpha_d.sqrt().to(torch.float32)  # (B,)
-            WB = B_dense * sA.unsqueeze(1)         # (B,3M)
-            wr = resid_g.to(torch.float32) * sA    # (B,)
-            BtDB = WB.transpose(0, 1) @ WB         # (3M,3M)
-            rhs_vec = WB.transpose(0, 1) @ wr      # (3M,)
+                # Weighted system using sqrt(alpha_d): BtDB = (sqrtA*B)^T (sqrtA*B), rhs = (sqrtA*B)^T (sqrtA*r)
+                sA = alpha_d.sqrt().to(torch.float32)  # (B,)
+                WB = B_dense * sA.unsqueeze(1)         # (B,3M)
+                wr = resid_g.detach().to(torch.float32) * sA    # (B,)
+                BtDB = WB.transpose(0, 1) @ WB         # (3M,3M)
+                rhs_vec = WB.transpose(0, 1) @ wr      # (3M,)
 
-            # Add prior term A^{-1} = (1/tau^2) * (Kuu ⊗ I3)
-            inv_tau2 = float(1.0 / (float(tau) * float(tau)))
-            if have_full:
-                # Avoid python loops for the common/full mode.
-                if isinstance(K_full3, torch.Tensor) and int(K_full3.shape[0]) == int(3 * M):
-                    G = BtDB + (inv_tau2 * K_full3)
-                else:
-                    Kprior = (inv_tau2 * Kuu)
-                    G = BtDB + torch.block_diag(Kprior, Kprior, Kprior)
-            else:
-                G = BtDB
-                for d0 in range(3):
-                    s0 = d0 * M
-                    G[s0 : s0 + M, s0 : s0 + M] = G[s0 : s0 + M, s0 : s0 + M] + (inv_tau2 * Kuu)
+                # Add prior term A^{-1} = (1/tau^2) * (Kuu ⊗ I3)
+                inv_tau2 = float(1.0 / (float(tau) * float(tau)))
+                # We only need Kuu for this block; use a block-diagonal add.
+                Kprior = (inv_tau2 * Kuu.to(device=dev, dtype=torch.float32))
+                G = BtDB + torch.block_diag(Kprior, Kprior, Kprior)
 
-            # Solve S y = rhs
-            try:
-                L = torch.linalg.cholesky(G)
-                y = torch.cholesky_solve(rhs_vec.reshape(-1, 1), L).reshape(-1)  # (3M,)
-            except Exception:
+                # Solve S y = rhs (best-effort; fall back to diag)
                 try:
-                    j = 1e-4
-                    L = torch.linalg.cholesky(G + (j * torch.eye(int(G.shape[0]), device=dev, dtype=G.dtype)))
-                    y = torch.cholesky_solve(rhs_vec.reshape(-1, 1), L).reshape(-1)
+                    # Prefer cholesky_ex to avoid Python exception overhead in the common case.
+                    L, info0 = torch.linalg.cholesky_ex(G)
+                    if int(info0.item()) != 0:
+                        # Escalate jitter a bit (rare)
+                        j = 1e-4
+                        I = torch.eye(int(G.shape[0]), device=dev, dtype=G.dtype)
+                        L, info1 = torch.linalg.cholesky_ex(G + (j * I))
+                        if int(info1.item()) != 0:
+                            raise RuntimeError("cholesky failed")
+                    y = torch.cholesky_solve(rhs_vec.reshape(-1, 1), L).reshape(-1)  # (3M,)
                 except Exception:
+                    y = None
+
+                if y is None:
                     n_groups_fallback_diag += 1
                     u_g = resid_g / sigma_g.square().clamp_min(1e-24)
                     quad = quad + _CollapsedQuad.apply(resid_g, u_g)
                     continue
 
-            by = (B_dense @ y).to(torch.float32)  # (B,)
-            u_g = alpha_d * (resid_g.to(torch.float32) - by)
-            u_g = u_g.to(dtype=resid_g.dtype)
+                by = (B_dense @ y).to(torch.float32)  # (B,)
+                u_g = alpha_d * (resid_g.detach().to(torch.float32) - by)
+                u_g = u_g.to(dtype=resid_g.dtype)
             n_groups_woodbury += 1
             quad = quad + _CollapsedQuad.apply(resid_g, u_g)
 

@@ -67,6 +67,47 @@ def _validate_params_synth(params: dict) -> dict:
 	return params
 
 
+def _apply_torch_runtime_settings(params: dict) -> None:
+	"""
+	Apply optional torch runtime performance settings.
+
+	This is particularly useful for `sample-multi` where each process should configure
+	its own CUDA backend deterministically at startup.
+
+	Config (optional; extra keys under inference.runtime are allowed):
+	  inference:
+	    runtime:
+	      torch:
+	        allow_tf32: bool
+	        matmul_precision: "highest"|"high"|"medium"
+	"""
+	try:
+		inf = params.get("inference", None)
+		rt = inf.get("runtime", None) if isinstance(inf, dict) else None
+		tc = rt.get("torch", None) if isinstance(rt, dict) else None
+		if not isinstance(tc, dict):
+			return
+		allow_tf32 = tc.get("allow_tf32", None)
+		if allow_tf32 is not None:
+			v = bool(allow_tf32)
+			try:
+				torch.backends.cuda.matmul.allow_tf32 = v  # type: ignore[attr-defined]
+			except Exception:
+				pass
+			try:
+				torch.backends.cudnn.allow_tf32 = v  # type: ignore[attr-defined]
+			except Exception:
+				pass
+		mp = tc.get("matmul_precision", None)
+		if mp is not None:
+			try:
+				torch.set_float32_matmul_precision(str(mp))
+			except Exception:
+				pass
+	except Exception:
+		return
+
+
 def _device_from_id(device_id: int) -> torch.device:
 	"""
 	Map an internal device id to a torch.device.
@@ -131,6 +172,7 @@ def _load_model(params: dict, device: int | str) -> torch.nn.Module:
 def _cmd_locate_full(args: argparse.Namespace) -> int:
 	"""Legacy: run the full pipeline (Phase 1 + Phase 2–4)."""
 	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
+	_apply_torch_runtime_settings(params)
 
 	# Device selection:
 	# - Single-device commands use exactly one entry from `inference.compute.devices` (or --device override).
@@ -187,6 +229,7 @@ def _cmd_locate_full(args: argparse.Namespace) -> int:
 def _cmd_locate_map(args: argparse.Namespace) -> int:
 	"""Run Phase 1 only, then dump a Phase-2 bundle."""
 	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
+	_apply_torch_runtime_settings(params)
 
 	# --- Optional distributed (torchrun) mode ---
 	# This is a *single-chain* multi-GPU mode (data-parallel minibatches) for Phase 1 (MAP).
@@ -291,6 +334,7 @@ def _cmd_locate_map(args: argparse.Namespace) -> int:
 def _cmd_sample(args: argparse.Namespace) -> int:
 	"""Run Phase 2–4 starting from a Phase-2 bundle (skips Phase 1)."""
 	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
+	_apply_torch_runtime_settings(params)
 
 	# --- Optional distributed (torchrun) mode ---
 	# This is a *single-chain* multi-GPU mode (data-parallel minibatches).
@@ -402,6 +446,7 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 def _cmd_analyze_resid(args: argparse.Namespace) -> int:
 	"""Run post-Phase1 residual diagnostics from an existing Phase-2 bundle (no MAP rerun)."""
 	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
+	_apply_torch_runtime_settings(params)
 
 	# Optional CLI overrides for shared_event_latent tau estimation inside analyze-resid.
 	# analyze_resid_from_bundle() already calls maybe_estimate_shared_event_latent_tau_after_phase1(state=...),
@@ -663,6 +708,7 @@ def _random_field_values_xy(
 def _cmd_synth(args: argparse.Namespace) -> int:
 	# Load params
 	params = _validate_params_synth(_load_params_json(args.params))
+	_apply_torch_runtime_settings(params)
 	device_id = int(args.device) if args.device is not None else int(params["devices"][0])
 	if torch.cuda.is_available():
 		device = torch.device(f"cuda:{device_id}")
