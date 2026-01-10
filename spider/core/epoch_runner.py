@@ -362,6 +362,8 @@ def _run_epoch(
                     )
             except Exception:
                 pass
+        # Expose whether this epoch is shuffled to lower-level code (e.g. caching in likelihoods).
+        state.params["_runtime_batch_shuffle"] = bool(shuffle)
 
     # Expose epoch index to lower-level code paths (e.g., likelihood caching / refresh schedules).
     # This is an internal implementation detail, not a user-facing config key.
@@ -449,6 +451,9 @@ def _run_epoch(
         batch_size = int(state.params.get(bs_key, 10000))
         batch_iter = range(0, state.N // batch_size + 1)
         use_buckets = False
+        # Expose standard batching parameters for lower-level caching.
+        state.params["_runtime_batch_size"] = int(batch_size)
+        state.params["_runtime_batching_mode"] = "standard"
 
     # Noise setup (generic sampler backend)
     # If noise_scale_factor > 0, enable noise; else disable (e.g., Phase 2). Phase 3 ramps it.
@@ -619,6 +624,10 @@ def _run_epoch(
                     state.params["_runtime_bucket_station_index"] = sta_b
                 except Exception:
                     state.params["_runtime_bucket_station_index"] = None
+                # Not a standard batch; clear standard ids to avoid accidental cache hits.
+                state.params["_runtime_batch_id"] = -1
+                state.params["_runtime_batch_i0"] = -1
+                state.params["_runtime_batch_i1"] = -1
             else:
                 # batch_item is batch_idx tensor
                 # Defensive: ensure batch row indices are in-range before index_select.
@@ -655,6 +664,10 @@ def _run_epoch(
                         state.params["_runtime_bucket_station_index"] = None
                 except Exception:
                     state.params["_runtime_bucket_station_index"] = None
+                # Not a standard batch; clear standard ids to avoid accidental cache hits.
+                state.params["_runtime_batch_id"] = -1
+                state.params["_runtime_batch_i0"] = -1
+                state.params["_runtime_batch_i1"] = -1
         else:
             # batch_item is j (index of batch)
             i_start = batch_item * batch_size
@@ -676,6 +689,10 @@ def _run_epoch(
             state.params["_runtime_bucket_v_s"] = None
             state.params["_runtime_bucket_chunks_p"] = None
             state.params["_runtime_bucket_chunks_s"] = None
+            # Stable standard batch id (only meaningful when _runtime_batch_shuffle is false).
+            state.params["_runtime_batch_id"] = int(batch_item)
+            state.params["_runtime_batch_i0"] = int(i_start)
+            state.params["_runtime_batch_i1"] = int(i_end)
             try:
                 if getattr(state, "row_station_index_epoch", None) is not None:
                     state.params["_runtime_bucket_station_index"] = state.row_station_index_epoch[i_start:i_end]

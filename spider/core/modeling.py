@@ -619,15 +619,109 @@ def compute_likelihood_loss(
             else:
                 keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id  # type: ignore[union-attr]
 
-        keys_sorted, perm = torch.sort(keys)
-        if keys_sorted.numel() > 0:
-            is_new = torch.ones_like(keys_sorted, dtype=torch.bool)
-            is_new[1:] = keys_sorted[1:] != keys_sorted[:-1]
-            starts = torch.nonzero(is_new, as_tuple=False).reshape(-1)
-            ends = torch.cat([starts[1:], torch.tensor([keys_sorted.numel()], device=starts.device, dtype=starts.dtype)])
-        else:
-            starts = torch.zeros((0,), device=resid.device, dtype=torch.int64)
-            ends = torch.zeros((0,), device=resid.device, dtype=torch.int64)
+        # --- Optional caching of station_phase grouping ---
+        #
+        # Sorting `keys` each batch can be expensive when batch sizes are huge (100k–1M+).
+        # When standard batching is deterministic (batch_shuffle=false), we can cache the sort perm
+        # and group boundaries per batch id to avoid re-sorting every epoch.
+        cache_ok = False
+        try:
+            cache_ok = (not bool(params.get("_runtime_batch_shuffle", True))) and (int(params.get("_runtime_batch_id", -1)) >= 0)
+        except Exception:
+            cache_ok = False
+        cache_key = None
+        cache_entry = None
+        if cache_ok:
+            try:
+                bid = int(params.get("_runtime_batch_id", -1))
+                bsz = int(keys.numel())
+                # Include prefer_componentwise and grouping in the cache key to avoid collisions.
+                cache_key = ("slowness_re", str(grouping), int(prefer_componentwise), int(bsz), int(bid))
+                cache = params.setdefault("_slowness_re_group_cache", {})
+                cache_entry = cache.get(cache_key, None) if isinstance(cache, dict) else None
+            except Exception:
+                cache_key = None
+                cache_entry = None
+
+        if isinstance(cache_entry, dict):
+            perm = cache_entry.get("perm", None)
+            starts = cache_entry.get("starts", None)
+            ends = cache_entry.get("ends", None)
+            group_ph = cache_entry.get("ph", None)
+            group_comp = cache_entry.get("comp", None)
+            # Validate shapes (best-effort); fall back if invalid.
+            ok = (
+                isinstance(perm, torch.Tensor) and perm.ndim == 1 and int(perm.numel()) == int(keys.numel())
+                and isinstance(starts, torch.Tensor) and starts.ndim == 1
+                and isinstance(ends, torch.Tensor) and ends.ndim == 1 and int(ends.numel()) == int(starts.numel())
+                and isinstance(group_ph, list) and len(group_ph) == int(starts.numel())
+            )
+            if not ok:
+                perm = None
+                starts = None
+                ends = None
+                group_ph = None
+                group_comp = None
+                cache_entry = None
+
+        if cache_entry is None:
+            # Compute grouping fresh
+            keys_sorted, perm = torch.sort(keys)
+            if keys_sorted.numel() > 0:
+                is_new = torch.ones_like(keys_sorted, dtype=torch.bool)
+                is_new[1:] = keys_sorted[1:] != keys_sorted[:-1]
+                starts = torch.nonzero(is_new, as_tuple=False).reshape(-1)
+                ends = torch.cat([starts[1:], torch.tensor([keys_sorted.numel()], device=starts.device, dtype=starts.dtype)])
+            else:
+                starts = torch.zeros((0,), device=resid.device, dtype=torch.int64)
+                ends = torch.zeros((0,), device=resid.device, dtype=torch.int64)
+
+            # Decode (phase, component) per group on CPU to avoid per-group GPU syncs later.
+            group_ph: list[int] = []
+            group_comp: list[int] | None = [] if prefer_componentwise else None
+            try:
+                if starts.numel() > 0:
+                    gk = keys_sorted.index_select(0, starts).detach().cpu().numpy().astype(np.int64, copy=False)
+                    for kk in gk.tolist():
+                        ph_g = int(kk & 1)
+                        group_ph.append(ph_g)
+                        if prefer_componentwise and group_comp is not None:
+                            if grouping == "phase":
+                                group_comp.append(int(kk >> 1))
+                            else:
+                                # key = ((comp*n_sta + sta)*2 + ph)
+                                comp_id = int((kk >> 1) // int(n_sta)) if isinstance(n_sta, int) and n_sta > 0 else 0
+                                group_comp.append(int(comp_id))
+                else:
+                    group_ph = []
+                    group_comp = [] if prefer_componentwise else None
+            except Exception:
+                # Fallback: keep empty decoded lists; group loop can still recover phase from tensor.
+                group_ph = [0 for _ in range(int(starts.numel()))]
+                group_comp = ([0 for _ in range(int(starts.numel()))] if prefer_componentwise else None)
+
+            # Insert into cache (best-effort) if enabled.
+            if cache_ok and cache_key is not None:
+                try:
+                    cache = params.setdefault("_slowness_re_group_cache", {})
+                    order = params.setdefault("_slowness_re_group_cache_order", [])
+                    max_entries = int(params.get("_slowness_re_group_cache_max_entries", 32))
+                    if max_entries < 0:
+                        max_entries = 0
+                    if isinstance(cache, dict) and max_entries > 0:
+                        cache[cache_key] = {"perm": perm, "starts": starts, "ends": ends, "ph": group_ph, "comp": group_comp}
+                        if isinstance(order, list):
+                            order.append(cache_key)
+                            # Evict oldest entries
+                            while len(order) > int(max_entries):
+                                old = order.pop(0)
+                                try:
+                                    if old in cache:
+                                        del cache[old]
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
 
         quad = torch.tensor(0.0, device=resid.device, dtype=resid.dtype)
         n_groups_total = 0
@@ -635,15 +729,11 @@ def compute_likelihood_loss(
         n_groups_fallback_diag = 0
         max_rows_seen = 0
         max_nodes_seen = 0
-        # Precompute a single representative key per group on CPU to avoid per-group GPU syncs.
-        # (We still slice idx tensors on GPU for compute, but key decoding happens on CPU.)
+        # Use CPU-side boundaries for group iteration (one-time sync), then run group work on GPU.
         try:
-            group_keys = keys_sorted.index_select(0, starts) if starts.numel() > 0 else torch.zeros((0,), device=keys_sorted.device, dtype=keys_sorted.dtype)
-            group_keys_cpu = group_keys.detach().cpu().numpy()
             starts_cpu = starts.detach().cpu().numpy()
             ends_cpu = ends.detach().cpu().numpy()
         except Exception:
-            group_keys_cpu = None
             starts_cpu = None
             ends_cpu = None
 
@@ -660,13 +750,16 @@ def compute_likelihood_loss(
             offs_cpu = None
 
         # main group loop
-        if group_keys_cpu is not None and starts_cpu is not None and ends_cpu is not None:
-            group_iter = zip(starts_cpu.tolist(), ends_cpu.tolist(), [int(k) for k in group_keys_cpu.tolist()])
+        if starts_cpu is not None and ends_cpu is not None and isinstance(group_ph, list) and len(group_ph) == int(starts.numel()):
+            if prefer_componentwise and isinstance(group_comp, list) and len(group_comp) == int(starts.numel()):
+                group_iter = zip(starts_cpu.tolist(), ends_cpu.tolist(), group_ph, group_comp)
+            else:
+                group_iter = zip(starts_cpu.tolist(), ends_cpu.tolist(), group_ph, [None] * int(starts.numel()))
         else:
-            # Fallback (older behavior)
-            group_iter = zip(starts.tolist(), ends.tolist(), [None] * int(starts.numel()))
+            # Fallback (rare): sync starts/ends and infer phase from tensor
+            group_iter = zip(starts.tolist(), ends.tolist(), [None] * int(starts.numel()), [None] * int(starts.numel()))
 
-        for si, ei, key_i in group_iter:
+        for si, ei, ph_g0, comp_id0 in group_iter:
             idxs = perm[si:ei]
             m_g = int(idxs.numel())
             if m_g <= 0:
@@ -674,23 +767,12 @@ def compute_likelihood_loss(
             n_groups_total += 1
             if m_g > max_rows_seen:
                 max_rows_seen = m_g
-            # Phase for this group (decode from key if possible; else fall back to GPU lookup).
-            if key_i is not None:
-                ph_g = int(key_i & 1)
-                comp_id = None
-                if prefer_componentwise:
-                    # key = ((comp*n_sta + sta)*2 + ph) for station_phase
-                    # key = (comp*2 + ph) for phase
-                    if grouping == "phase":
-                        comp_id = int(key_i >> 1)
-                    else:
-                        try:
-                            comp_id = int((key_i >> 1) // int(n_sta)) if isinstance(n_sta, int) and n_sta > 0 else None
-                        except Exception:
-                            comp_id = None
+            # Phase/component for this group (prefer cached decoded values to avoid syncs).
+            if ph_g0 is not None:
+                ph_g = int(ph_g0)
             else:
                 ph_g = int(ph_id.index_select(0, idxs[:1]).item())
-                comp_id = None
+            comp_id = int(comp_id0) if (prefer_componentwise and comp_id0 is not None) else None
             tau0 = tau_p if ph_g == 0 else tau_s
             tau = float(tau0)
             sigma_g = σ_p if ph_g == 0 else σ_s
