@@ -909,6 +909,103 @@ def compute_likelihood_loss(
             kuu_dev_cache = None
             kprior_cache = None
 
+        # Optional fast path for small M: precompute per-batch neighbor->dense Kbar once and reuse across groups.
+        #
+        # When grouping='station_phase' and there is a single inducing block (no component splitting),
+        # each row belongs to exactly one group but the neighbor lists + kernel weights are shared.
+        # Precomputing avoids per-group allocations and many small kernel launches.
+        precompute_ok = False
+        Kuu_global = None
+        M_global = 0
+        pre_max_M = int(params.get("_slowness_re_precompute_kbar_dense_max_M", 64))
+        try:
+            if pre_max_M < 1:
+                pre_max_M = 0
+        except Exception:
+            pre_max_M = 64
+        try:
+            if grouping == "station_phase" and (not prefer_componentwise) and int(pre_max_M) > 0:
+                if have_full and isinstance(K_full, torch.Tensor):
+                    Kuu_global = K_full
+                    M_global = int(Kuu_global.shape[0])
+                    precompute_ok = True
+                elif isinstance(K_blocks, list) and len(K_blocks) == 1 and isinstance(offs, torch.Tensor) and int(offs.numel()) >= 2:
+                    Kuu0 = K_blocks[0]
+                    if isinstance(Kuu0, torch.Tensor):
+                        Kuu_global = Kuu0.to(device=dev, dtype=torch.float32) if (Kuu0.device != dev or Kuu0.dtype != torch.float32) else Kuu0
+                        M_global = int(Kuu_global.shape[0])
+                        precompute_ok = True
+        except Exception:
+            precompute_ok = False
+        if precompute_ok and (int(M_global) > int(pre_max_M)):
+            precompute_ok = False
+
+        # Per-batch precomputes (only valid when precompute_ok)
+        Kbar_dense_all = None
+        nei_loc_all = None
+        kbar_all = None
+        w_all = None
+        if precompute_ok:
+            try:
+                # Row endpoints
+                e1_all = idx[:, 0].to(dtype=torch.int64)
+                e2_all = idx[:, 1].to(dtype=torch.int64)
+                x1_all = X_cur.index_select(0, e1_all)
+                x2_all = X_cur.index_select(0, e2_all)
+                dx_all = x2_all - x1_all  # (B,3)
+                # w depends on tau_units; for vel_frac, scale by v(z) per phase.
+                if tau_units == "vel_frac":
+                    zbar_all = 0.5 * (x1_all[:, 2] + x2_all[:, 2])
+                    if isinstance(zc, torch.Tensor) and isinstance(vp, torch.Tensor) and isinstance(vs, torch.Tensor):
+                        vP = _interp1d_linear(zbar_all.to(torch.float32), zc.to(torch.float32), vp.to(torch.float32))
+                        vS = _interp1d_linear(zbar_all.to(torch.float32), zc.to(torch.float32), vs.to(torch.float32))
+                        v_all = torch.where(ph_id == 0, vP, vS).clamp_min(1e-3)
+                    else:
+                        v_all = torch.where(ph_id == 0, torch.full_like(zbar_all, 6.0), torch.full_like(zbar_all, 3.5)).clamp_min(1e-3)
+                    w_all = (dx_all * (1.0 / v_all).unsqueeze(1)).to(torch.float32)
+                else:
+                    w_all = dx_all.to(torch.float32)
+
+                # Neighbor indices (B,2m)
+                nei1_all = nei_idx_ev.index_select(0, e1_all)
+                nei2_all = nei_idx_ev.index_select(0, e2_all)
+                nei_g_all = torch.cat([nei1_all, nei2_all], dim=1)
+                mask_all = (nei_g_all >= 0)
+                nei_clamped_all = torch.where(mask_all, nei_g_all, torch.zeros_like(nei_g_all))
+                # Since we only allow this fast-path when there's a single global block, local == global.
+                nei_loc_all = nei_clamped_all.to(torch.int64)
+                nei_loc_all = torch.where(mask_all, nei_loc_all, torch.zeros_like(nei_loc_all))
+
+                # Kernel weights (B,2m)
+                k_map = params.get("_slowness_re_inducing_neighbor_k_matern32", None)
+                if isinstance(k_map, torch.Tensor) and k_map.ndim == 2 and int(k_map.shape[0]) == int(X_src.shape[0]):
+                    k_map = k_map.to(device=dev, dtype=torch.float32)
+                    k1_all = k_map.index_select(0, e1_all)
+                    k2_all = k_map.index_select(0, e2_all)
+                    k_eu_all = torch.cat([k1_all, k2_all], dim=1)
+                else:
+                    # Dynamic kernel eval (depends on current X_cur)
+                    B_all = int(nei_loc_all.shape[0])
+                    K_all = int(nei_loc_all.shape[1])
+                    U_all = inducing_xyz.index_select(0, nei_clamped_all.reshape(-1)).reshape(B_all, K_all, 3)
+                    xe_all = torch.cat(
+                        [x1_all.unsqueeze(1).expand(B_all, K_all // 2, 3), x2_all.unsqueeze(1).expand(B_all, K_all // 2, 3)],
+                        dim=1,
+                    )
+                    d_all = torch.linalg.norm(U_all - xe_all, dim=2)
+                    k_eu_all = _matern32(d_all, ell_km)
+                k_eu_all = torch.where(mask_all, k_eu_all, torch.zeros_like(k_eu_all))
+                kbar_all = (0.5 * k_eu_all).to(torch.float32)
+
+                # Dense Kbar rows (B,M)
+                Kbar_dense_all = torch.zeros((int(idx.shape[0]), int(M_global)), device=dev, dtype=torch.float32)
+                Kbar_dense_all.scatter_add_(1, nei_loc_all, kbar_all)
+            except Exception:
+                Kbar_dense_all = None
+                nei_loc_all = None
+                kbar_all = None
+                w_all = None
+
         # main group loop
         if starts_cpu is not None and ends_cpu is not None and isinstance(group_ph, list) and len(group_ph) == int(starts.numel()):
             if prefer_componentwise and isinstance(group_comp, list) and len(group_comp) == int(starts.numel()):
@@ -1116,17 +1213,26 @@ def compute_likelihood_loss(
                 w = dx
 
             # Build Kbar sparse rows (union of endpoint neighbor lists)
-            nei1 = nei_idx_ev.index_select(0, e1)  # (B,m)
-            nei2 = nei_idx_ev.index_select(0, e2)  # (B,m)
-            nei_g = torch.cat([nei1, nei2], dim=1)  # (B,2m) global inducing idx
-            mask = (nei_g >= 0)
-            # clamp for gather
-            nei_clamped = torch.where(mask, nei_g, torch.zeros_like(nei_g))
-            # enforce component block bounds
-            in_block = (nei_clamped >= int(off0)) & (nei_clamped < int(off1))
-            mask = mask & in_block
-            nei_loc = (nei_clamped - int(off0)).to(torch.int64)
-            nei_loc = torch.where(mask, nei_loc, torch.zeros_like(nei_loc))
+            if Kbar_dense_all is not None and nei_loc_all is not None and kbar_all is not None and w_all is not None and (int(off0) == 0) and (int(M) == int(M_global)):
+                # Fast path: use precomputed neighbor/kbar and dense Kbar
+                nei_loc = nei_loc_all.index_select(0, idxs)
+                kbar = kbar_all.index_select(0, idxs)
+                Kbar_dense = Kbar_dense_all.index_select(0, idxs)
+                w = w_all.index_select(0, idxs).to(torch.float32)
+                # Mask is implicit in kbar/nei_loc construction; use a cheap valid-mask derived from kbar.
+                mask = (kbar != 0.0)
+            else:
+                nei1 = nei_idx_ev.index_select(0, e1)  # (B,m)
+                nei2 = nei_idx_ev.index_select(0, e2)  # (B,m)
+                nei_g = torch.cat([nei1, nei2], dim=1)  # (B,2m) global inducing idx
+                mask = (nei_g >= 0)
+                # clamp for gather
+                nei_clamped = torch.where(mask, nei_g, torch.zeros_like(nei_g))
+                # enforce component block bounds
+                in_block = (nei_clamped >= int(off0)) & (nei_clamped < int(off1))
+                mask = mask & in_block
+                nei_loc = (nei_clamped - int(off0)).to(torch.int64)
+                nei_loc = torch.where(mask, nei_loc, torch.zeros_like(nei_loc))
 
             B = int(nei_loc.shape[0])
             K = int(nei_loc.shape[1])
@@ -1164,23 +1270,24 @@ def compute_likelihood_loss(
                 else:
                     t_k0 = time.perf_counter()
 
-            k_map = params.get("_slowness_re_inducing_neighbor_k_matern32", None)
-            if isinstance(k_map, torch.Tensor) and k_map.ndim == 2 and int(k_map.shape[0]) == int(X_src.shape[0]):
-                k_map = k_map.to(device=dev, dtype=torch.float32)
-                k1 = k_map.index_select(0, e1)
-                k2 = k_map.index_select(0, e2)
-                k_eu = torch.cat([k1, k2], dim=1)
-            else:
-                U = inducing_xyz.index_select(0, nei_clamped.reshape(-1)).reshape(B, K, 3)
-                xe = torch.cat(
-                    [x1.unsqueeze(1).expand(B, K // 2, 3), x2.unsqueeze(1).expand(B, K // 2, 3)],
-                    dim=1,
-                )
-                d = torch.linalg.norm(U - xe, dim=2)
-                k_eu = _matern32(d, ell_km)
-            k_eu = torch.where(mask, k_eu, torch.zeros_like(k_eu))
-            # 0.5 * (k(x1,U) + k(x2,U)) is represented by concatenation with a 0.5 scale
-            kbar = 0.5 * k_eu  # (B,K)
+            if kbar_all is None:
+                k_map = params.get("_slowness_re_inducing_neighbor_k_matern32", None)
+                if isinstance(k_map, torch.Tensor) and k_map.ndim == 2 and int(k_map.shape[0]) == int(X_src.shape[0]):
+                    k_map = k_map.to(device=dev, dtype=torch.float32)
+                    k1 = k_map.index_select(0, e1)
+                    k2 = k_map.index_select(0, e2)
+                    k_eu = torch.cat([k1, k2], dim=1)
+                else:
+                    U = inducing_xyz.index_select(0, nei_clamped.reshape(-1)).reshape(B, K, 3)
+                    xe = torch.cat(
+                        [x1.unsqueeze(1).expand(B, K // 2, 3), x2.unsqueeze(1).expand(B, K // 2, 3)],
+                        dim=1,
+                    )
+                    d = torch.linalg.norm(U - xe, dim=2)
+                    k_eu = _matern32(d, ell_km)
+                k_eu = torch.where(mask, k_eu, torch.zeros_like(k_eu))
+                # 0.5 * (k(x1,U) + k(x2,U)) is represented by concatenation with a 0.5 scale
+                kbar = 0.5 * k_eu  # (B,K)
             if prof_this_group:
                 try:
                     if prof_sl_use_cuda_events:
@@ -1366,9 +1473,10 @@ def compute_likelihood_loss(
                     continue
 
                 # Dense Kbar: (B,M) with Kbar[b,u] = sum_k kbar[b,k] for neighbors mapping to u.
-                Kbar_dense = torch.zeros((B, M), device=dev, dtype=torch.float32)
-                # nei_loc is (B,K) with invalid entries mapped to 0 and kbar already zeroed for invalid => safe scatter_add
-                Kbar_dense.scatter_add_(1, nei_loc, kbar)
+                if Kbar_dense_all is None:
+                    Kbar_dense = torch.zeros((B, M), device=dev, dtype=torch.float32)
+                    # nei_loc is (B,K) with invalid entries mapped to 0 and kbar already zeroed for invalid => safe scatter_add
+                    Kbar_dense.scatter_add_(1, nei_loc, kbar)
                 # B_dense: (B,3M)
                 B0 = (w_f[:, 0:1] * Kbar_dense)
                 B1 = (w_f[:, 1:2] * Kbar_dense)
