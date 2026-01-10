@@ -1668,11 +1668,7 @@ def analyze_resid_from_bundle(
         state.dX_src.data.copy_(bun.dX_src.to(device=state.device, dtype=torch.float32))
     except Exception as e:
         raise RuntimeError(f"Could not restore MAP dX_src from bundle: {e}") from e
-    try:
-        if state.log_scale_theta is not None and bun.noise_log_scale is not None:
-            state.log_scale_theta.data.copy_(bun.noise_log_scale.to(device=state.device, dtype=torch.float32))
-    except Exception:
-        pass
+    # Note: Phase-2 bundles no longer persist noise scale / optimizer state by default.
 
     info(
         f"analyze-resid: loaded bundle={bundle_path} events={int(state.X_src.shape[0])} dtimes={int(state.N)}",

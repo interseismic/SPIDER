@@ -17,6 +17,7 @@ Core workflow:
 
 ```bash
 # Phase 1 (MAP) -> writes <checkpoint_dir>/phase2_bundle.pth by default
+# (bundle contains post-filter picks + MAP locations; sampling rebuilds all other runtime artifacts)
 python -m spider locate-map path/to/params.json --device 0
 
 # Phase 2–4 (sampling) from the Phase-2 bundle

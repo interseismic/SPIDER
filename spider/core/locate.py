@@ -5392,13 +5392,14 @@ def locate_map(
         try:
             save_phase2_bundle(
                 path=str(bundle_out),
-                params=state.params,
                 origins0=state.origins0,
                 dtimes=state.dtimes,
                 dX_src=state.dX_src.detach(),
-                noise_log_scale=(state.log_scale_theta.detach() if state.log_scale_theta is not None else None),
-                phase1_optimizer_state_dict=(state.optimizer.state_dict() if state.optimizer is not None else {}),
-                global_step_count=int(state.global_step_count),
+                    # Bundle should contain only locations + picks; everything else is rebuilt cleanly at sampling start.
+                    params=None,
+                    noise_log_scale=None,
+                    phase1_optimizer_state_dict=None,
+                    global_step_count=0,
             )
             info(f"Wrote Phase-2 bundle -> {bundle_out}", section="BUNDLE")
         except Exception as e:
@@ -5480,20 +5481,9 @@ def locate_sample_from_bundle(
 
     # Restore MAP solution
     state.dX_src.data.copy_(bun.dX_src.to(device=state.device, dtype=torch.float32))
-    if state.log_scale_theta is not None and bun.noise_log_scale is not None:
-        try:
-            state.log_scale_theta.data.copy_(bun.noise_log_scale.to(device=state.device, dtype=torch.float32))
-        except Exception:
-            pass
-
-    # Restore Phase-1 optimizer state so Phase-2 can transplant preconditioner stats if backend supports it.
-    try:
-        if isinstance(bun.phase1_optimizer_state_dict, dict) and state.optimizer is not None:
-            state.optimizer.load_state_dict(bun.phase1_optimizer_state_dict)
-    except Exception as e:
-        warn(f"Could not load phase1 optimizer state from bundle: {e}", section="BUNDLE")
-
-    state.global_step_count = int(bun.global_step_count)
+    # NOTE: We intentionally do NOT restore Phase-1 noise/optimizer/global_step state from the bundle.
+    # Sampling runs should initialize cleanly from the current config + MAP locations.
+    state.global_step_count = 0
 
     # From here, behave as if Phase 1 just finished.
     phase = "phase2"
