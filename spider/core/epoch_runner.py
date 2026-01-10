@@ -2257,6 +2257,9 @@ def _run_epoch(
                     raise RuntimeError("skip shared_event_latent diagnostics this epoch")
 
                 b = getattr(state, "shared_event_latent_b", None)
+                # Coefficient diagnostics:
+                # - full / graph_gmrf / inducing_gp: b is scalar per phase (..,*,2)
+                # - slowness_inducing_gp: b is vector per phase (..,*,2,3)
                 if isinstance(b, torch.Tensor) and b.ndim == 3 and int(b.shape[2]) == 2:
                     bP = b[:, :, 0]
                     bS = b[:, :, 1]
@@ -2265,13 +2268,20 @@ def _run_epoch(
                     # Global mean drift (should be ~0 under Q with q_diag>0)
                     metrics["shared_event_latent/bP_mean"] = float(bP.mean().item())
                     metrics["shared_event_latent/bS_mean"] = float(bS.mean().item())
+                elif isinstance(b, torch.Tensor) and b.ndim == 4 and int(b.shape[2]) == 2 and int(b.shape[3]) == 3:
+                    bP = b[:, :, 0, :]  # (S_or_R, M, 3)
+                    bS = b[:, :, 1, :]
+                    metrics["shared_event_latent/bP_rms"] = float(torch.sqrt((bP * bP).mean()).item())
+                    metrics["shared_event_latent/bS_rms"] = float(torch.sqrt((bS * bS).mean()).item())
+                    metrics["shared_event_latent/bP_mean"] = float(bP.mean().item())
+                    metrics["shared_event_latent/bS_mean"] = float(bS.mean().item())
                     # Direct check of the *station-common mode* constraint:
                     # We care about mean over stations *per event* (K,2), not just global mean.
                     try:
                         n_stations = int(getattr(state, "n_stations", 0) or 0)
                         if n_stations > 0:
                             if int(b.shape[0]) == int(n_stations):
-                                mu = b.to(torch.float32).mean(dim=0)  # (K,2)
+                                mu = b.to(torch.float32).mean(dim=0)  # scalar: (K,2) ; vector: (M,2,3)
                             else:
                                 W_sta = getattr(state, "shared_event_latent_station_basis_W", None)
                                 if (
@@ -2283,12 +2293,16 @@ def _run_epoch(
                                     W = W_sta.to(device=b.device, dtype=torch.float32)
                                     ones = torch.ones((n_stations,), device=b.device, dtype=torch.float32)
                                     r = (W.transpose(0, 1).matmul(ones)) / float(max(1, n_stations))  # (R,)
-                                    mu = torch.tensordot(r, b.to(torch.float32), dims=([0], [0]))  # (K,2)
+                                    mu = torch.tensordot(r, b.to(torch.float32), dims=([0], [0]))  # scalar: (K,2) ; vector: (M,2,3)
                                 else:
                                     mu = None
                             if isinstance(mu, torch.Tensor) and mu.numel() > 0:
-                                metrics["shared_event_latent/station_common_P_rms"] = float(torch.sqrt((mu[:, 0] * mu[:, 0]).mean()).item())
-                                metrics["shared_event_latent/station_common_S_rms"] = float(torch.sqrt((mu[:, 1] * mu[:, 1]).mean()).item())
+                                if mu.ndim == 2 and int(mu.shape[1]) == 2:
+                                    metrics["shared_event_latent/station_common_P_rms"] = float(torch.sqrt((mu[:, 0] * mu[:, 0]).mean()).item())
+                                    metrics["shared_event_latent/station_common_S_rms"] = float(torch.sqrt((mu[:, 1] * mu[:, 1]).mean()).item())
+                                elif mu.ndim == 3 and int(mu.shape[1]) == 2 and int(mu.shape[2]) == 3:
+                                    metrics["shared_event_latent/station_common_P_rms"] = float(torch.sqrt((mu[:, 0, :] * mu[:, 0, :]).mean()).item())
+                                    metrics["shared_event_latent/station_common_S_rms"] = float(torch.sqrt((mu[:, 1, :] * mu[:, 1, :]).mean()).item())
                     except Exception:
                         pass
                     # If station_basis is enabled, b is in basis space (R,M,2). The physically relevant
@@ -2321,9 +2335,9 @@ def _run_epoch(
                     # Prior energy under the shared_event_latent prior.
                     # This is a useful amplitude diagnostic: too small -> b not used; too large -> b drifting / overpowering data fit.
                     mode = str(state.params.get("_shared_event_latent_parameterization", "full")).strip().lower()
-                    if mode not in {"full", "inducing_gp", "graph_gmrf"}:
+                    if mode not in {"full", "inducing_gp", "slowness_inducing_gp", "graph_gmrf"}:
                         mode = "full"
-                    if mode == "inducing_gp":
+                    if mode in {"inducing_gp", "slowness_inducing_gp"}:
                         # Inducing-point GP coefficients prior:
                         #   c ~ N(0, K_UU^{-1})  ⇔  log p(c) ∝ -0.5 * c^T K_UU c
                         offs = state.params.get("_shared_event_latent_inducing_offsets", None)
@@ -2354,15 +2368,27 @@ def _run_epoch(
                                     if not isinstance(K, torch.Tensor) or K.numel() == 0:
                                         continue
                                     Kt = K.to(device=b.device, dtype=b.dtype)
-                                    cP = bP[:, i0:i1]
-                                    cS = bS[:, i0:i1]
-                                    KP = torch.matmul(cP, Kt)
-                                    KS = torch.matmul(cS, Kt)
-                                    e00 = e00 + (cP * KP).sum()
-                                    e11 = e11 + (cS * KS).sum()
-                                    e01 = e01 + (cP * KS).sum()
+                                    if isinstance(b, torch.Tensor) and b.ndim == 3 and int(b.shape[2]) == 2:
+                                        cP = bP[:, i0:i1]
+                                        cS = bS[:, i0:i1]
+                                        KP = torch.matmul(cP, Kt)
+                                        KS = torch.matmul(cS, Kt)
+                                        e00 = e00 + (cP * KP).sum()
+                                        e11 = e11 + (cS * KS).sum()
+                                        e01 = e01 + (cP * KS).sum()
+                                    elif isinstance(b, torch.Tensor) and b.ndim == 4 and int(b.shape[2]) == 2 and int(b.shape[3]) == 3:
+                                        # Vector slowness coefficients: sum energies across xyz components.
+                                        for d in range(3):
+                                            cP = b[:, i0:i1, 0, d]
+                                            cS = b[:, i0:i1, 1, d]
+                                            KP = torch.matmul(cP, Kt)
+                                            KS = torch.matmul(cS, Kt)
+                                            e00 = e00 + (cP * KP).sum()
+                                            e11 = e11 + (cS * KS).sum()
+                                            e01 = e01 + (cP * KS).sum()
                                 energy = 0.5 * (float(inv00) * e00 + float(inv11) * e11 + 2.0 * float(inv01) * e01)
-                                dof = float(max(1, int(bP.numel() + bS.numel())))
+                                # Degrees of freedom for normalization (scalar or vector)
+                                dof = float(max(1, int(b.numel())))
                                 metrics["shared_event_latent/prior_energy"] = float(energy.item())
                                 metrics["shared_event_latent/prior_energy_per_dof"] = float((energy / dof).item())
                     else:
