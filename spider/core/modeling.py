@@ -477,6 +477,18 @@ def compute_likelihood_loss(
         pcg_min_inducing = int(params.get("_slowness_re_pcg_min_inducing", 128))
         pcg_min_rows = int(params.get("_slowness_re_pcg_min_rows", 2000))
 
+        # Optional: station basis for slowness_re (receiver-dependent, low-rank).
+        # NOTE: This requires a per-row station index for the current batch.
+        W_sta = params.get("_slowness_re_station_basis_W", None)
+        try:
+            use_sta_basis = bool(params.get("_slowness_re_station_basis_enabled", False)) and isinstance(W_sta, torch.Tensor)
+        except Exception:
+            use_sta_basis = False
+        sta_idx_basis = params.get("_runtime_bucket_station_index", None)
+        if use_sta_basis:
+            if (not isinstance(sta_idx_basis, torch.Tensor)) or (int(sta_idx_basis.numel()) != int(resid.numel())):
+                raise ValueError("slowness_re.station_basis enabled but no per-row station index is available for this batch.")
+
         # We currently rely on a homoscedastic base sigma and incorporate only our own diagonal correction (FITC).
         # sigma_extra_var may already have been applied above (e.g., by shared_event_latent); we accept it here.
 
@@ -914,7 +926,7 @@ def compute_likelihood_loss(
                     inv_tau2 = float(1.0 / max(float(tau) * float(tau), 1e-24))
                     Kprior = (inv_tau2 * Kuu).to(device=dev, dtype=torch.float32)
 
-                    sta_g = sta_idx.index_select(0, idxs).to(torch.int64)  # (B,)
+                    sta_g = sta_idx_basis.index_select(0, idxs).to(torch.int64)  # (B,)
                     with torch.no_grad():
                         u_float, it_done = _pcg_station_basis_solve(
                             resid_g=resid_g,
