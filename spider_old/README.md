@@ -38,6 +38,11 @@ Start from the template:
 
 - `spider/examples/params_template.json`
 
+Notes on optional likelihoods:
+
+- `model.likelihood.slowness_re.mode="component_station_explicit"` enables explicit component+station slowness latents (per phase) and can be updated with ESS via `model.likelihood.slowness_re.ess`.
+- `model.likelihood.dd_graph_re` enables per‑phase event latents with a DD‑graph Laplacian/GMRF prior; optional ESS is configured under `model.likelihood.dd_graph_re.ess`.
+
 ### Library utilities (optional)
 
 The CLI does not depend on these modules, but they are available for scripting:

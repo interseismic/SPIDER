@@ -1,14 +1,6 @@
-"""Utility modules for SPIDER."""
+"""Utility helpers for spider."""
 
-from .wandb_logger import WandbLogger, init_wandb_if_enabled, extract_metrics_from_stats_tensor
-from .console import info, warn, error, kv
+from .console import info, warn
+from .wandb_logger import init_wandb, WandbLogger
 
-__all__ = [
-    'WandbLogger',
-    'init_wandb_if_enabled',
-    'extract_metrics_from_stats_tensor',
-    'info',
-    'warn',
-    'error',
-    'kv',
-]
+__all__ = ["info", "warn", "init_wandb", "WandbLogger"]

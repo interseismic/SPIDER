@@ -26,6 +26,8 @@ from spider.diagnostics.spatial import run_spatial_diag_end_phase1
 from spider.diagnostics.pathcorr import run_pathcorr_diag_end_phase1
 from spider.utils.console import info, warn
 from spider.utils.wandb_gates import want_wandb_group as _want_wandb_group, wb_add_if_finite as _wb_add_if_finite
+from spider.core.corr_error_graph import build_corr_error_dtimes_graph, build_corr_error_radius_graph
+from spider.core.shared_event_re_whitening import build_whitening_cache_entry, _make_cache_key
 
 # Core runtime state (moved out of this module to avoid locate<->epoch_runner cycles)
 from spider.core.state import (
@@ -71,6 +73,20 @@ def _ddp_is_main(params: dict) -> bool:
         return True
 
 
+def _lr_for_phase(params: dict, phase: str) -> float:
+    phase_key = str(phase).strip().lower()
+    lr_vec = params.get("_sampler_lr_per_phase", None)
+    if isinstance(lr_vec, list) and len(lr_vec) == 4:
+        idx = {"phase1": 0, "phase2": 1, "phase3": 2, "phase4": 3}.get(phase_key, 1)
+        try:
+            return float(lr_vec[int(idx)])
+        except Exception:
+            pass
+    if phase_key == "phase1":
+        return float(params.get("lr_warmup", 1e-3))
+    return float(params.get("lr_sampler", 1e-4))
+
+
 def _sampler_extra_metrics(optimizer: Optional[torch.optim.Optimizer]) -> Dict[str, float]:
     """
     Extra sampler diagnostics for W&B.
@@ -85,19 +101,10 @@ def _sampler_extra_metrics(optimizer: Optional[torch.optim.Optimizer]) -> Dict[s
     if optimizer is None:
         return metrics
 
-    # Only when SGHMC backend is active.
+    # We log these diagnostics for any sampler backend that exposes the helper methods.
+    # (pSGLD/SGHMC/AdaptiveSGHMC all implement grad_vs_noise_stats in spider.optim.*)
     try:
-        if str(optimizer.__class__.__name__).strip().lower() != "sghmc":
-            return metrics
-    except Exception:
-        return metrics
-
-    # Only meaningful when Langevin noise is actually on (phases 3–4).
-    try:
-        pg0 = optimizer.param_groups[0] if hasattr(optimizer, "param_groups") and len(optimizer.param_groups) > 0 else {}
-        add_noise = bool(pg0.get("add_noise", False))
-        noise_scale = float(pg0.get("noise_scale", 0.0))
-        if (not add_noise) or (not (noise_scale > 0.0)):
+        if not hasattr(optimizer, "grad_vs_noise_stats") and not hasattr(optimizer, "temperature_stats"):
             return metrics
     except Exception:
         return metrics
@@ -113,6 +120,42 @@ def _sampler_extra_metrics(optimizer: Optional[torch.optim.Optimizer]) -> Dict[s
                     metrics["grad_noise_to_langevin_med"] = med
                 if gm == gm:
                     metrics["grad_noise_to_langevin_gm"] = gm
+                dt_med = float(s.get("dt_median", float("nan")))
+                dt_gm = float(s.get("dt_gm", float("nan")))
+                if dt_med == dt_med:
+                    metrics["grad_noise_to_langevin_med_dt"] = dt_med
+                if dt_gm == dt_gm:
+                    metrics["grad_noise_to_langevin_gm_dt"] = dt_gm
+                vg = float(s.get("var_g_median", float("nan")))
+                vn = float(s.get("var_noise_median", float("nan")))
+                if vg == vg:
+                    metrics["grad_noise_var_med"] = vg
+                if vn == vn:
+                    metrics["langevin_noise_var_med"] = vn
+                # Per-parameter-group stats (e.g., hypocenter vs corr_error) if provided by backend.
+                pg = s.get("per_group", None)
+                if isinstance(pg, list):
+                    for i, gs in enumerate(pg):
+                        if not isinstance(gs, dict):
+                            continue
+                        name = str(gs.get("group_name", f"group{i}")).strip().lower()
+                        # Map legacy "core" group to a more user-meaningful label.
+                        if name in {"core", "main"}:
+                            name = "hypocenter"
+                        # sanitize
+                        name = "".join([c if (c.isalnum() or c in {"_", "-"} ) else "_" for c in name])
+                        gmed = float(gs.get("median", float("nan")))
+                        ggm = float(gs.get("gm", float("nan")))
+                        if gmed == gmed:
+                            metrics[f"grad_noise_to_langevin_med_{name}"] = gmed
+                        if ggm == ggm:
+                            metrics[f"grad_noise_to_langevin_gm_{name}"] = ggm
+                        gdt_med = float(gs.get("dt_median", float("nan")))
+                        gdt_gm = float(gs.get("dt_gm", float("nan")))
+                        if gdt_med == gdt_med:
+                            metrics[f"grad_noise_to_langevin_med_{name}_dt"] = gdt_med
+                        if gdt_gm == gdt_gm:
+                            metrics[f"grad_noise_to_langevin_gm_{name}_dt"] = gdt_gm
     except Exception:
         pass
 
@@ -131,6 +174,57 @@ def _sampler_extra_metrics(optimizer: Optional[torch.optim.Optimizer]) -> Dict[s
         pass
 
     return metrics
+
+
+def _sampler_sgnht_metrics(optimizer: Optional[torch.optim.Optimizer]) -> Dict[str, float]:
+    """Optional SGNHT-specific diagnostics for W&B."""
+    metrics: Dict[str, float] = {}
+    if optimizer is None:
+        return metrics
+    try:
+        if hasattr(optimizer, "sgnht_stats"):
+            s = optimizer.sgnht_stats()  # type: ignore[attr-defined]
+            if isinstance(s, dict):
+                xi_mean = float(s.get("xi_mean", float("nan")))
+                xi_med = float(s.get("xi_median", float("nan")))
+                kin_gm = float(s.get("kinetic_gm_over_target", float("nan")))
+                kin_med = float(s.get("kinetic_median_over_target", float("nan")))
+                if xi_mean == xi_mean:
+                    metrics["sgnht/xi_mean"] = xi_mean
+                if xi_med == xi_med:
+                    metrics["sgnht/xi_median"] = xi_med
+                if kin_gm == kin_gm:
+                    metrics["sgnht/kinetic_gm_over_target"] = kin_gm
+                if kin_med == kin_med:
+                    metrics["sgnht/kinetic_median_over_target"] = kin_med
+    except Exception:
+        pass
+    return metrics
+
+
+def _apply_sgnht_per_obs_scaling(state: LocateState, sampler: Optional[torch.optim.Optimizer]) -> None:
+    """When lr_mode=per_obs, scale SGNHT diffusion and thermostat_mass to preserve dynamics."""
+    try:
+        if sampler is None or not hasattr(sampler, "param_groups"):
+            return
+        backend = str(state.params.get("sampler_backend", "")).strip().lower()
+        lr_mode = str(state.params.get("sampler_lr_mode", "")).strip().lower()
+        if backend != "sgnht" or lr_mode != "per_obs":
+            return
+        n_obs = int(max(1, int(state.N)))
+        base_diff = float(state.params.get("sgnht_diffusion", 0.01))
+        base_mass = float(state.params.get("sgnht_thermostat_mass", 1.0))
+        diff_eff = base_diff * float(n_obs)
+        mass_eff = base_mass / float(n_obs)
+        if (not math.isfinite(diff_eff)) or (diff_eff <= 0.0):
+            diff_eff = float(base_diff)
+        if (not math.isfinite(mass_eff)) or (mass_eff <= 0.0):
+            mass_eff = float(base_mass)
+        for g in sampler.param_groups:
+            g["diffusion"] = float(diff_eff)
+            g["thermostat_mass"] = float(mass_eff)
+    except Exception:
+        return
 
 
 def _compute_phase_mads(
@@ -861,8 +955,8 @@ def _latent_field_map_update(
 
     # (latent_field ESS removed; we use MAP (Jacobi) z-block updates instead)
 
-def _pre_filter_outlier_residuals(state: LocateState) -> None:
-    """Optionally drop dtimes with large residuals at initial locations (ΔX=0).
+def _pre_filter_outlier_residuals(state: LocateState, *, use_current_dX: bool = False) -> None:
+    """Optionally drop dtimes with large residuals.
 
     Controlled by params:
       - residual_filter_enable: bool (default False)
@@ -878,15 +972,23 @@ def _pre_filter_outlier_residuals(state: LocateState) -> None:
     sigma = float(state.params.get("residual_filter_mad_sigma", 6.0))
     abs_max = float(state.params.get("residual_filter_abs_max", 1.0))
 
-    print("Residual pre-filter: computing initial residuals for outlier detection…")
+    if use_current_dX:
+        print("Residual pre-filter: computing residuals at current ΔX for outlier detection…")
+    else:
+        print("Residual pre-filter: computing initial residuals for outlier detection…")
     # Use a generous residual batch size to speed up pass
     bs = max(int(state.batch_size_warmup), 1)
     with torch.no_grad():
-        # Evaluate residuals at ΔX=0 (i.e., current X_src + 0)
-        zero_dX = torch.zeros_like(state.dX_src, device=state.dX_src.device)
-        residuals = compute_residuals_full(
-            state.II, state.YY, state.X_src, zero_dX, state.model, bs, state.N
-        )
+        if use_current_dX:
+            residuals = compute_residuals_full(
+                state.II, state.YY, state.X_src, state.dX_src, state.model, bs, state.N
+            )
+        else:
+            # Evaluate residuals at ΔX=0 (i.e., current X_src + 0)
+            zero_dX = torch.zeros_like(state.dX_src, device=state.dX_src.device)
+            residuals = compute_residuals_full(
+                state.II, state.YY, state.X_src, zero_dX, state.model, bs, state.N
+            )
         # Build keep mask
         abs_thr = abs_max if (abs_max is not None and float(abs_max) > 0.0) else float("inf")
         if method == "abs":
@@ -1062,7 +1164,8 @@ def _format_sampler_status(opt: Optional[torch.optim.Optimizer]) -> str:
         noise_s = f"on(scale={noise_scale:g},T={temp:g})"
     else:
         noise_s = "off"
-    return f"precond={precond_s} noise={noise_s}"
+    lr = float(g.get("lr", float("nan")))
+    return f"precond={precond_s} noise={noise_s} lr={lr:g}"
 
 def _format_epoch_line(*, phase: str, step: int, total: int, metrics: Dict[str, float], opt: Optional[torch.optim.Optimizer], extra: str = "") -> str:
     """
@@ -1184,7 +1287,13 @@ def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=No
                 phase="phase1",
                 global_step_count=state.global_step_count,
                 noise_log_scale=None,
-            corr_error_b=getattr(state, "corr_error_b", None),
+                corr_error_b=getattr(state, "corr_error_b", None),
+                slowness_re_comp_p=getattr(state, "slowness_re_comp_p", None),
+                slowness_re_comp_s=getattr(state, "slowness_re_comp_s", None),
+                slowness_re_station_p=getattr(state, "slowness_re_station_p", None),
+                slowness_re_station_s=getattr(state, "slowness_re_station_s", None),
+                dd_graph_re_b_p=getattr(state, "dd_graph_re_b_p", None),
+                dd_graph_re_b_s=getattr(state, "dd_graph_re_b_s", None),
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -1546,6 +1655,12 @@ def _finalize_phase1(state: LocateState) -> None:
         global_step_count=state.global_step_count,
         noise_log_scale=None,
         corr_error_b=getattr(state, "corr_error_b", None),
+        slowness_re_comp_p=getattr(state, "slowness_re_comp_p", None),
+        slowness_re_comp_s=getattr(state, "slowness_re_comp_s", None),
+        slowness_re_station_p=getattr(state, "slowness_re_station_p", None),
+        slowness_re_station_s=getattr(state, "slowness_re_station_s", None),
+        dd_graph_re_b_p=getattr(state, "dd_graph_re_b_p", None),
+        dd_graph_re_b_s=getattr(state, "dd_graph_re_b_s", None),
         event_precision_matrix=state.event_precision_matrix,
     )
 
@@ -1555,6 +1670,40 @@ def _setup_sampler(state: LocateState) -> torch.optim.Optimizer:
     info(f"Sampler backend={backend_name}", section="SAMP")
     state.sampler_backend = backend_name
     state.sampler = sampler
+    # Enforce JSON preconditioning flags on fresh sampler creation too.
+    try:
+        precond_json = bool(state.params.get("sampler_preconditioning", False))
+        precond_type_json = str(state.params.get("sampler_preconditioner", "none")).strip().lower()
+        if precond_json and precond_type_json in {"none", "false", ""}:
+            precond_type_json = "rmsprop"
+        if (not precond_json) or precond_type_json in {"none", "false", ""}:
+            precond_type_json = "none"
+        if sampler is not None and hasattr(sampler, "param_groups"):
+            for g in sampler.param_groups:
+                if backend_name == "adaptive_sghmc":
+                    g["preconditioning"] = True
+                    g["preconditioner"] = "adaptive_sghmc"
+                elif backend_name == "adsgld_adam":
+                    g["preconditioning"] = False
+                    g["preconditioner"] = "none"
+                else:
+                    g["preconditioning"] = precond_json
+                    g["preconditioner"] = precond_type_json
+        # One-time debug log to confirm resolved preconditioning settings.
+        try:
+            if sampler is not None and hasattr(sampler, "param_groups") and len(sampler.param_groups) > 0:
+                g0 = sampler.param_groups[0]
+                info(
+                    "Sampler preconditioning resolved: "
+                    f"enabled={bool(precond_json)} type={str(precond_type_json)} "
+                    f"| group_preconditioning={g0.get('preconditioning', None)} "
+                    f"group_preconditioner={g0.get('preconditioner', None)}",
+                    section="SAMP",
+                )
+        except Exception:
+            pass
+    except Exception:
+        pass
     _apply_sampler_group_overrides(state, sampler)
     return sampler
 
@@ -1584,6 +1733,14 @@ def _resume_or_initialize(state: LocateState):
     if reset_batch_numbers:
         info("Resetting batch numbers to 0 (reset_batch_numbers=True)", section="RUN")
         clear_checkpoint_files(state.params)
+        # Clear one-time debug/runtime flags so logs show on fresh runs.
+        try:
+            state.params["_slowness_re_logged_delta"] = False
+            state.params["_slowness_re_runtime_logged"] = False
+            state.params["_slowness_re_debug_compare_logged"] = False
+            state.params["_slowness_re_explicit_logged"] = False
+        except Exception:
+            pass
         if clear_samples_on_reset:
             ok = clear_samples_file(state.params)
             if ok:
@@ -1664,6 +1821,52 @@ def _resume_or_initialize(state: LocateState):
             setattr(state, "_resume_corr_error_b", ceb)
     except Exception:
         pass
+    # Restore explicit slowness_re latents if present.
+    try:
+        if bool(state.params.get("_slowness_re_explicit_enabled", False)):
+            for key, attr in (
+                ("slowness_re_comp_p", "slowness_re_comp_p"),
+                ("slowness_re_comp_s", "slowness_re_comp_s"),
+                ("slowness_re_station_p", "slowness_re_station_p"),
+                ("slowness_re_station_s", "slowness_re_station_s"),
+            ):
+                val = ckpt.get(key, None)
+                lat = getattr(state, attr, None)
+                if val is None or not isinstance(lat, torch.nn.Parameter):
+                    continue
+                try:
+                    if isinstance(val, torch.Tensor) and tuple(val.shape) == tuple(lat.shape):
+                        lat.data.copy_(val.to(device=state.device, dtype=torch.float32))
+                    elif not isinstance(val, torch.Tensor):
+                        vv = torch.as_tensor(val, device=state.device, dtype=torch.float32)
+                        if tuple(vv.shape) == tuple(lat.shape):
+                            lat.data.copy_(vv)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Restore dd_graph_re latents if present.
+    try:
+        if bool(state.params.get("_dd_graph_re_enabled", False)):
+            for key, attr in (
+                ("dd_graph_re_b_p", "dd_graph_re_b_p"),
+                ("dd_graph_re_b_s", "dd_graph_re_b_s"),
+            ):
+                val = ckpt.get(key, None)
+                lat = getattr(state, attr, None)
+                if val is None or not isinstance(lat, torch.nn.Parameter):
+                    continue
+                try:
+                    if isinstance(val, torch.Tensor) and tuple(val.shape) == tuple(lat.shape):
+                        lat.data.copy_(val.to(device=state.device, dtype=torch.float32))
+                    elif not isinstance(val, torch.Tensor):
+                        vv = torch.as_tensor(val, device=state.device, dtype=torch.float32)
+                        if tuple(vv.shape) == tuple(lat.shape):
+                            lat.data.copy_(vv)
+                except Exception:
+                    pass
+    except Exception:
+        pass
     state.sample_count = get_next_sample_count(state.params)
     # Clamp any resumed parameters to respect current config bounds
     try:
@@ -1691,6 +1894,31 @@ def _resume_or_initialize(state: LocateState):
 
     # For phase1, we need to load optimizer state here
     if phase == "phase1":
+        # If corr_error is enabled during Phase 1, ensure corr_error_b exists and is registered
+        # in the Adam optimizer BEFORE loading the optimizer state dict (param-group structure must match).
+        try:
+            if bool(state.params.get("_corr_error_enabled", False)) and bool(state.params.get("_corr_error_enable_in_phase1", False)):
+                _maybe_init_corr_error(state)
+                b = getattr(state, "corr_error_b", None)
+                if isinstance(b, torch.Tensor):
+                    already = False
+                    for g in state.optimizer.param_groups:
+                        try:
+                            if any(p is b for p in g.get("params", [])):
+                                already = True
+                                break
+                        except Exception:
+                            pass
+                    if not already:
+                        base_lr = float(state.optimizer.param_groups[0].get("lr", state.params.get("lr_warmup", 1e-3)))
+                        lr_mult = float(state.params.get("_corr_error_phase1_lr_mult", 0.1) or 0.1)
+                        if (not math.isfinite(lr_mult)) or (lr_mult <= 0.0):
+                            lr_mult = 0.1
+                        state.optimizer.add_param_group({"params": [b], "lr": base_lr * lr_mult})
+                        if (not _ddp_enabled(state.params)) or _ddp_is_main(state.params):
+                            info(f"Phase 1: corr_error enabled (resume). Added corr_error_b to Adam with lr_mult={lr_mult:g}", section="LIKELIHOOD")
+        except Exception:
+            pass
         try:
             state.optimizer.load_state_dict(ckpt.get("optimizer_state_dict", {}))
             # One-time fix: override LR with current JSON so restarts pick up changes
@@ -1717,8 +1945,10 @@ def _phase2_preconditioner(
     # ... existing comments ...
 
     # Respect user intent: only force RMSProp warmup if preconditioning is enabled
-    user_preconditioning = bool(state.params["sampler_preconditioning"])
-    user_precond_type = str(state.params["sampler_preconditioner"]).lower()
+    user_preconditioning = bool(state.params.get("sampler_preconditioning", False))
+    user_precond_type = str(state.params.get("sampler_preconditioner", "none")).strip().lower()
+    if user_preconditioning and user_precond_type in {"none", "false", ""}:
+        user_precond_type = "rmsprop"
     
     for g in sampler.param_groups:
         if 'add_noise' in g:
@@ -1727,16 +1957,23 @@ def _phase2_preconditioner(
             g['noise_scale'] = 0.0
 
         # AdaptiveSGHMC has its own internal preconditioner (v_hat) and burn-in adaptation.
-        # Do NOT clobber its identity/flags with the generic "rmsprop/adam/matrix" Phase-2 logic.
+        # Do NOT clobber its identity/flags with the generic Phase-2 logic.
         if sampler_backend == "adaptive_sghmc":
             g["preconditioner"] = "adaptive_sghmc"
             g["preconditioning"] = True
             g["freeze_preconditioner"] = False
             g["is_burnin"] = True
             continue
+        # Adaptive-drift SGLD (Adam variant) does not use preconditioning.
+        if sampler_backend == "adsgld_adam":
+            g["preconditioner"] = "none"
+            g["preconditioning"] = False
+            g["freeze_preconditioner"] = True
+            g["is_burnin"] = True
+            continue
             
-        # include blockdiag_fisher (alias: matrix_ema) as a valid Phase 2 preconditioner
-        if user_preconditioning and user_precond_type in {"rmsprop", "adam", "blockdiag_fisher", "matrix_ema"}:
+        # include blockdiag_fisher (alias: matrix_ema) and non-diagonal metrics as valid Phase 2 preconditioners
+        if user_preconditioning and user_precond_type in {"rmsprop", "blockdiag_fisher", "matrix_ema", "monge", "shampoo"}:
             g['preconditioner'] = user_precond_type
             g['preconditioning'] = True
             g['freeze_preconditioner'] = False
@@ -1749,7 +1986,8 @@ def _phase2_preconditioner(
     if ddp_main:
         print(f"Phase 2: drift-only (noise=off) | {_format_sampler_status(state.sampler)}")
     for epoch in range(start_epoch, state.params["phase2_epochs"]):
-        metrics = _run_epoch(state, epoch, sampler, noise_scale_factor=0.0)
+        grad_clip_norm = float(state.params.get("sampler_grad_clip_norm", 0.0))
+        metrics = _run_epoch(state, epoch, sampler, noise_scale_factor=0.0, grad_clip_norm=grad_clip_norm)
         
         # --- per-epoch summary (like phase 3 style) ---
         # Control MAD computation frequency to avoid full-dataset passes
@@ -1764,6 +2002,12 @@ def _phase2_preconditioner(
         # - We intentionally do NOT log drift_ratio_* metrics (removed; too noisy/expensive).
         # - We DO log SGHMC grad_noise_to_langevin + t_eff_var_over_target when SGHMC noise is enabled
         #   via `_sampler_extra_metrics()` (sampling diagnostics group).
+
+        sampler_extra = {}
+        try:
+            sampler_extra = _sampler_extra_metrics(sampler)
+        except Exception:
+            sampler_extra = {}
 
         # Log metrics to wandb if enabled (rank0 only under torchrun)
         if ddp_main and wandb_logger and _want_wandb_group(state.params, "core"):
@@ -1795,8 +2039,10 @@ def _phase2_preconditioner(
                     "learning_rate": lr0,
                     "noise_enabled": int(noise_enabled),
                 })
-            if _want_wandb_group(state.params, "sampler"):
-                wandb_metrics.update(_sampler_extra_metrics(sampler))
+                if sampler_extra:
+                    wandb_metrics.update(sampler_extra)
+            if _want_wandb_group(state.params, "sgnht"):
+                wandb_metrics.update(_sampler_sgnht_metrics(sampler))
             wandb_logger.log_phase2_metrics(epoch, wandb_metrics, global_step=state.global_step_count)
 
         # Report current posterior noise scales instead of MADs (rank0 only under torchrun)
@@ -1832,6 +2078,12 @@ def _phase2_preconditioner(
                 global_step_count=state.global_step_count,
                 noise_log_scale=None,
                 corr_error_b=getattr(state, "corr_error_b", None),
+                slowness_re_comp_p=getattr(state, "slowness_re_comp_p", None),
+                slowness_re_comp_s=getattr(state, "slowness_re_comp_s", None),
+                slowness_re_station_p=getattr(state, "slowness_re_station_p", None),
+                slowness_re_station_s=getattr(state, "slowness_re_station_s", None),
+                dd_graph_re_b_p=getattr(state, "dd_graph_re_b_p", None),
+                dd_graph_re_b_s=getattr(state, "dd_graph_re_b_s", None),
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -1855,6 +2107,12 @@ def _phase2_preconditioner(
             global_step_count=state.global_step_count,
             noise_log_scale=None,
             corr_error_b=getattr(state, "corr_error_b", None),
+            slowness_re_comp_p=getattr(state, "slowness_re_comp_p", None),
+            slowness_re_comp_s=getattr(state, "slowness_re_comp_s", None),
+            slowness_re_station_p=getattr(state, "slowness_re_station_p", None),
+            slowness_re_station_s=getattr(state, "slowness_re_station_s", None),
+            dd_graph_re_b_p=getattr(state, "dd_graph_re_b_p", None),
+            dd_graph_re_b_s=getattr(state, "dd_graph_re_b_s", None),
             event_precision_matrix=state.event_precision_matrix,
         )
     
@@ -2042,14 +2300,15 @@ def _phase3_noise_ramp(
     # We interpret lr_sampler as a per-observation knob for pSGLD/SGHMC/AdaptiveSGHMC by applying
     # lr_eff = lr_sampler / N. This must be applied consistently whenever we overwrite sampler LR
     # (Phase 3/4 entry and resume). The backend factory does the same at construction time.
-    lr_user = float(state.params["lr_sampler"])
+    lr_user = _lr_for_phase(state.params, "phase3")
     lr_mode = str(state.params["sampler_lr_mode"]).strip().lower()
     sampler_backend = str(state.params["sampler_backend"]).lower()
-    if sampler_backend in {"psgld", "sghmc", "adaptive_sghmc"} and lr_mode == "per_obs":
+    if sampler_backend in {"psgld", "sghmc", "adaptive_sghmc", "sgnht", "adsgld_adam"} and lr_mode == "per_obs":
         base_lr = lr_user / float(max(1, int(state.N)))
     else:
         base_lr = lr_user
     sampler.set_lr(base_lr)
+    _apply_sgnht_per_obs_scaling(state, sampler)
     _apply_sampler_group_overrides(state, sampler)
     
     for g in sampler.param_groups:
@@ -2084,8 +2343,18 @@ def _phase3_noise_ramp(
             progress = 1.0
         else:
             progress = float(min(1.0, (t + 1) / float(ramp_len)))
+
+        # Optional extra noise multiplier (applied in both Phase 3 and Phase 4).
+        try:
+            noise_mult = float(state.params.get("sampler_noise_scale_mult", 1.0) or 1.0)
+            if (not math.isfinite(noise_mult)) or (noise_mult <= 0.0):
+                noise_mult = 1.0
+        except Exception:
+            noise_mult = 1.0
+        progress = float(progress) * float(noise_mult)
         
-        metrics = _run_epoch(state, t, sampler, noise_scale_factor=progress)
+        grad_clip_norm = float(state.params.get("sampler_grad_clip_norm", 0.0))
+        metrics = _run_epoch(state, t, sampler, noise_scale_factor=progress, grad_clip_norm=grad_clip_norm)
 
         # --- per-iteration (ramp step) summary ---
         phase3_interval = int(state.params.get("phase3_mads_interval", 0 if state.event_batch_enable else 10))
@@ -2142,6 +2411,8 @@ def _phase3_noise_ramp(
                 _wb_add_if_finite(wandb_metrics, "tau_mean", tau_mean)
                 _wb_add_if_finite(wandb_metrics, "tau_med", tau_med)
                 wandb_metrics.update(_sampler_extra_metrics(sampler))
+            if _want_wandb_group(state.params, "sgnht"):
+                wandb_metrics.update(_sampler_sgnht_metrics(sampler))
             wandb_logger.log_phase3_metrics(t, wandb_metrics, global_step=state.global_step_count)
 
         # Report current posterior noise scales instead of MADs (rank0 only under torchrun)
@@ -2177,6 +2448,12 @@ def _phase3_noise_ramp(
                 global_step_count=state.global_step_count,
                 noise_log_scale=None,
                 corr_error_b=getattr(state, "corr_error_b", None),
+                slowness_re_comp_p=getattr(state, "slowness_re_comp_p", None),
+                slowness_re_comp_s=getattr(state, "slowness_re_comp_s", None),
+                slowness_re_station_p=getattr(state, "slowness_re_station_p", None),
+                slowness_re_station_s=getattr(state, "slowness_re_station_s", None),
+                dd_graph_re_b_p=getattr(state, "dd_graph_re_b_p", None),
+                dd_graph_re_b_s=getattr(state, "dd_graph_re_b_s", None),
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -2200,6 +2477,12 @@ def _phase3_noise_ramp(
             global_step_count=state.global_step_count,
             noise_log_scale=None,
             corr_error_b=getattr(state, "corr_error_b", None),
+            slowness_re_comp_p=getattr(state, "slowness_re_comp_p", None),
+            slowness_re_comp_s=getattr(state, "slowness_re_comp_s", None),
+            slowness_re_station_p=getattr(state, "slowness_re_station_p", None),
+            slowness_re_station_s=getattr(state, "slowness_re_station_s", None),
+            dd_graph_re_b_p=getattr(state, "dd_graph_re_b_p", None),
+            dd_graph_re_b_s=getattr(state, "dd_graph_re_b_s", None),
             event_precision_matrix=state.event_precision_matrix,
         )
 
@@ -2213,18 +2496,19 @@ def _phase4_sampling(
     # Ensure LR is set from config.
     # For lr_mode='per_obs' we apply lr_eff = lr_sampler / N for pSGLD/SGHMC/AdaptiveSGHMC.
     try:
-        lr_user = float(state.params["lr_sampler"])
+        lr_user = _lr_for_phase(state.params, "phase4")
         lr_mode = str(state.params["sampler_lr_mode"]).strip().lower()
         backend = str(state.params["sampler_backend"]).strip().lower()
-        if backend in {"psgld", "sghmc", "adaptive_sghmc"} and lr_mode == "per_obs":
+        if backend in {"psgld", "sghmc", "adaptive_sghmc", "sgnht", "adsgld_adam"} and lr_mode == "per_obs":
             base_lr = lr_user / float(max(1, int(state.N)))
         else:
             base_lr = lr_user
-        if hasattr(sampler, "set_lr"):
-            sampler.set_lr(base_lr)  # type: ignore[attr-defined]
-        else:
-            for g in sampler.param_groups:
-                g['lr'] = base_lr
+            if hasattr(sampler, "set_lr"):
+                sampler.set_lr(base_lr)  # type: ignore[attr-defined]
+            else:
+                for g in sampler.param_groups:
+                    g['lr'] = base_lr
+            _apply_sgnht_per_obs_scaling(state, sampler)
     except Exception:
         pass
 
@@ -2253,6 +2537,41 @@ def _phase4_sampling(
     _apply_sampler_group_overrides(state, sampler)
     ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
     if ddp_main:
+        # Production-sampling guardrails:
+        # - Deterministic (unshuffled) batching in Phase 4 can create long-term trends because the
+        #   gradient-noise process becomes periodic rather than i.i.d.
+        # - Leaving the preconditioner unfrozen in Phase 4 makes the Markov kernel time-inhomogeneous.
+        try:
+            if not bool(state.params.get("batch_shuffle", True)):
+                warn(
+                    "Phase 4: batching.shuffle=false (deterministic minibatch order). "
+                    "For production posterior sampling, enable inference.batching.standard.shuffle=true "
+                    "to avoid periodic gradient-noise artifacts / long-term trends.",
+                    section="SAMPLER",
+                )
+        except Exception:
+            pass
+        try:
+            precond_on = bool(state.params.get("sampler_preconditioning", True))
+            if precond_on and (not bool(freeze_precond)):
+                warn(
+                    "Phase 4: freeze_preconditioner_sampling=false while preconditioning is enabled. "
+                    "This makes the sampling kernel time-inhomogeneous and can look like continued optimization. "
+                    "For production posterior samples, set inference.sampler.freeze_preconditioner_sampling=true.",
+                    section="SAMPLER",
+                )
+        except Exception:
+            pass
+        try:
+            if bool(state.params.get("sampler_preconditioning", True)) and int(state.params.get("phase2_epochs", 0) or 0) <= 0:
+                warn(
+                    "Phase 4: phase2_epochs=0 while preconditioning is enabled. "
+                    "Consider running a nonzero Phase 2 to stabilize RMSProp statistics before sampling "
+                    "(then freeze in Phase 4).",
+                    section="SAMPLER",
+                )
+        except Exception:
+            pass
         print(f"Phase 4: sampling | {_format_sampler_status(sampler)}")
 
     # Track relative parameter changes over the last N and N2 epochs
@@ -2260,14 +2579,108 @@ def _phase4_sampling(
     rel_window2 = int(state.params.get("rel_change_window2", 50))
     param_snapshots = collections.deque(maxlen=max(rel_window, rel_window2) + 1)
 
+    # --- lightweight drift diagnostics (subset + epoch-level batch-means t-test) ---
+    # Goal: detect systematic long-term drift in internal modes (e.g., coherent warps) during Phase-4 sampling.
+    # We track per-epoch increments of mean-centered dX_z on a fixed subset of events and compute a rolling
+    # t-statistic across the last W epochs. This is cheap (O(W*subset_n)) and GPU-friendly.
+    drift_subset_n_default = 2048
+    drift_window_default = 50
+    drift_min_blocks_default = 10
+    try:
+        drift_subset_n = int(state.params.get("_runtime_drift_subset_n", drift_subset_n_default) or drift_subset_n_default)
+        drift_window = int(state.params.get("_runtime_drift_window_epochs", drift_window_default) or drift_window_default)
+        drift_min_blocks = int(state.params.get("_runtime_drift_min_blocks", drift_min_blocks_default) or drift_min_blocks_default)
+        drift_subset_n = max(64, drift_subset_n)
+        drift_window = max(5, drift_window)
+        drift_min_blocks = max(5, min(drift_window, drift_min_blocks))
+    except Exception:
+        drift_subset_n, drift_window, drift_min_blocks = drift_subset_n_default, drift_window_default, drift_min_blocks_default
+
+    if not hasattr(state, "_runtime_drift_tracker"):
+        try:
+            Ne = int(state.dX_src.shape[0])
+            n_sub = min(int(drift_subset_n), int(Ne))
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(int(state.params.get("runtime_seed", 0) or 0) + 1337)
+            idx_cpu = torch.randperm(Ne, generator=gen, device="cpu")[:n_sub].to(torch.int64)
+            idx = idx_cpu.to(device=state.dX_src.device, non_blocking=True)
+            setattr(state, "_runtime_drift_tracker", {
+                "idx": idx,
+                "prev": None,
+                "deltas": collections.deque(maxlen=int(drift_window)),
+                "n_sub": int(n_sub),
+                "window": int(drift_window),
+                "min_blocks": int(drift_min_blocks),
+            })
+        except Exception:
+            setattr(state, "_runtime_drift_tracker", None)
+
+    @torch.no_grad()
+    def _drift_centered_dz_subset() -> Optional[torch.Tensor]:
+        tr = getattr(state, "_runtime_drift_tracker", None)
+        if not isinstance(tr, dict):
+            return None
+        idx = tr.get("idx", None)
+        if not isinstance(idx, torch.Tensor) or idx.numel() == 0:
+            return None
+        try:
+            dz = state.dX_src.detach()[:, 2].to(dtype=torch.float32)  # (Ne,)
+            zsub = dz.index_select(0, idx)  # (n_sub,)
+            zsub = zsub - zsub.mean()
+            return zsub
+        except Exception:
+            return None
+
     for epoch in range(int(start_epoch), int(n_epochs)):
+        # Drift tracker: capture state at epoch start (for delta over this epoch)
+        try:
+            tr = getattr(state, "_runtime_drift_tracker", None)
+            if isinstance(tr, dict) and tr.get("prev", None) is None:
+                tr["prev"] = _drift_centered_dz_subset()
+        except Exception:
+            pass
+
         metrics = _run_epoch(
             state,
             epoch,
             sampler,
             is_sampling=True,
-            noise_scale_factor=1.0,
+            noise_scale_factor=float(state.params.get("sampler_noise_scale_mult", 1.0) or 1.0),
+            grad_clip_norm=float(state.params.get("sampler_grad_clip_norm", 0.0)),
         )
+
+        # Drift tracker: update deltas and compute rolling t-stats on a fixed subset (rank0 logs below).
+        drift_metrics: Dict[str, float] = {}
+        try:
+            tr = getattr(state, "_runtime_drift_tracker", None)
+            if isinstance(tr, dict):
+                prev = tr.get("prev", None)
+                cur = _drift_centered_dz_subset()
+                if isinstance(prev, torch.Tensor) and isinstance(cur, torch.Tensor) and prev.shape == cur.shape:
+                    d = (cur - prev).detach().to(device="cpu", dtype=torch.float32)
+                    deltas = tr.get("deltas", None)
+                    if isinstance(deltas, collections.deque):
+                        deltas.append(d)
+                    tr["prev"] = cur
+                # Compute rolling stats (only when we have enough blocks)
+                deltas = tr.get("deltas", None)
+                if isinstance(deltas, collections.deque) and len(deltas) >= int(tr.get("min_blocks", 10)):
+                    D = torch.stack(list(deltas), dim=0)  # (B, n_sub)
+                    B = int(D.shape[0])
+                    mean = D.mean(dim=0)
+                    std = D.std(dim=0, unbiased=True).clamp_min(1e-30)
+                    tstat = mean / (std / float(max(1, B)) ** 0.5)
+                    abs_t = tstat.abs()
+                    drift_metrics = {
+                        "drift_z/frac_abs_t_gt3": float((abs_t > 3.0).float().mean().item()),
+                        "drift_z/frac_abs_t_gt10": float((abs_t > 10.0).float().mean().item()),
+                        "drift_z/abs_t_p99": float(torch.quantile(abs_t, 0.99).item()),
+                        "drift_z/abs_t_p999": float(torch.quantile(abs_t, 0.999).item()),
+                        "drift_z/window_epochs": float(B),
+                        "drift_z/subset_n": float(int(tr.get("n_sub", int(D.shape[1])))),
+                    }
+        except Exception:
+            drift_metrics = {}
 
         # --- per-epoch summary ---
         phase4_interval = int(state.params.get("phase4_mads_interval", 0 if state.event_batch_enable else 10))
@@ -2276,6 +2689,13 @@ def _phase4_sampling(
         if phase4_interval > 0 and (epoch % phase4_interval == 0 or epoch == n_epochs - 1):
             mp, ms = _compute_phase_mads(state, state.batch_size_sgld)
             mad_p_val, mad_s_val = mp.item(), ms.item()
+
+        # Sampler diagnostics (noise variance ratios, etc.)
+        sampler_extra: Dict[str, float] = {}
+        try:
+            sampler_extra = _sampler_extra_metrics(sampler)
+        except Exception:
+            sampler_extra = {}
 
         # See note in Phase 2: drift_ratio_* is removed; SGHMC teff/noise diagnostics are logged only when noise is on.
         tau_mean = float('nan')
@@ -2322,7 +2742,13 @@ def _phase4_sampling(
                 # tau_* only exists for samplers that expose tau_stats(); skip NaNs.
                 _wb_add_if_finite(wandb_metrics, "tau_mean", tau_mean)
                 _wb_add_if_finite(wandb_metrics, "tau_med", tau_med)
-                wandb_metrics.update(_sampler_extra_metrics(sampler))
+                if sampler_extra:
+                    wandb_metrics.update(sampler_extra)
+                # Drift diagnostics (subset + rolling epoch-level batch-means test)
+                if drift_metrics:
+                    wandb_metrics.update(drift_metrics)
+            if _want_wandb_group(state.params, "sgnht"):
+                wandb_metrics.update(_sampler_sgnht_metrics(sampler))
             wandb_logger.log_phase4_metrics(epoch, wandb_metrics, global_step=state.global_step_count)
 
         # Compact console line (rank0 only under torchrun)
@@ -2353,6 +2779,12 @@ def _phase4_sampling(
                 global_step_count=state.global_step_count,
                 noise_log_scale=None,
                 corr_error_b=getattr(state, "corr_error_b", None),
+                slowness_re_comp_p=getattr(state, "slowness_re_comp_p", None),
+                slowness_re_comp_s=getattr(state, "slowness_re_comp_s", None),
+                slowness_re_station_p=getattr(state, "slowness_re_station_p", None),
+                slowness_re_station_s=getattr(state, "slowness_re_station_s", None),
+                dd_graph_re_b_p=getattr(state, "dd_graph_re_b_p", None),
+                dd_graph_re_b_s=getattr(state, "dd_graph_re_b_s", None),
                 event_precision_matrix=state.event_precision_matrix,
             )
 
@@ -2414,6 +2846,12 @@ def _phase4_sampling(
             global_step_count=state.global_step_count,
             noise_log_scale=None,
             corr_error_b=getattr(state, "corr_error_b", None),
+            slowness_re_comp_p=getattr(state, "slowness_re_comp_p", None),
+            slowness_re_comp_s=getattr(state, "slowness_re_comp_s", None),
+            slowness_re_station_p=getattr(state, "slowness_re_station_p", None),
+            slowness_re_station_s=getattr(state, "slowness_re_station_s", None),
+            dd_graph_re_b_p=getattr(state, "dd_graph_re_b_p", None),
+            dd_graph_re_b_s=getattr(state, "dd_graph_re_b_s", None),
             event_precision_matrix=state.event_precision_matrix,
         )  # type: ignore[arg-type]
     return
@@ -2429,33 +2867,37 @@ def _apply_sampler_group_overrides(state: "LocateState", sampler: Optional[torch
     # If the user did not explicitly provide any overrides, do NOT touch group hyperparams.
     # This avoids surprising behavior and ensures global flags like sampler.freeze_preconditioner_sampling
     # apply uniformly to all parameter groups.
-    if not bool(state.params.get("_corr_error_sampler_overrides_active", False)):
+    if not bool(state.params.get("_sampler_group_overrides_active", False)):
         return
-    try:
-        lr_mult = float(state.params.get("_corr_error_lr_mult", 0.05))
-        t_mult = float(state.params.get("_corr_error_temperature_mult", 0.25))
-        eps_b = float(state.params.get("_corr_error_eps", 1e-3))
-        freeze_b = bool(state.params.get("_corr_error_freeze_preconditioner_sampling", False))
-    except Exception:
-        lr_mult, t_mult, eps_b, freeze_b = 0.05, 0.25, 1e-3, False
+    group_overrides = state.params.get("_sampler_group_overrides", {})
+    if not isinstance(group_overrides, dict) or not group_overrides:
+        return
 
     for g in sampler.param_groups:
-        if str(g.get("group_name", "")).strip().lower() != "corr_error":
+        gname = str(g.get("group_name", "")).strip().lower()
+        if not gname:
+            continue
+        ov = group_overrides.get(gname, None)
+        if not isinstance(ov, dict) or not ov:
             continue
         try:
             # Keep base lr/temperature as whatever caller set, then apply multipliers.
             # We store base values on the group to avoid compounding.
-            if "base_lr" not in g:
-                g["base_lr"] = float(g.get("lr", 0.0))
-            if "base_temperature" not in g:
-                g["base_temperature"] = float(g.get("temperature", 1.0))
-            g["lr"] = float(g["base_lr"]) * float(lr_mult)
-            g["temperature"] = float(g["base_temperature"]) * float(t_mult)
+            if "lr_mult" in ov:
+                if "base_lr" not in g:
+                    g["base_lr"] = float(g.get("lr", 0.0))
+                g["lr"] = float(g["base_lr"]) * float(ov["lr_mult"])
+            if "temperature_mult" in ov:
+                if "base_temperature" not in g:
+                    g["base_temperature"] = float(g.get("temperature", 1.0))
+                g["temperature"] = float(g["base_temperature"]) * float(ov["temperature_mult"])
             # Stabilize RMSProp preconditioner/noise amplification
-            g["eps"] = float(eps_b)
+            if "eps" in ov:
+                g["eps"] = float(ov["eps"])
             # Do not clobber the global freeze flag; if the run is in a frozen phase (Phase 4),
             # keep it frozen even if this group override isn't requesting freezing.
-            g["freeze_preconditioner"] = bool(g.get("freeze_preconditioner", False)) or bool(freeze_b)
+            if "freeze_preconditioner_sampling" in ov:
+                g["freeze_preconditioner"] = bool(g.get("freeze_preconditioner", False)) or bool(ov["freeze_preconditioner_sampling"])
         except Exception:
             pass
     return
@@ -4795,7 +5237,7 @@ def _maybe_init_corr_error(state: "LocateState") -> None:
 
     where:
       - w_s is a fixed station basis vector (n_stations, R)
-      - b is an event latent (n_events, R, 2) with a GMRF/Laplacian prior over an event kNN graph
+      - b is an event latent (n_events, R, 2) with a GMRF/Laplacian prior over a radius-r subsampled graph
 
     This is designed to be pSGLD/SGHMC friendly: b is an explicit Parameter.
     """
@@ -4805,8 +5247,12 @@ def _maybe_init_corr_error(state: "LocateState") -> None:
     except Exception:
         return
 
+    ddp_on = _ddp_enabled(state.params)
     # Require station indices for receiver dependence.
     if getattr(state, "row_station_index", None) is None or int(getattr(state, "n_stations", 0) or 0) <= 0:
+        # In DDP, silently disabling on one rank can deadlock collectives later (different Parameter sets).
+        if ddp_on:
+            raise RuntimeError("corr_error enabled but station indices are missing (DDP requires this to be consistent across ranks).")
         warn("corr_error enabled but station indices are missing; disabling corr_error.", section="LIKELIHOOD")
         state.params["_corr_error_enabled"] = False
         return
@@ -4814,124 +5260,240 @@ def _maybe_init_corr_error(state: "LocateState") -> None:
     n_events = int(state.X_src.shape[0])
     dev = state.device
 
-    # --- Station basis W (n_stations, R) ---
+    # --- Station basis W (n_stations, R) (optional) ---
     R = int(state.params.get("_corr_error_r", 0) or 0)
     if R <= 0:
         raise ValueError("corr_error.enabled=true but corr_error.r <= 0")
+    sta_basis_enabled = True
+    try:
+        sta_basis_enabled = bool(state.params.get("_corr_error_station_basis_enabled", True))
+    except Exception:
+        sta_basis_enabled = True
     ell_sta = float(state.params.get("_corr_error_station_basis_ell_km", 0.0) or 0.0)
-    if not (ell_sta > 0.0) or (not math.isfinite(ell_sta)):
-        raise ValueError("corr_error.enabled=true but corr_error.station_basis.ell_km is not finite and > 0")
     jitter_sta = float(state.params.get("_corr_error_station_basis_jitter", 1e-6) or 1e-6)
 
-    try:
-        sta_xy = (
-            state.dtimes.select([pl.col("sta_idx"), pl.col("X"), pl.col("Y")])
-            .unique(subset=["sta_idx"], maintain_order=True)
-            .sort("sta_idx")
+    W = None
+    if not sta_basis_enabled:
+        # Per-station coefficients mode: b has one coefficient per station.
+        # For correctness, we need R == n_stations so sta_idx maps directly to coefficient.
+        # Rather than erroring, automatically override R at runtime (user asked for this).
+        if int(R) != int(n_stations):
+            warn(
+                "corr_error: station_basis.enabled=false implies per-station coefficients, so "
+                f"overriding corr_error.r from {int(R)} to n_stations={int(n_stations)}.",
+                section="LIKELIHOOD",
+            )
+            R = int(n_stations)
+            try:
+                state.params["_corr_error_r"] = int(R)
+            except Exception:
+                pass
+        info(
+            "corr_error: station_basis.enabled=false -> using per-station coefficients (no low-rank basis).",
+            section="LIKELIHOOD",
         )
-        if int(sta_xy.shape[0]) != int(n_stations):
-            raise ValueError(f"corr_error.station_basis: expected {n_stations} stations but got {int(sta_xy.shape[0])} unique sta_idx rows")
-        xy_np = sta_xy.select([pl.col("X"), pl.col("Y")]).to_numpy().astype(np.float32, copy=False)
-        XY = torch.from_numpy(xy_np).to(device=dev, dtype=torch.float32)  # (S,2)
-        D_sta = torch.cdist(XY, XY).to(torch.float32)
-        K_sta = torch.exp(-0.5 * (D_sta / float(ell_sta)).square())
-        j = 1e-6 if (not math.isfinite(jitter_sta) or jitter_sta <= 0.0) else float(jitter_sta)
-        K_sta = K_sta + (j * torch.eye(int(K_sta.shape[0]), device=dev, dtype=K_sta.dtype))
-        evals, evecs = torch.linalg.eigh(K_sta)
-        evals = evals.clamp_min(0.0)
-        if int(R) > int(evals.numel()):
-            raise ValueError(f"corr_error.station_basis: r={int(R)} exceeds n_stations={int(evals.numel())}")
-        evals_r = evals[-int(R):]
-        evecs_r = evecs[:, -int(R):]
-        W = (evecs_r * torch.sqrt(evals_r).unsqueeze(0)).to(device=dev, dtype=torch.float32)  # (S,R)
-    except Exception as e:
-        warn(f"Failed to build corr_error station_basis; disabling (err={e})", section="LIKELIHOOD")
-        state.params["_corr_error_enabled"] = False
-        return
+    else:
+        if not (ell_sta > 0.0) or (not math.isfinite(ell_sta)):
+            raise ValueError("corr_error.enabled=true but corr_error.station_basis.ell_km is not finite and > 0")
+        try:
+            sta_xy = (
+                state.dtimes.select([pl.col("sta_idx"), pl.col("X"), pl.col("Y")])
+                .unique(subset=["sta_idx"], maintain_order=True)
+                .sort("sta_idx")
+            )
+            if int(sta_xy.shape[0]) != int(n_stations):
+                raise ValueError(f"corr_error.station_basis: expected {n_stations} stations but got {int(sta_xy.shape[0])} unique sta_idx rows")
+            xy_np = sta_xy.select([pl.col("X"), pl.col("Y")]).to_numpy().astype(np.float32, copy=False)
+            # Compute the station basis on CPU for robustness and determinism across heterogeneous GPUs.
+            XY_cpu = torch.from_numpy(xy_np).to(device="cpu", dtype=torch.float64)  # (S,2)
+            D_sta = torch.cdist(XY_cpu, XY_cpu).to(torch.float64)
+            K_sta = torch.exp(-0.5 * (D_sta / float(ell_sta)).square())
+            j = 1e-6 if (not math.isfinite(jitter_sta) or jitter_sta <= 0.0) else float(jitter_sta)
+            K_sta = K_sta + (j * torch.eye(int(K_sta.shape[0]), device=K_sta.device, dtype=K_sta.dtype))
+            evals, evecs = torch.linalg.eigh(K_sta)
+            evals = evals.clamp_min(0.0)
+            if int(R) > int(evals.numel()):
+                raise ValueError(f"corr_error.station_basis: r={int(R)} exceeds n_stations={int(evals.numel())}")
+            evals_r = evals[-int(R):]
+            evecs_r = evecs[:, -int(R):]
+            W_cpu = (evecs_r * torch.sqrt(evals_r).unsqueeze(0)).to(dtype=torch.float32)  # (S,R) on CPU
+            W = W_cpu.to(device=dev, dtype=torch.float32)  # (S,R) on device
+        except Exception as e:
+            # In DDP, silently disabling on one rank can deadlock collectives later (different Parameter sets).
+            if ddp_on:
+                raise RuntimeError(f"Failed to build corr_error station_basis under DDP (err={e})")
+            warn(f"Failed to build corr_error station_basis; disabling (err={e})", section="LIKELIHOOD")
+            state.params["_corr_error_enabled"] = False
+            return
 
     state.corr_error_station_basis_W = W
     state.corr_error_r = int(R)
-    state.params["_corr_error_station_basis_W"] = W
+    if isinstance(W, torch.Tensor):
+        state.params["_corr_error_station_basis_W"] = W
 
-    # --- Event kNN graph (u,v,w) built at MAP geometry ---
-    knn = int(state.params.get("_corr_error_event_graph_knn", 16) or 16)
-    ell_ev = float(state.params.get("_corr_error_event_graph_ell_km", 0.0) or 0.0)
-    if not (ell_ev > 0.0) or (not math.isfinite(ell_ev)):
-        raise ValueError("corr_error.enabled=true but corr_error.event_graph.ell_km is not finite and > 0")
+    # --- Event graph: default is geometry kNN-within-radius; optional dtimes-derived graph ---
+    graph_enabled = True
+    try:
+        graph_enabled = bool(state.params.get("_corr_error_event_graph_enabled", True))
+    except Exception:
+        graph_enabled = True
+    k = int(state.params.get("_corr_error_event_graph_k", 16) or 16)
+    r_ev = float(state.params.get("_corr_error_event_graph_radius_km", 0.0) or 0.0)
+    graph_source = str(state.params.get("_corr_error_event_graph_source", "geometry") or "geometry").strip().lower()
+    if graph_source not in {"geometry", "dtimes", "none"}:
+        graph_source = "geometry"
+    if (graph_source != "dtimes") and graph_enabled:
+        if not (r_ev > 0.0) or (not math.isfinite(r_ev)):
+            raise ValueError("corr_error.enabled=true but corr_error.event_graph.radius_km is not finite and > 0")
+    symmetrize = bool(state.params.get("_corr_error_event_graph_symmetrize", True))
+    cell_size_km = state.params.get("_corr_error_event_graph_cell_size_km", None)
+    cell_hops = int(state.params.get("_corr_error_event_graph_cell_hops", 2) or 2)
+    max_tries = int(state.params.get("_corr_error_event_graph_max_tries_per_neighbor", 64) or 64)
     q_diag = float(state.params.get("_corr_error_event_graph_q_diag", 0.0) or 0.0)
+    weighting = str(state.params.get("_corr_error_event_graph_weighting", "uniform_degree") or "uniform_degree")
+    weight_ell_km = state.params.get("_corr_error_event_graph_weight_ell_km", None)
+    weight_eps_km = float(state.params.get("_corr_error_event_graph_weight_eps_km", 1e-3) or 1e-3)
+    weight_normalize = bool(state.params.get("_corr_error_event_graph_weight_normalize", True))
 
     t0 = time.time()
-    X_map = (state.X_src.detach() + state.dX_src.detach())[:, :3].to(torch.float32).cpu()
-    X_np = X_map.numpy()
-    ii_np = None
-    jj_np = None
-    dd_np = None
-    used_backend = "torch_cdist"
-    try:
-        from scipy.spatial import cKDTree  # type: ignore
-        X64 = X_np.astype("float64", copy=False)
-        tree = cKDTree(X64)
-        kq = int(min(int(knn) + 1, int(n_events)))
+    if not graph_enabled:
+        # IID prior mode: no event graph; use Q = I in the corr_error prior.
+        gstats = None
+        dt_graph_s = 0.0
+        u_t = torch.empty((0,), dtype=torch.int64, device=dev)
+        v_t = torch.empty((0,), dtype=torch.int64, device=dev)
+        w_t = torch.empty((0,), dtype=torch.float32, device=dev)
+        state.corr_error_u = u_t
+        state.corr_error_v = v_t
+        state.corr_error_w = w_t
+        state.corr_error_q_diag = 1.0
+        state.params["_corr_error_u"] = u_t
+        state.params["_corr_error_v"] = v_t
+        state.params["_corr_error_w"] = w_t
+        state.params["_corr_error_q_diag"] = float(state.corr_error_q_diag)
+        state.params["_corr_error_event_graph_dt_s"] = 0.0
+        state.params["_corr_error_event_graph_backend"] = "none"
+        state.params["_corr_error_event_graph_backend_id"] = -1.0
+        # Single component label (not used unless gauge-fixing is enabled; IID mode should not need it).
         try:
-            dists, nbrs = tree.query(X64, k=kq, workers=-1)
-        except TypeError:
+            n_ev = int(n_events)
+        except Exception:
+            n_ev = 0
+        state.corr_error_component_id = torch.zeros((int(n_ev),), dtype=torch.int64, device=dev)
+        state.corr_error_n_components = 1
+        state.params["_corr_error_event_graph_n_components"] = float(1)
+        info("corr_error: event_graph.enabled=false -> using IID prior on b (no Laplacian).", section="LIKELIHOOD")
+    else:
+        seed0 = int(state.params.get("runtime_seed", 0))
+        X_now = (state.X_src.detach() + state.dX_src.detach())[:, :3].to(torch.float32).cpu()
+        X_np = X_now.numpy().astype(np.float64, copy=False)
+        t_graph0 = time.time()
+        info(
+            f"corr_error: building event graph (source={graph_source} n_events={int(n_events)} radius_km={float(r_ev):g} k={int(k)} sym={int(bool(symmetrize))})",
+            section="LIKELIHOOD",
+        )
+        if graph_source == "dtimes":
+            II_cpu = state.II.detach().to(device="cpu").numpy()
+            u_np, v_np, w_np, gstats = build_corr_error_dtimes_graph(
+                II_cpu,
+                n_events=int(n_events),
+                k=int(k),
+                X_km=X_np,
+                radius_km=(float(r_ev) if (math.isfinite(float(r_ev)) and float(r_ev) > 0.0) else None),
+                seed=int(seed0),
+                symmetrize=bool(symmetrize),
+                weighting=str(weighting),
+                weight_ell_km=(float(weight_ell_km) if weight_ell_km is not None else None),
+                weight_eps_km=float(weight_eps_km),
+                normalize_weights=bool(weight_normalize),
+            )
+        else:
+            u_np, v_np, w_np, gstats = build_corr_error_radius_graph(
+                X_np,
+                radius_km=float(r_ev),
+                k=int(k),
+                seed=int(seed0),
+                cell_size_km=cell_size_km,
+                cell_hops=int(cell_hops),
+                max_tries_per_neighbor=int(max_tries),
+                symmetrize=bool(symmetrize),
+                weighting=str(weighting),
+                weight_ell_km=(float(weight_ell_km) if weight_ell_km is not None else None),
+                weight_eps_km=float(weight_eps_km),
+                normalize_weights=bool(weight_normalize),
+            )
+        dt_graph_s = time.time() - t_graph0
+        try:
+            backend = str(getattr(gstats, "backend", "unknown")).strip().lower()
+        except Exception:
+            backend = "unknown"
+        state.params["_corr_error_event_graph_dt_s"] = float(dt_graph_s)
+        state.params["_corr_error_event_graph_backend"] = backend
+        # W&B-friendly numeric encoding
+        state.params["_corr_error_event_graph_backend_id"] = float(1.0 if backend == "ckdtree" else (0.0 if backend == "grid" else -1.0))
+        u_t = torch.tensor(u_np, dtype=torch.int64, device=dev)
+        v_t = torch.tensor(v_np, dtype=torch.int64, device=dev)
+        w_t = torch.tensor(w_np, dtype=torch.float32, device=dev)
+        state.corr_error_u = u_t
+        state.corr_error_v = v_t
+        state.corr_error_w = w_t
+        state.corr_error_q_diag = float(max(0.0, q_diag))
+        state.params["_corr_error_u"] = u_t
+        state.params["_corr_error_v"] = v_t
+        state.params["_corr_error_w"] = w_t
+        state.params["_corr_error_q_diag"] = float(state.corr_error_q_diag)
+
+    # --- Connected components of the corr_error event graph (for per-component gauge fixing) ---
+    # Only meaningful when a graph/Laplacian is actually enabled.
+    if graph_enabled:
+        try:
+            n_ev = int(n_events)
+            if n_ev > 0 and int(u_np.size) > 0:
+                try:
+                    from scipy.sparse import coo_matrix  # type: ignore
+                    from scipy.sparse.csgraph import connected_components  # type: ignore
+                    row = np.concatenate([u_np.astype(np.int64, copy=False), v_np.astype(np.int64, copy=False)], axis=0)
+                    col = np.concatenate([v_np.astype(np.int64, copy=False), u_np.astype(np.int64, copy=False)], axis=0)
+                    data = np.ones((row.shape[0],), dtype=np.int8)
+                    adj = coo_matrix((data, (row, col)), shape=(n_ev, n_ev))
+                    n_comp, labels = connected_components(csgraph=adj, directed=False, return_labels=True)
+                    labels_t = torch.tensor(labels, dtype=torch.int64, device=dev)
+                    state.corr_error_component_id = labels_t
+                    state.corr_error_n_components = int(n_comp)
+                    state.params["_corr_error_event_graph_n_components"] = float(int(n_comp))
+                except Exception:
+                    # Fallback: treat as one component (still better than crashing initialization).
+                    state.corr_error_component_id = torch.zeros((n_ev,), dtype=torch.int64, device=dev)
+                    state.corr_error_n_components = 1
+                    state.params["_corr_error_event_graph_n_components"] = float(1)
+            else:
+                state.corr_error_component_id = torch.arange(int(n_ev), dtype=torch.int64, device=dev)
+                state.corr_error_n_components = int(n_ev)
+                state.params["_corr_error_event_graph_n_components"] = float(int(n_ev))
+        except Exception:
+            # Extremely defensive: if anything went wrong, still define a valid component labeling.
             try:
-                dists, nbrs = tree.query(X64, k=kq, n_jobs=-1)  # type: ignore[call-arg]
-            except TypeError:
-                dists, nbrs = tree.query(X64, k=kq)
-        dists = dists[:, 1:]
-        nbrs = nbrs[:, 1:]
-        knn_eff = int(nbrs.shape[1])
-        ii_np = np.repeat(np.arange(n_events, dtype=np.int64), knn_eff)
-        jj_np = nbrs.reshape(-1).astype(np.int64, copy=False)
-        dd_np = dists.reshape(-1).astype(np.float32, copy=False)
-        used_backend = "scipy_ckdtree"
-    except Exception:
-        # Fallback: exact O(n^2) memory/time (ok only for small n_events).
-        D = torch.cdist(X_map, X_map).to(torch.float32)
-        D.fill_diagonal_(float("inf"))
-        k_eff = int(min(int(knn), int(max(0, n_events - 1))))
-        vals, nbrs = torch.topk(D, k=k_eff, largest=False)
-        ii = torch.arange(n_events, dtype=torch.int64).unsqueeze(1).expand(-1, k_eff).reshape(-1)
-        jj = nbrs.reshape(-1).to(torch.int64)
-        dd = vals.reshape(-1).to(torch.float32)
-        ii_np = ii.numpy()
-        jj_np = jj.numpy()
-        dd_np = dd.numpy()
-        used_backend = "torch_cdist"
-
-    ww_np = np.exp(-0.5 * (dd_np / float(ell_ev)) ** 2).astype(np.float32, copy=False)
-    u = np.minimum(ii_np, jj_np).astype(np.int64, copy=False)
-    v = np.maximum(ii_np, jj_np).astype(np.int64, copy=False)
-    pairs = np.stack([u, v], axis=1)
-    uniq, inv = np.unique(pairs, axis=0, return_inverse=True)
-    w_sum = np.zeros((uniq.shape[0],), dtype=np.float64)
-    w_cnt = np.zeros((uniq.shape[0],), dtype=np.float64)
-    np.add.at(w_sum, inv, ww_np.astype(np.float64))
-    np.add.at(w_cnt, inv, 1.0)
-    w_mean = (w_sum / np.maximum(1.0, w_cnt)).astype(np.float32)
-    mask = (uniq[:, 0] != uniq[:, 1])
-    uniq = uniq[mask]
-    w_mean = w_mean[mask]
-
-    u_t = torch.tensor(uniq[:, 0], dtype=torch.int64, device=dev)
-    v_t = torch.tensor(uniq[:, 1], dtype=torch.int64, device=dev)
-    w_t = torch.tensor(w_mean, dtype=torch.float32, device=dev)
-    state.corr_error_u = u_t
-    state.corr_error_v = v_t
-    state.corr_error_w = w_t
-    state.corr_error_q_diag = float(max(0.0, q_diag))
-    state.params["_corr_error_u"] = u_t
-    state.params["_corr_error_v"] = v_t
-    state.params["_corr_error_w"] = w_t
-    state.params["_corr_error_q_diag"] = float(state.corr_error_q_diag)
+                n_ev = int(n_events)
+            except Exception:
+                n_ev = 0
+            state.corr_error_component_id = torch.zeros((int(n_ev),), dtype=torch.int64, device=dev)
+            state.corr_error_n_components = 1
+            state.params["_corr_error_event_graph_n_components"] = float(1)
 
     # --- Initialize b (n_events, R, 2) ---
     b0 = torch.zeros((int(n_events), int(R), 2), dtype=torch.float32, device=dev)
     resume_b = getattr(state, "_resume_corr_error_b", None)
     if isinstance(resume_b, torch.Tensor):
         try:
-            b0.copy_(resume_b.to(device=dev, dtype=torch.float32))
+            rb = resume_b.to(device=dev, dtype=torch.float32)
+            # Only warm-start if shapes match; otherwise ignore (basis-mode changes cannot be mapped safely).
+            if tuple(rb.shape) == tuple(b0.shape):
+                b0.copy_(rb)
+            else:
+                warn(
+                    f"corr_error: ignoring warm-start corr_error_b due to shape mismatch resume={tuple(rb.shape)} init={tuple(b0.shape)}",
+                    section="LIKELIHOOD",
+                )
         except Exception:
             pass
         try:
@@ -4941,11 +5503,15 @@ def _maybe_init_corr_error(state: "LocateState") -> None:
     state.corr_error_b = torch.nn.Parameter(b0)
 
     dt_s = time.time() - t0
+    deg_mean = float(getattr(gstats, "mean_undirected_degree", 0.0)) if gstats is not None else 0.0
+    gb = str(getattr(gstats, "backend", "none")) if gstats is not None else "none"
     info(
         "Initialized corr_error: "
         f"b_shape=({int(n_events)},{int(R)},2) edges={int(u_t.numel())} "
-        f"ell_event_km={float(ell_ev):g} q_diag={float(state.corr_error_q_diag):g} "
-        f"ell_station_km={float(ell_sta):g} (knn_backend={used_backend}, dt={dt_s:.2f}s)",
+        f"radius_km={float(r_ev):g} k={int(k)} q_diag={float(state.corr_error_q_diag):g} "
+        f"sym={int(bool(symmetrize))} deg_mean={float(deg_mean):.1f} "
+        f"ell_station_km={float(ell_sta):g} "
+        f"(graph_backend={str(gb)} graph_dt={float(dt_graph_s):.2f}s total_dt={dt_s:.2f}s)",
         section="LIKELIHOOD",
     )
     return
@@ -5324,6 +5890,131 @@ def _maybe_estimate_eikonet_v1d_speed(state: "LocateState") -> None:
             warn(f"EikoNet v1d save failed: {e}", section="LIKELIHOOD")
 
 
+@torch.no_grad()
+def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
+    try:
+        if not bool(state.params.get("_shared_event_re_enabled", False)):
+            return
+        if not bool(state.params.get("_shared_event_re_whitening_enabled", False)):
+            return
+        if not bool(state.params.get("_shared_event_re_whitening_precompute", False)):
+            return
+        if bool(state.params.get("event_batch_enable", False)):
+            return
+        if bool(state.params.get("batch_shuffle", True)):
+            return
+    except Exception:
+        return
+
+    device_pref = str(state.params.get("_shared_event_re_whitening_precompute_device", "gpu")).strip().lower()
+    if device_pref not in {"gpu", "cpu"}:
+        device_pref = "gpu"
+    if device_pref == "cpu":
+        # CPU precompute is not supported for reuse on GPU without extra transfers.
+        return
+
+    batch_size = int(getattr(state, "batch_size_sgld", 0) or state.params.get("batch_size_sgld", 0) or 0)
+    N = int(state.N)
+    if batch_size <= 0 or N <= 0:
+        return
+
+    cache = state.params.get("_shared_event_re_whitening_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+
+    grouping = str(state.params.get("_shared_event_re_grouping", "phase")).strip().lower()
+    if grouping in {"stationphase", "station-phase"}:
+        grouping = "station_phase"
+
+    tau_ps = state.params.get("_shared_event_re_tau_s", [0.0, 0.0])
+    tau_p = float(tau_ps[0]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+    tau_s = float(tau_ps[1]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+    jitter0 = float(state.params.get("_shared_event_re_jitter0", 1e-8))
+    max_rows_per_group = int(state.params.get("_shared_event_re_max_rows_per_group", 200000))
+    max_nodes_per_group = int(state.params.get("_shared_event_re_max_nodes_per_group", 512))
+    solver = str(state.params.get("_shared_event_re_whitening_solver", "pcg")).strip().lower()
+
+    edge_weighting = str(state.params.get("_shared_event_re_whitening_edge_weighting", "uniform")).strip().lower()
+    edge_weight_ell_km = float(state.params.get("_shared_event_re_whitening_edge_weight_ell_km", 1.0))
+    edge_weight_eps_km = float(state.params.get("_shared_event_re_whitening_edge_weight_eps_km", 1e-3))
+    edge_weight_power = float(state.params.get("_shared_event_re_whitening_edge_weight_power", 1.0))
+    edge_weight_scale_km = float(state.params.get("_shared_event_re_whitening_edge_weight_scale_km", 1.0))
+    edge_weight_global_scale = float(state.params.get("_shared_event_re_whitening_edge_weight_global_scale", 1.0))
+    edge_weight_normalize = bool(state.params.get("_shared_event_re_whitening_edge_weight_normalize", False))
+
+    X_event = None
+    if edge_weighting in {"distance_rbf", "distance_linear", "distance_power"}:
+        X_event = state.params.get("_shared_event_re_whitening_X_event", None)
+        if not isinstance(X_event, torch.Tensor) or int(X_event.shape[0]) != int(state.X_src.shape[0]):
+            X_event = (state.X_src + state.dX_src)[:, :3].detach().to(device=state.device, dtype=torch.float32)
+            state.params["_shared_event_re_whitening_X_event"] = X_event
+
+    σp, σs = _current_noise_scales(state)
+    σp = σp.to(device=state.device)
+    σs = σs.to(device=state.device)
+
+    n_batches = int(math.ceil(float(N) / float(batch_size)))
+    for b in range(n_batches):
+        i_start = b * batch_size
+        i_end = min(i_start + batch_size, N)
+        idx_b = state.II[i_start:i_end].to(device=state.device, dtype=torch.int64)
+        YY_b = state.YY[i_start:i_end].to(device=state.device)
+        ph_id = torch.where(
+            YY_b[:, 4] < 0.5,
+            torch.zeros_like(YY_b[:, 4], dtype=torch.int64),
+            torch.ones_like(YY_b[:, 4], dtype=torch.int64),
+        )
+        if grouping == "station_phase" and isinstance(state.row_station_index, torch.Tensor):
+            sta_b = state.row_station_index[i_start:i_end].to(device=state.device, dtype=torch.int64)
+            keys = (sta_b * 2) + ph_id
+        else:
+            keys = ph_id
+
+        cache_key_extra = ("batch", int(b))
+        cache_key = _make_cache_key(
+            edge_weighting=edge_weighting,
+            edge_weight_ell_km=edge_weight_ell_km,
+            edge_weight_eps_km=edge_weight_eps_km,
+            edge_weight_power=edge_weight_power,
+            edge_weight_scale_km=edge_weight_scale_km,
+            edge_weight_global_scale=edge_weight_global_scale,
+            edge_weight_normalize=edge_weight_normalize,
+            tau_p=float(tau_p),
+            tau_s=float(tau_s),
+            max_rows_per_group=int(max_rows_per_group),
+            max_nodes_per_group=int(max_nodes_per_group),
+            solver=str(solver),
+            idx_rows=int(idx_b.shape[0]),
+            cache_key_extra=cache_key_extra,
+        )
+        if cache_key in cache:
+            continue
+        cache_entry = build_whitening_cache_entry(
+            idx=idx_b,
+            keys=keys,
+            ph_id=ph_id,
+            sigma_p=σp,
+            sigma_s=σs,
+            tau_p=float(tau_p),
+            tau_s=float(tau_s),
+            jitter0=float(jitter0),
+            max_rows_per_group=int(max_rows_per_group),
+            max_nodes_per_group=int(max_nodes_per_group),
+            solver=str(solver),
+            edge_weighting=edge_weighting,
+            edge_weight_ell_km=float(edge_weight_ell_km),
+            edge_weight_eps_km=float(edge_weight_eps_km),
+            edge_weight_power=float(edge_weight_power),
+            edge_weight_scale_km=float(edge_weight_scale_km),
+            edge_weight_global_scale=float(edge_weight_global_scale),
+            edge_weight_normalize=bool(edge_weight_normalize),
+            X_event=X_event,
+        )
+        cache[cache_key] = cache_entry
+
+    state.params["_shared_event_re_whitening_cache"] = cache
+
+
 def locate_all(
     params: dict,
     origins0: pl.DataFrame,
@@ -5336,25 +6027,26 @@ def locate_all(
     state = _build_initial_state(params, origins0, dtimes, model, device)
     phase, start_epoch, skip_saving_first_epoch, ckpt = _resume_or_initialize(state)
 
-    # Optional residual-based outlier removal, only at fresh Phase 1 start.
-    # Prefer running this during data prep (prepare_input_dfs) immediately after the linearization filter,
-    # so we avoid doing an extra expensive residual pass here.
-    if (
-        ckpt is None
-        and phase == "phase1"
-        and start_epoch == 0
-        and bool(state.params.get("residual_filter_enable", False))
-        and not bool(state.params.get("_residual_filter_applied_in_prepare_input_dfs", False))
-    ):
-        _pre_filter_outlier_residuals(state)
-        _print_initial_residual_stats(state)
-
     # Phase 1: MAP estimation with Adam optimizer
     if phase == "phase1":
         if wandb_logger:
             wandb_logger.start_phase("phase1")
         _phase1_map_warmup(state, start_epoch, wandb_logger)
         phase = "phase2"
+
+    # Optional residual-based outlier removal at the start of Phase 2 (post-MAP).
+    # Prefer running this during data prep (prepare_input_dfs) immediately after the linearization filter,
+    # so we avoid doing an extra expensive residual pass here.
+    if (
+        ckpt is None
+        and phase == "phase2"
+        and bool(state.params.get("residual_filter_enable", False))
+        and not bool(state.params.get("_residual_filter_applied_in_prepare_input_dfs", False))
+        and not bool(state.params.get("_residual_filter_applied_in_phase2", False))
+    ):
+        _pre_filter_outlier_residuals(state, use_current_dX=True)
+        state.params["_residual_filter_applied_in_phase2"] = True
+        _print_initial_residual_stats(state)
 
     # Structured likelihood components (shared_event_latent/shared_event_re/slowness_re) removed.
     _maybe_init_corr_error(state)
@@ -5376,10 +6068,10 @@ def locate_all(
         # One-time fix: enforce current JSON hyperparameters after resume
         try:
             # Enforce required param-group keys expected by our current samplers.
-            lr_user = float(state.params["lr_sampler"])
+            lr_user = _lr_for_phase(state.params, phase)
             lr_mode = str(state.params["sampler_lr_mode"]).strip().lower()
             backend = str(state.params["sampler_backend"]).strip().lower()
-            if backend in {"psgld", "sghmc", "adaptive_sghmc"} and lr_mode == "per_obs":
+            if backend in {"psgld", "sghmc", "adaptive_sghmc", "sgnht", "adsgld_adam"} and lr_mode == "per_obs":
                 lr_json = lr_user / float(max(1, int(state.N)))
             else:
                 lr_json = lr_user
@@ -5388,12 +6080,26 @@ def locate_all(
             eps_json = float(state.params["sampler_eps"])
             temp_json = float(state.params["sampler_temperature"])
             precond_json = bool(state.params["sampler_preconditioning"])
+            precond_type_json = str(state.params.get("sampler_preconditioner", "none")).strip().lower()
+            if precond_json and precond_type_json in {"none", "false", ""}:
+                precond_type_json = "rmsprop"
+            if (not precond_json) or precond_type_json in {"none", "false", ""}:
+                precond_type_json = "none"
 
             for g in sampler.param_groups:
                 g.setdefault("beta", beta_json)
                 g.setdefault("eps", eps_json)
                 g.setdefault("temperature", temp_json)
-                g.setdefault("preconditioning", precond_json)
+                # Always honor current JSON preconditioning flags on resume.
+                if backend == "adaptive_sghmc":
+                    g["preconditioning"] = True
+                    g["preconditioner"] = "adaptive_sghmc"
+                elif backend == "adsgld_adam":
+                    g["preconditioning"] = False
+                    g["preconditioner"] = "none"
+                else:
+                    g["preconditioning"] = precond_json
+                    g["preconditioner"] = precond_type_json
                 if 'add_noise' not in g:
                     ns = float(g.get('noise_scale', 0.0))
                     g['add_noise'] = bool(ns > 0.0)
@@ -5408,6 +6114,7 @@ def locate_all(
             else:
                 for g in sampler.param_groups:
                     g['lr'] = lr_json
+            _apply_sgnht_per_obs_scaling(state, sampler)
             # Also take temperature from JSON on restart (override)
             for g in sampler.param_groups:
                 g["temperature"] = temp_json
@@ -5426,6 +6133,10 @@ def locate_all(
     if phase == "phase2":
         if wandb_logger:
             wandb_logger.start_phase("phase2")
+        try:
+            _maybe_precompute_shared_event_re_whitening(state)
+        except Exception as e:
+            warn(f"shared_event_re whitening precompute failed: {e}", section="LIKELIHOOD")
         # Transfer preconditioning state from Adam to sampler if coming from phase 1
         if ckpt is None or ckpt.get("phase") == "phase1":
             try:
@@ -5488,17 +6199,6 @@ def locate_map(
         phase = "phase1"
         start_epoch = 0
 
-    # Optional residual-based outlier removal, only at fresh Phase 1 start.
-    # Prefer running this during data prep (prepare_input_dfs) immediately after the linearization filter.
-    if (
-        ckpt is None
-        and start_epoch == 0
-        and bool(state.params.get("residual_filter_enable", False))
-        and not bool(state.params.get("_residual_filter_applied_in_prepare_input_dfs", False))
-    ):
-        _pre_filter_outlier_residuals(state)
-        _print_initial_residual_stats(state)
-
     # Always print a pre-optimization residual sanity check at the *initial* catalog locations
     # (ΔX=0), even when the residual filter was already applied during data prep.
     # This is useful for quickly comparing datasets/configs and spotting busted inputs.
@@ -5512,6 +6212,33 @@ def locate_map(
 
     if wandb_logger:
         wandb_logger.start_phase("phase1")
+
+    # Optional: enable corr_error during Phase 1 MAP.
+    try:
+        if bool(state.params.get("_corr_error_enabled", False)) and bool(state.params.get("_corr_error_enable_in_phase1", False)):
+            _maybe_init_corr_error(state)
+            b = getattr(state, "corr_error_b", None)
+            if isinstance(b, torch.Tensor):
+                already = False
+                for g in state.optimizer.param_groups:
+                    try:
+                        if any(p is b for p in g.get("params", [])):
+                            already = True
+                            break
+                    except Exception:
+                        pass
+                if not already:
+                    base_lr = float(state.optimizer.param_groups[0].get("lr", state.params.get("lr_warmup", 1e-3)))
+                    lr_mult = float(state.params.get("_corr_error_phase1_lr_mult", 0.1) or 0.1)
+                    if (not math.isfinite(lr_mult)) or (lr_mult <= 0.0):
+                        lr_mult = 0.1
+                    state.optimizer.add_param_group({"params": [b], "lr": base_lr * lr_mult})
+                    ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+                    if ddp_main:
+                        info(f"Phase 1: corr_error enabled. Added corr_error_b to Adam with lr_mult={lr_mult:g}", section="LIKELIHOOD")
+    except Exception:
+        pass
+
     _phase1_map_warmup(state, start_epoch=start_epoch, wandb_logger=wandb_logger)
 
     # In torchrun/DDP mode, only rank0 writes bundle outputs.
@@ -5524,6 +6251,7 @@ def locate_map(
                 origins0=state.origins0,
                 dtimes=state.dtimes,
                 dX_src=state.dX_src.detach(),
+                corr_error_b=(getattr(state, "corr_error_b", None) if bool(state.params.get("_corr_error_enabled", False)) else None),
                     # Bundle should contain only locations + picks; everything else is rebuilt cleanly at sampling start.
                     params=None,
                     noise_log_scale=None,
@@ -5559,8 +6287,11 @@ def locate_sample_from_bundle(
     #
     # The bundle is used only for its dataset payload (origins0/dtimes) and initial MAP state.
     run_params = params
-
     state = _build_initial_state(run_params, bun.origins0, bun.dtimes, model, device)
+    try:
+        _maybe_precompute_shared_event_re_whitening(state)
+    except Exception as e:
+        warn(f"shared_event_re whitening precompute failed: {e}", section="LIKELIHOOD")
 
     # Mirror the important "reset/clear samples" behavior from `_resume_or_initialize`,
     # but without ever resuming Phase 2–4 checkpoints (bundle start is always Phase 2 epoch 0).
@@ -5610,6 +6341,12 @@ def locate_sample_from_bundle(
 
     # Restore MAP solution
     state.dX_src.data.copy_(bun.dX_src.to(device=state.device, dtype=torch.float32))
+    # If corr_error was optimized during Phase 1, warm-start the latent from the bundle.
+    try:
+        if bun.corr_error_b is not None:
+            setattr(state, "_resume_corr_error_b", bun.corr_error_b.to(device=state.device, dtype=torch.float32))
+    except Exception:
+        pass
     # NOTE: We intentionally do NOT restore Phase-1 noise/optimizer/global_step state from the bundle.
     # Sampling runs should initialize cleanly from the current config + MAP locations.
     state.global_step_count = 0
@@ -5619,6 +6356,16 @@ def locate_sample_from_bundle(
     start_epoch = 0
     skip_saving_first_epoch = False
     ckpt = None
+
+    # Optional residual-based outlier removal at the start of Phase 2 (post-MAP).
+    if (
+        bool(state.params.get("residual_filter_enable", False))
+        and not bool(state.params.get("_residual_filter_applied_in_prepare_input_dfs", False))
+        and not bool(state.params.get("_residual_filter_applied_in_phase2", False))
+    ):
+        _pre_filter_outlier_residuals(state, use_current_dX=True)
+        state.params["_residual_filter_applied_in_phase2"] = True
+        _print_initial_residual_stats(state)
 
     # Structured likelihood components (shared_event_latent/shared_event_re/slowness_re) removed.
     _maybe_init_corr_error(state)

@@ -128,3 +128,99 @@ def update_precision_hyperparameter(
         else:
             # Fallback
             return torch.eye(4, device=dX_src.device)
+
+def update_corr_error_tau_hyperparameter(
+    b: torch.Tensor,
+    u: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    q_diag: float,
+    prior_dof: float,
+    prior_scale_inv: torch.Tensor,
+    mode: str = "sample"
+) -> torch.Tensor:
+    """
+    Update the P/S covariance matrix for corr_error latents using a Gibbs update.
+    
+    Args:
+        b: (Ne, R, 2) latent tensor
+        u, v, w: event graph edge tensors
+        q_diag: diagonal jitter for precision Q
+        prior_dof: nu_0 for Inverse-Wishart hyperprior
+        prior_scale_inv: V_0 for Inverse-Wishart hyperprior (2x2 matrix)
+        mode: "sample" or "map"
+    """
+    Ne = int(b.shape[0])
+    R = int(b.shape[1])
+    dev = b.device
+    
+    # 1. Compute components of the 2x2 scatter matrix Sb
+    # Sb[i,j] = sum_r (b[:,r,i]^T Q b[:,r,j])
+    # To prevent DC runaway, we center b before computing the scatter matrix.
+    # This ensures tau represents spatial variation, not global offsets.
+    bP = b[:, :, 0]
+    bS = b[:, :, 1]
+    
+    bP = bP - bP.mean(dim=0, keepdim=True)
+    bS = bS - bS.mean(dim=0, keepdim=True)
+    
+    u_i = u.to(torch.int64)
+    v_i = v.to(torch.int64)
+    w_f = w.to(dtype=b.dtype, device=dev)
+
+    def _apply_Q(xNR: torch.Tensor) -> torch.Tensor:
+        y = xNR * float(max(0.0, q_diag))
+        if int(u_i.numel()) > 0:
+            xu = xNR.index_select(0, u_i)
+            xv = xNR.index_select(0, v_i)
+            diff = xu - xv
+            dw = diff * w_f.unsqueeze(1)
+            y.index_add_(0, u_i, dw)
+            y.index_add_(0, v_i, -dw)
+        return y
+
+    qP = _apply_Q(bP)
+    qS = _apply_Q(bS)
+    
+    e00 = (bP * qP).sum()
+    e11 = (bS * qS).sum()
+    e01 = (bP * qS).sum()
+    
+    Sb = torch.tensor([[e00, e01], [e01, e11]], device=dev, dtype=torch.float32)
+    
+    # Total degrees of freedom contributed by the latent field
+    # Since Q is full rank (due to q_diag), each dimension r adds Ne degrees of freedom.
+    N_eff = R * Ne
+    
+    if mode == "map":
+        df = prior_dof + N_eff
+        inv_term = prior_scale_inv + Sb
+        # Mode of Wishart distribution for the precision matrix
+        p = 2
+        scalar = max(0.0, df - p - 1)
+        # If df is too small, the mode is ill-defined; fall back to a prior-scale covariance.
+        if not (scalar > 0.0):
+            # For our chosen parameterization where prior_scale_inv = nu * diag(scale_std^2),
+            # this equals diag(scale_std^2) (a reasonable prior covariance baseline).
+            return (prior_scale_inv / max(prior_dof, 1e-12)).to(torch.float32)
+        try:
+            P_tau_map = scalar * torch.linalg.inv(inv_term)
+            cov = torch.linalg.inv(P_tau_map.to(torch.float64))
+            cov = 0.5 * (cov + cov.T)
+            return cov.to(torch.float32)
+        except Exception:
+            return (prior_scale_inv / max(prior_dof, 1e-12)).to(torch.float32)
+    else:
+        # Sample precision matrix from Wishart posterior
+        P_tau_sample = sample_wishart_posterior(Sb, N_eff, prior_dof, prior_scale_inv)
+        if P_tau_sample is not None:
+            # Return covariance matrix (tau^2 and rho*tau1*tau2)
+            try:
+                cov = torch.linalg.inv(P_tau_sample.to(torch.float64))
+                cov = 0.5 * (cov + cov.T)
+                return cov.to(torch.float32)
+            except Exception:
+                return (prior_scale_inv / max(prior_dof, 1e-12)).to(torch.float32)
+        else:
+            # Prior fallback (covariance baseline). See note above.
+            return (prior_scale_inv / max(prior_dof, 1e-12)).to(torch.float32)

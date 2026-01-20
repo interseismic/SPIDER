@@ -83,13 +83,9 @@ class SGHMC(torch.optim.Optimizer):
             group.setdefault("alpha", alpha)
             group.setdefault("n_obs", n_obs)
             preconditioning = bool(group.get("preconditioning", True))
-            # Diagonal preconditioning: "rmsprop" (default) or "adam" (alias; bias-corrected variant).
+            # Diagonal preconditioning: "rmsprop" (default).
             # Matrix preconditioning: "matrix" (rare; primarily used in legacy workflows / diagnostics).
             preconditioner_type = str(group.get("preconditioner", "rmsprop")).strip().lower()
-            if preconditioner_type == "adam":
-                # For SGHMC we treat "adam" as an alias for RMSProp-style diagonal stats.
-                # (We already use a bias-corrected variant for stability.)
-                preconditioner_type = "rmsprop"
             add_noise = bool(group.get("add_noise", True))
             noise_scale = float(group.get("noise_scale", 1.0))
             temperature = float(group.get("temperature", 1.0))
@@ -213,7 +209,7 @@ class SGHMC(torch.optim.Optimizer):
                     elif G is not None:
                         # Diagonal Noise: sqrt(G) * epsilon
                         noise = torch.randn_like(p) * std * G.sqrt()
-                        # Optional gauge projection of injected noise (prevents centroid random-walk).
+                        # Optional gauge projection of injected noise (prevents mean translation drift).
                         try:
                             if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
                                 if bool(getattr(self, "_gauge_project_apply_noise", True)):
@@ -300,10 +296,6 @@ class SGHMC(torch.optim.Optimizer):
             
             state = self.state.get(p, {})
             
-            # Normalize preconditioner tag (keep this robust to config aliases)
-            if str(preconditioner_type).strip().lower() == "adam":
-                preconditioner_type = "rmsprop"
-
             if preconditioner_type == "matrix":
                 M_inv = state.get("matrix_inv", None)
                 if M_inv is None:
@@ -329,10 +321,37 @@ class SGHMC(torch.optim.Optimizer):
         (update variance from minibatch gradient noise) / (injected momentum noise variance).
         """
         eps = 1e-30
-        any_noise = False
-        all_ratios = []
 
-        for group in self.param_groups:
+        def _summarize(cat_ratios: torch.Tensor) -> dict:
+            if cat_ratios is None or (not isinstance(cat_ratios, torch.Tensor)) or cat_ratios.numel() == 0:
+                return {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            log_mean = torch.log(cat_ratios.clamp_min(1e-20)).mean()
+            gm = math.exp(log_mean.item())
+            median = cat_ratios.median().item()
+            try:
+                x = cat_ratios
+                n = int(x.numel())
+                def _k(q: float) -> int:
+                    return int(max(1, min(n, round(q * (n - 1)) + 1)))
+                p10 = float(torch.kthvalue(x, _k(0.10)).values.item())
+                p90 = float(torch.kthvalue(x, _k(0.90)).values.item())
+            except Exception:
+                p10 = float("nan")
+                p90 = float("nan")
+            return {
+                "gm": float(gm),
+                "median": float(median),
+                "p10": float(p10),
+                "p90": float(p90),
+                "min": float(cat_ratios.min().item()),
+                "max": float(cat_ratios.max().item()),
+            }
+
+        any_noise_global = False
+        all_ratios = []
+        per_group = []
+
+        for gi, group in enumerate(self.param_groups):
             lr = float(group.get("lr", 0.0))
             beta = float(group.get("beta", 0.99))
             eps_g = float(group.get("eps", 1e-5))
@@ -343,10 +362,16 @@ class SGHMC(torch.optim.Optimizer):
             alpha = float(group.get("alpha", 0.01))
             
             if add_noise and noise_scale > 0.0 and temperature > 0.0 and alpha > 0.0:
-                any_noise = True
+                any_noise_global = True
             
             if lr <= 0.0:
+                per_group.append({
+                    "group_name": str(group.get("group_name", f"group{gi}")),
+                    "gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0,
+                })
                 continue
+            any_noise_group = bool(add_noise and noise_scale > 0.0 and temperature > 0.0 and alpha > 0.0)
+            group_ratios = []
 
             for p in group["params"]:
                 if p is None:
@@ -381,35 +406,27 @@ class SGHMC(torch.optim.Optimizer):
                 ratio = (num / denom).clamp_min(1e-30)
                 finite_mask = torch.isfinite(ratio)
                 if finite_mask.any():
-                    all_ratios.append(ratio[finite_mask].flatten())
+                    rr = ratio[finite_mask].flatten()
+                    all_ratios.append(rr)
+                    group_ratios.append(rr)
 
-        if not any_noise or not all_ratios:
-            return {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
-        
-        cat_ratios = torch.cat(all_ratios)
-        if cat_ratios.numel() == 0:
-             return {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            if any_noise_group and group_ratios:
+                gcat = torch.cat(group_ratios)
+                gstats = _summarize(gcat)
+            else:
+                gstats = {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            gstats["group_name"] = str(group.get("group_name", f"group{gi}"))
+            per_group.append(gstats)
 
-        # Geometric Mean (clamped to avoid log(0))
-        log_mean = torch.log(cat_ratios.clamp_min(1e-20)).mean()
-        gm = math.exp(log_mean.item())
-        
-        # Median and other stats
-        median = cat_ratios.median().item()
-        try:
-            x = cat_ratios
-            n = int(x.numel())
-            def _k(q: float) -> int:
-                return int(max(1, min(n, round(q * (n - 1)) + 1)))
-            p10 = float(torch.kthvalue(x, _k(0.10)).values.item())
-            p90 = float(torch.kthvalue(x, _k(0.90)).values.item())
-        except Exception:
-            p10 = float("nan")
-            p90 = float("nan")
-        min_val = cat_ratios.min().item()
-        max_val = cat_ratios.max().item()
-        
-        return {"gm": gm, "median": median, "p10": p10, "p90": p90, "min": min_val, "max": max_val}
+        if (not any_noise_global) or (not all_ratios):
+            out = {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            out["per_group"] = per_group
+            return out
+
+        cat_ratios = torch.cat(all_ratios) if all_ratios else torch.tensor([])
+        out = _summarize(cat_ratios)
+        out["per_group"] = per_group
+        return out
 
     @torch.no_grad()
     def temperature_stats(self) -> dict:

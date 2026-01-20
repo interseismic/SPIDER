@@ -4,9 +4,18 @@ import torch
 import math
 import numpy as np
 import torch.distributed as dist
-from spider.core.hierarchy import update_precision_hyperparameter
+from spider.core.hierarchy import (
+    update_precision_hyperparameter,
+    update_corr_error_tau_hyperparameter,
+)
 from spider.utils.console import info, warn
-from spider.core.state import LocateState, _current_noise_scales, _clamp_dX_inplace, _apply_shared_event_latent_constraints_inplace
+from spider.core.state import (
+    LocateState,
+    _current_noise_scales,
+    _clamp_dX_inplace,
+    _apply_shared_event_latent_constraints_inplace,
+    _apply_dd_graph_re_constraints_inplace,
+)
 from spider.core.batching import _ensure_owner_buckets, _iter_event_batches
 from spider.core.modeling import (
     posterior_loss,
@@ -18,6 +27,1124 @@ from spider.core.modeling import (
 from spider.utils.wandb_gates import want_wandb_group as _want_wandb_group
 from spider.optim.gauge import project_event_mean_inplace
 
+
+def _corr_error_nll_sum_from_resid(
+    *,
+    resid: torch.Tensor,
+    sigma: torch.Tensor,
+    params: dict,
+) -> torch.Tensor:
+    """
+    Sum of per-row negative log-likelihood terms for residuals, matching compute_likelihood_loss.
+
+    NOTE: This is used for corr_error ESS where we precompute base residuals once (no model forward)
+    and then evaluate many likelihoods under different nuisance deltas.
+    """
+    # Clamp sigma to avoid division by zero
+    sigma = sigma.clamp_min(1e-12)
+    scaled_resid = resid / sigma
+
+    loss_type = str(params.get("likelihood", "huber")).strip().lower()
+    if loss_type in {"gaussian", "mse", "l2"}:
+        data_loss = 0.5 * (scaled_resid ** 2)
+    elif loss_type in {"student_t", "student-t", "studentt"}:
+        try:
+            nu_f = float(params.get("_student_t_nu", 4.0))
+        except Exception:
+            nu_f = 4.0
+        if not (nu_f > 0.0):
+            nu_f = 4.0
+        nu = scaled_resid.new_tensor(nu_f)
+        pi = scaled_resid.new_tensor(float(np.pi))
+        t_const = 0.5 * torch.log(nu * pi) + torch.lgamma(0.5 * nu) - torch.lgamma(0.5 * (nu + 1.0))
+        data_loss = 0.5 * (nu + 1.0) * torch.log1p((scaled_resid ** 2) / nu) + t_const
+    elif loss_type in {"laplace", "l1", "mae"}:
+        data_loss = torch.abs(scaled_resid)
+    else:
+        # Huber (Smooth L1)
+        huber_delta = float(params["model"]["likelihood"].get("huber_delta", 1.0))
+        data_loss = torch.nn.functional.huber_loss(
+            scaled_resid,
+            torch.zeros_like(scaled_resid),
+            reduction="none",
+            delta=huber_delta,
+        )
+
+    total_nll = data_loss + torch.log(sigma)
+    return total_nll.sum()
+
+
+def _corr_error_nll_terms_from_resid(
+    *,
+    resid: torch.Tensor,
+    sigma: torch.Tensor,
+    params: dict,
+) -> torch.Tensor:
+    """
+    Per-row negative log-likelihood terms for residuals, matching compute_likelihood_loss.
+
+    Returns a tensor of shape (B,) on the same device.
+    """
+    sigma = sigma.clamp_min(1e-12)
+    scaled_resid = resid / sigma
+
+    loss_type = str(params.get("likelihood", "huber")).strip().lower()
+    if loss_type in {"gaussian", "mse", "l2"}:
+        data_loss = 0.5 * (scaled_resid ** 2)
+    elif loss_type in {"student_t", "student-t", "studentt"}:
+        try:
+            nu_f = float(params.get("_student_t_nu", 4.0))
+        except Exception:
+            nu_f = 4.0
+        if not (nu_f > 0.0):
+            nu_f = 4.0
+        nu = scaled_resid.new_tensor(nu_f)
+        pi = scaled_resid.new_tensor(float(np.pi))
+        t_const = 0.5 * torch.log(nu * pi) + torch.lgamma(0.5 * nu) - torch.lgamma(0.5 * (nu + 1.0))
+        data_loss = 0.5 * (nu + 1.0) * torch.log1p((scaled_resid ** 2) / nu) + t_const
+    elif loss_type in {"laplace", "l1", "mae"}:
+        data_loss = torch.abs(scaled_resid)
+    else:
+        huber_delta = float(params["model"]["likelihood"].get("huber_delta", 1.0))
+        data_loss = torch.nn.functional.huber_loss(
+            scaled_resid,
+            torch.zeros_like(scaled_resid),
+            reduction="none",
+            delta=huber_delta,
+        )
+    return data_loss + torch.log(sigma)
+
+
+@torch.no_grad()
+def _student_t_scale_update_full(*, state: LocateState, epoch_index: int) -> dict | None:
+    """
+    Full-dataset Gibbs update for Student-t scale-mixture per-row precision (lambda).
+    """
+    try:
+        enabled = bool(state.params.get("_student_t_scale_enabled", False))
+    except Exception:
+        enabled = False
+    try:
+        update_every = int(state.params.get("_student_t_scale_update_every_epochs", 1))
+    except Exception:
+        update_every = 1
+    lam = getattr(state, "student_t_lambda", None)
+    try:
+        nu = float(state.params.get("_student_t_scale_nu", 4.0))
+    except Exception:
+        nu = 4.0
+    try:
+        bs = int(state.params.get("_student_t_scale_batch_size", 200_000))
+    except Exception:
+        bs = 200_000
+    N = int(state.N)
+    if (not enabled) or (update_every <= 0) or ((int(epoch_index) % int(update_every)) != 0) or (not isinstance(lam, torch.Tensor)) or (not (nu > 0.0)) or (N <= 0):
+        return None
+    bs = max(1024, int(bs))
+    lam_min = float(state.params.get("_student_t_scale_min_lambda", 1e-6))
+    lam_max = float(state.params.get("_student_t_scale_max_lambda", 1e6))
+
+    σp, σs = _current_noise_scales(state)
+    shape = (nu + 1.0) * 0.5
+    for i0 in range(0, N, bs):
+        i1 = min(i0 + bs, N)
+        II_b = state.II[i0:i1]
+        YY_b = state.YY[i0:i1]
+        resid_b = compute_residuals(II_b, YY_b, state.X_src, state.dX_src, state.model).detach().to(torch.float32)
+        ph = YY_b[:, 4].detach()
+        is_p = (ph < 0.5)
+        sigma_b = torch.where(is_p, σp, σs).clamp_min(1e-12)
+        z = resid_b / sigma_b
+        rate = (nu + (z * z)) * 0.5
+        rate = rate.clamp_min(1e-12)
+        gamma = torch.distributions.Gamma(concentration=shape, rate=rate)
+        lam_b = gamma.sample().to(dtype=lam.dtype, device=lam.device)
+        lam_b = lam_b.clamp_min(lam_min).clamp_max(lam_max)
+        lam[i0:i1] = lam_b
+    state.student_t_lambda = lam
+    state.params["_student_t_lambda"] = lam
+
+    try:
+        lam_det = lam.detach().float()
+        lam_mean = float(lam_det.mean().item())
+        # Quantiles: subsample if too large to avoid quantile() size limits.
+        n = int(lam_det.numel())
+        q_src = lam_det
+        if n > 5_000_000:
+            try:
+                gen = torch.Generator(device=lam_det.device)
+                seed0 = int(state.params.get("runtime_seed", 0) or 0)
+                gen.manual_seed(int(seed0 + 1000003 * int(epoch_index)))
+            except Exception:
+                gen = None
+            k = 5_000_000
+            idx = torch.randperm(n, device=lam_det.device, generator=gen)[:k]
+            q_src = lam_det.index_select(0, idx)
+        q_cpu = q_src.cpu()
+        stats = {
+            "student_t_scale/lambda_mean": float(lam_mean),
+            "student_t_scale/lambda_p50": float(torch.quantile(q_cpu, 0.50).item()),
+            "student_t_scale/lambda_p90": float(torch.quantile(q_cpu, 0.90).item()),
+            "student_t_scale/lambda_p99": float(torch.quantile(q_cpu, 0.99).item()),
+        }
+        return stats
+    except Exception:
+        return None
+
+
+@torch.no_grad()
+def _maybe_freeze_corr_error_group_for_sampler(state: LocateState, optimizer: torch.optim.Optimizer) -> None:
+    """
+    If corr_error ESS is enabled, we treat corr_error_b as a blocked latent and do NOT
+    update it via the sampler backend (pSGLD/SGHMC). We instead update it via ESS.
+    """
+    try:
+        if not bool(state.params.get("_corr_error_enabled", False)):
+            return
+        if not bool(state.params.get("_corr_error_ess_enabled", False)):
+            return
+        if not bool(state.params.get("_corr_error_ess_freeze_sampler_group", True)):
+            return
+    except Exception:
+        return
+    try:
+        for g in optimizer.param_groups:
+            if str(g.get("group_name", "")).strip().lower() != "corr_error":
+                continue
+            # Preserve original lr so other code can still read it (no compounding).
+            if "base_lr" not in g:
+                g["base_lr"] = float(g.get("lr", 0.0))
+            g["lr"] = 0.0
+            # Force noise off for this group.
+            g["add_noise"] = False
+            g["noise_scale"] = 0.0
+    except Exception:
+        return
+
+@torch.no_grad()
+def _maybe_freeze_dd_graph_re_group_for_sampler(state: LocateState, optimizer: torch.optim.Optimizer) -> None:
+    """
+    If dd_graph_re ESS is enabled, freeze the dd_graph_re param group in the sampler backend.
+    """
+    try:
+        if not bool(state.params.get("_dd_graph_re_enabled", False)):
+            return
+        if not bool(state.params.get("_dd_graph_re_ess_enabled", False)):
+            return
+        if not bool(state.params.get("_dd_graph_re_ess_freeze_sampler_group", True)):
+            return
+    except Exception:
+        return
+    try:
+        for g in optimizer.param_groups:
+            if str(g.get("group_name", "")).strip().lower() != "dd_graph_re":
+                continue
+            if "base_lr" not in g:
+                g["base_lr"] = float(g.get("lr", 0.0))
+            g["lr"] = 0.0
+            g["add_noise"] = False
+            g["noise_scale"] = 0.0
+    except Exception:
+        return
+
+
+@torch.no_grad()
+def _maybe_freeze_slowness_re_group_for_sampler(state: LocateState, optimizer: torch.optim.Optimizer) -> None:
+    """
+    If slowness_re explicit ESS is enabled, freeze the slowness_re param group in the sampler backend.
+    """
+    try:
+        if not bool(state.params.get("_slowness_re_explicit_enabled", False)):
+            return
+        if not bool(state.params.get("_slowness_re_ess_enabled", False)):
+            return
+        if not bool(state.params.get("_slowness_re_ess_freeze_sampler_group", True)):
+            return
+    except Exception:
+        return
+    try:
+        for g in optimizer.param_groups:
+            if str(g.get("group_name", "")).strip().lower() != "slowness_re":
+                continue
+            if "base_lr" not in g:
+                g["base_lr"] = float(g.get("lr", 0.0))
+            g["lr"] = 0.0
+            g["add_noise"] = False
+            g["noise_scale"] = 0.0
+    except Exception:
+        return
+
+@torch.no_grad()
+def _corr_error_ess_update(
+    *,
+    state: LocateState,
+    epoch_index: int,
+) -> Dict[str, float]:
+    """
+    Exact elliptical slice sampling update for corr_error_b using full-data log-likelihood.
+
+    Currently supported:
+      - event_graph.enabled=false (IID prior; Q=I)
+      - station_basis.enabled=false (per-station coefficients) with block_by_station=True (recommended)
+        OR block_by_station=False (global ESS over b)
+      - station_basis.enabled=true is supported only in global mode (can be expensive)
+
+    This update holds ΔX_src fixed and updates corr_error_b conditional on current ΔX_src.
+    """
+    # Always return a (possibly empty) metrics dict so callers can log to W&B.
+    ess_metrics: Dict[str, float] = {}
+
+    # Gate
+    try:
+        if not bool(state.params.get("_corr_error_enabled", False)):
+            return ess_metrics
+        if not bool(state.params.get("_corr_error_ess_enabled", False)):
+            return ess_metrics
+    except Exception:
+        return ess_metrics
+
+    ess_metrics["corr_error_ess/enabled"] = float(1.0)
+    ess_metrics["corr_error_ess/updated"] = float(0.0)
+
+    # Avoid DDP for now (would require consistent global loglik and synchronized accept/reject).
+    ddp_enabled, ddp_rank, ddp_world_size, ddp_is_main = _ddp_info(state.params)
+
+    # Ensure shared_event_re whitening cache exists (static operator).
+    try:
+        if getattr(state, "shared_event_re_whitening_cache", None) is None:
+            state.shared_event_re_whitening_cache = {}
+        state.params["_shared_event_re_whitening_cache"] = state.shared_event_re_whitening_cache
+    except Exception:
+        pass
+    if ddp_enabled:
+        if ddp_is_main:
+            warn("corr_error ESS is not supported under torchrun/DDP yet; skipping.", section="ESS")
+        return ess_metrics
+
+    # Cadence
+    try:
+        every = int(state.params.get("_corr_error_ess_update_every", 1))
+        start_after = int(state.params.get("_corr_error_ess_start_after_epochs", 0))
+        if every < 1:
+            every = 1
+        if start_after < 0:
+            start_after = 0
+    except Exception:
+        every = 1
+        start_after = 0
+    if int(epoch_index) < int(start_after):
+        return ess_metrics
+    if (int(epoch_index) % int(every)) != 0:
+        return ess_metrics
+
+    # Currently only IID prior is implemented (event_graph.disabled => Q=I).
+    try:
+        if bool(state.params.get("_corr_error_event_graph_enabled", True)):
+            warn("corr_error ESS currently requires event_graph.enabled=false (IID prior); skipping.", section="ESS")
+            return ess_metrics
+    except Exception:
+        pass
+
+    b_param = getattr(state, "corr_error_b", None)
+    if not isinstance(b_param, torch.nn.Parameter):
+        return ess_metrics
+
+    # Precompute base residuals once (no corr_error), and sigma per row.
+    N = int(getattr(state, "N", 0) or 0)
+    if N <= 0:
+        return ess_metrics
+    try:
+        bs = int(state.params.get("_corr_error_ess_batch_size", 50_000))
+        bs = max(1, int(bs))
+    except Exception:
+        bs = 50_000
+
+    t0 = time.perf_counter()
+
+    σp, σs = _current_noise_scales(state)
+    ph = state.YY[:, 4]
+    is_p = (ph < 0.5)
+    sigma_all = torch.where(is_p, σp, σs).to(device=state.device, dtype=torch.float32).clamp_min(1e-12)
+
+    # Base residuals: dt_obs - dt_pred (no corr_error)
+    resid0 = torch.empty((N,), device=state.device, dtype=torch.float32)
+    for i0 in range(0, N, bs):
+        i1 = min(i0 + bs, N)
+        II_b = state.II[i0:i1]
+        YY_b = state.YY[i0:i1]
+        r = compute_residuals(II_b, YY_b, state.X_src, state.dX_src, state.model).detach().to(torch.float32)
+        resid0[i0:i1] = r
+
+    # Prior covariance across (P,S) for each latent element.
+    try:
+        tau_ps = state.params.get("_corr_error_tau_s", [0.0, 0.0])
+        tau_p = float(tau_ps[0]); tau_s = float(tau_ps[1])
+        rho = float(state.params.get("_corr_error_rho_ps", 0.0))
+    except Exception:
+        tau_p, tau_s, rho = 0.0, 0.0, 0.0
+    if not (tau_p > 0.0 and tau_s > 0.0):
+        warn("corr_error ESS: tau_p/tau_s must be > 0; skipping.", section="ESS")
+        return ess_metrics
+    rho = max(-0.999, min(0.999, rho))
+    cov = torch.tensor(
+        [[tau_p * tau_p, rho * tau_p * tau_s], [rho * tau_p * tau_s, tau_s * tau_s]],
+        device=state.device,
+        dtype=torch.float32,
+    )
+    # Cholesky with jitter for safety
+    try:
+        L = torch.linalg.cholesky(cov + 1e-12 * torch.eye(2, device=state.device, dtype=torch.float32))
+    except Exception:
+        warn("corr_error ESS: covariance not PD; skipping.", section="ESS")
+        return ess_metrics
+
+    # ESS settings
+    try:
+        sweeps = int(state.params.get("_corr_error_ess_sweeps_per_update", 1))
+        sweeps = max(1, int(sweeps))
+        max_steps = int(state.params.get("_corr_error_ess_max_bracket_steps", 64))
+        max_steps = max(8, int(max_steps))
+        block_by_station = bool(state.params.get("_corr_error_ess_block_by_station", True))
+        top_k = int(state.params.get("_corr_error_ess_top_k_stations", 0))
+        top_k = max(0, int(top_k))
+        seed = int(state.params.get("_corr_error_ess_seed", 0))
+        seed0 = int(state.params.get("runtime_seed", 0))
+    except Exception:
+        sweeps, max_steps, block_by_station, top_k, seed, seed0 = 1, 64, True, 0, 0, 0
+
+    # If per-station coefficients, we can do exact station-factorized ESS blocks.
+    W = getattr(state, "corr_error_station_basis_W", None)
+    per_station = (not isinstance(W, torch.Tensor))
+    if (not per_station) and bool(block_by_station):
+        # Can't factorize when W is present; fallback to global.
+        block_by_station = False
+
+    rng = np.random.default_rng(int(seed0 + 10000019 * int(epoch_index) + int(seed)))
+
+    # Stats accumulators
+    n_blocks = 0
+    n_blocks_accepted = 0
+    n_ll_evals = 0
+    n_bracket_steps = 0  # number of proposal evaluations (excluding the initial ll0)
+    ll_delta_sum = 0.0
+
+    def _ess_update_tensor(
+        b0: torch.Tensor,
+        loglike_fn,
+        *,
+        sample_nu_fn,
+    ) -> tuple[torch.Tensor, int, int, float]:
+        # Draw ellipse direction from prior
+        nu = sample_nu_fn()
+        ll0 = float(loglike_fn(b0))
+        # Slice threshold
+        logy = ll0 + float(np.log(max(rng.random(), 1e-30)))
+        # Draw initial angle and bracket
+        theta = float(rng.uniform(0.0, 2.0 * np.pi))
+        theta_min = theta - 2.0 * np.pi
+        theta_max = theta
+        evals = 1
+        for _ in range(int(max_steps)):
+            ct = math.cos(theta)
+            st = math.sin(theta)
+            b_prop = (b0 * ct + nu * st).to(dtype=b0.dtype, device=b0.device)
+            ll = float(loglike_fn(b_prop))
+            evals += 1
+            if ll >= logy:
+                # accepted
+                return b_prop, evals, 1, float(ll - ll0)
+            if theta < 0.0:
+                theta_min = theta
+            else:
+                theta_max = theta
+            theta = float(rng.uniform(theta_min, theta_max))
+        # reject (max bracket steps exhausted)
+        return b0, evals, 0, 0.0
+
+    # GLOBAL ESS (works for both W present and per-station mode)
+    if not block_by_station:
+        sta_idx_all = getattr(state, "row_station_index", None)
+        if not isinstance(sta_idx_all, torch.Tensor):
+            warn("corr_error ESS: missing row_station_index; skipping.", section="ESS")
+            return
+        sta_idx_all = sta_idx_all.to(device=state.device, dtype=torch.int64)
+        e1_all = state.II[:, 0].to(torch.int64)
+        e2_all = state.II[:, 1].to(torch.int64)
+        is_s_all = (state.YY[:, 4] >= 0.5)
+
+        def loglike_global(b_all: torch.Tensor) -> torch.Tensor:
+            # b_all: (Ne,R,2)
+            nll_sum = torch.zeros((), device=state.device, dtype=torch.float32)
+            for j0 in range(0, N, bs):
+                j1 = min(j0 + bs, N)
+                e1 = e1_all[j0:j1]; e2 = e2_all[j0:j1]
+                bi = b_all.index_select(0, e1)
+                bj = b_all.index_select(0, e2)
+                db = (bj - bi).to(torch.float32)  # (B,R,2)
+                is_s = is_s_all[j0:j1]
+                db_phase = torch.where(is_s.view(-1, 1), db[:, :, 1], db[:, :, 0])  # (B,R)
+                if isinstance(W, torch.Tensor):
+                    Wr = W.index_select(0, sta_idx_all[j0:j1]).to(torch.float32)  # (B,R)
+                    delta = (Wr * db_phase).sum(dim=1)
+                else:
+                    sidx = sta_idx_all[j0:j1].view(-1, 1)
+                    delta = db_phase.gather(1, sidx).squeeze(1)
+                resid = resid0[j0:j1] - delta
+                nll_sum = nll_sum + _corr_error_nll_sum_from_resid(resid=resid, sigma=sigma_all[j0:j1], params=state.params)
+            return -nll_sum
+
+        def sample_nu_global() -> torch.Tensor:
+            # IID prior across events and basis dims; only 2x2 coupling across phases.
+            z = torch.randn_like(b_param.detach())
+            # einsum over last dim (phase)
+            return torch.einsum("nrc,cd->nrd", z, L.T)
+
+        b0 = b_param.detach()
+        for _ in range(int(sweeps)):
+            n_blocks += 1
+            b1, evals, acc, dll = _ess_update_tensor(b0, loglike_global, sample_nu_fn=sample_nu_global)
+            n_ll_evals += int(evals)
+            n_bracket_steps += int(max(0, evals - 1))
+            n_blocks_accepted += int(acc)
+            ll_delta_sum += float(dll)
+            b0 = b1
+        b_param.copy_(b0)
+        dt_ms = 1000.0 * float(time.perf_counter() - t0)
+        ess_metrics["corr_error_ess/updated"] = float(1.0)
+        ess_metrics["corr_error_ess/mode"] = float(0.0)  # 0=global, 1=per_station
+        ess_metrics["corr_error_ess/sweeps"] = float(int(sweeps))
+        ess_metrics["corr_error_ess/blocks"] = float(int(n_blocks))
+        ess_metrics["corr_error_ess/blocks_accepted"] = float(int(n_blocks_accepted))
+        ess_metrics["corr_error_ess/ll_evals"] = float(int(n_ll_evals))
+        ess_metrics["corr_error_ess/mean_bracket_steps"] = float(n_bracket_steps / max(1, n_blocks))
+        ess_metrics["corr_error_ess/mean_ll_delta"] = float(ll_delta_sum / max(1, n_blocks))
+        ess_metrics["corr_error_ess/time_ms"] = float(dt_ms)
+        info(
+            f"corr_error ESS(global): sweeps={sweeps} blocks={n_blocks} "
+            f"mean_steps={ess_metrics['corr_error_ess/mean_bracket_steps']:.2f} "
+            f"time_ms={dt_ms:.1f}",
+            section="ESS",
+        )
+        return ess_metrics
+
+    # PER-STATION blocked ESS (station_basis.enabled=false) — optimized parallel implementation.
+    #
+    # Key optimization vs the naive per-station loop:
+    # - We evaluate log-likelihoods for *all stations at once* using a single pass over rows:
+    #     ll_s(b) = -sum_{rows with sta=s} nll(resid0 - delta_corr(b))
+    #   and we use index_add_ to reduce per-row nll terms into per-station totals.
+    # - This avoids thousands of tiny GPU kernels + .item() synchronizations that look like CPU-only time.
+    n_stations = int(getattr(state, "n_stations", 0) or 0)
+    if n_stations <= 0:
+        return ess_metrics
+    sta_idx_all = getattr(state, "row_station_index", None)
+    if not isinstance(sta_idx_all, torch.Tensor):
+        warn("corr_error ESS: missing row_station_index; skipping.", section="ESS")
+        return ess_metrics
+    sta_idx_all = sta_idx_all.to(device=state.device, dtype=torch.int64)
+    S = int(n_stations)
+    # Sanity: b must be per-station coefficients (R == n_stations) in this mode.
+    if not (b_param.ndim == 3 and int(b_param.shape[1]) == int(S) and int(b_param.shape[2]) == 2):
+        warn("corr_error ESS: expected b shape (n_events,n_stations,2) for per-station ESS; skipping.", section="ESS")
+        return ess_metrics
+
+    # Select stations to update (top-K by row count), if requested.
+    # We compute counts cheaply on GPU once per update.
+    try:
+        counts = torch.bincount(sta_idx_all.clamp_min(0), minlength=S).to(device="cpu")
+    except Exception:
+        counts = None
+    if isinstance(counts, torch.Tensor) and int(counts.numel()) == int(S):
+        if top_k > 0 and top_k < S:
+            # choose top-k stations by count
+            _, sel = torch.topk(counts.to(torch.int64), k=int(top_k), largest=True, sorted=False)
+            sta_sel = sel.to(device=state.device, dtype=torch.int64)
+        else:
+            sta_sel = torch.arange(S, device=state.device, dtype=torch.int64)
+    else:
+        sta_sel = torch.arange(S, device=state.device, dtype=torch.int64)
+    K = int(sta_sel.numel())
+    if K <= 0:
+        return ess_metrics
+
+    # Precompute e1/e2 and phase mask once (global)
+    e1_all = state.II[:, 0].to(torch.int64)
+    e2_all = state.II[:, 1].to(torch.int64)
+    is_s_all = (state.YY[:, 4] >= 0.5)
+
+    # Helper: compute per-station log-likelihoods for a candidate b (Ne,S,2).
+    def _loglike_per_station(b_all: torch.Tensor) -> torch.Tensor:
+        # Returns ll_by_station: (S,) float32 on device
+        ll = torch.zeros((S,), device=state.device, dtype=torch.float32)
+        bP_flat = b_all[:, :, 0].reshape(-1).to(torch.float32)
+        bS_flat = b_all[:, :, 1].reshape(-1).to(torch.float32)
+        for j0 in range(0, N, bs):
+            j1 = min(j0 + bs, N)
+            sta_b = sta_idx_all[j0:j1]
+            # linear indices into flattened (event,station) grid
+            idx1 = (e1_all[j0:j1] * S + sta_b).to(torch.int64)
+            idx2 = (e2_all[j0:j1] * S + sta_b).to(torch.int64)
+            dp = bP_flat.index_select(0, idx2) - bP_flat.index_select(0, idx1)
+            ds = bS_flat.index_select(0, idx2) - bS_flat.index_select(0, idx1)
+            delta = torch.where(is_s_all[j0:j1], ds, dp).to(torch.float32)
+            resid = resid0[j0:j1] - delta
+            nll_terms = _corr_error_nll_terms_from_resid(resid=resid, sigma=sigma_all[j0:j1], params=state.params)
+            # Accumulate -NLL into station loglike
+            ll.index_add_(0, sta_b, -nll_terms.to(torch.float32))
+        return ll
+
+    # Initial state (we update only selected stations but evaluate ll for all stations)
+    b_base = b_param.detach().to(torch.float32)
+    ll0_all = _loglike_per_station(b_base)  # (S,)
+    ll0 = ll0_all.index_select(0, sta_sel)  # (K,)
+
+    # Slice thresholds per station
+    u = torch.rand((K,), device=state.device, dtype=torch.float32).clamp_min(1e-30)
+    logy = ll0 + torch.log(u)
+
+    # Draw ellipse directions nu for selected stations
+    z = torch.randn((int(b_base.shape[0]), K, 2), device=state.device, dtype=torch.float32)
+    nu = torch.matmul(z, L.T)  # (Ne,K,2)
+
+    # Bracket init
+    theta = (2.0 * float(np.pi)) * torch.rand((K,), device=state.device, dtype=torch.float32)
+    theta_min = theta - 2.0 * float(np.pi)
+    theta_max = theta.clone()
+    active = torch.ones((K,), device=state.device, dtype=torch.bool)
+
+    # Current b for selected stations
+    b_cur_sel = b_base.index_select(1, sta_sel).contiguous()  # (Ne,K,2)
+
+    # ESS loop (vectorized across stations; one sync per bracket step to check completion)
+    for step in range(int(max_steps)):
+        ct = torch.cos(theta)
+        st = torch.sin(theta)
+        # Keep accepted stations fixed
+        ct = torch.where(active, ct, torch.ones_like(ct))
+        st = torch.where(active, st, torch.zeros_like(st))
+        b_prop_sel = b_cur_sel * ct.view(1, K, 1) + nu * st.view(1, K, 1)
+        # Assemble proposed full b (only selected columns changed)
+        b_prop = b_base.clone()
+        b_prop.index_copy_(1, sta_sel, b_prop_sel)
+        ll_prop_all = _loglike_per_station(b_prop)
+        ll_prop = ll_prop_all.index_select(0, sta_sel)
+
+        n_blocks += int(active.sum().item())
+        n_ll_evals += 1  # one batched ll evaluation
+
+        accept = active & (ll_prop >= logy)
+        if accept.any():
+            n_blocks_accepted += int(accept.sum().item())
+            ll_delta_sum += float((ll_prop[accept] - ll0[accept]).sum().item())
+            # Update accepted stations
+            b_cur_sel = torch.where(accept.view(1, K, 1), b_prop_sel, b_cur_sel)
+            ll0 = torch.where(accept, ll_prop, ll0)
+            active = active & (~accept)
+
+        if (not active.any()):
+            n_bracket_steps += int(step + 1)
+            break
+
+        # Shrink brackets and resample theta for active stations
+        neg = (theta < 0.0) & active
+        pos = (theta >= 0.0) & active
+        theta_min = torch.where(neg, theta, theta_min)
+        theta_max = torch.where(pos, theta, theta_max)
+        r = torch.rand((K,), device=state.device, dtype=torch.float32)
+        theta = torch.where(active, theta_min + r * (theta_max - theta_min), theta)
+        if step == int(max_steps) - 1:
+            n_bracket_steps += int(max_steps)
+
+    # Write back updated b for selected stations
+    b_out = b_base.clone()
+    b_out.index_copy_(1, sta_sel, b_cur_sel)
+    b_param.copy_(b_out.to(dtype=b_param.dtype))
+
+    dt_ms = 1000.0 * float(time.perf_counter() - t0)
+    ess_metrics["corr_error_ess/updated"] = float(1.0)
+    ess_metrics["corr_error_ess/mode"] = float(1.0)  # 0=global, 1=per_station
+    ess_metrics["corr_error_ess/sweeps"] = float(int(sweeps))
+    ess_metrics["corr_error_ess/stations_updated"] = float(int(K))
+    ess_metrics["corr_error_ess/stations_target"] = float(int(K))
+    ess_metrics["corr_error_ess/blocks"] = float(int(n_blocks))
+    ess_metrics["corr_error_ess/blocks_accepted"] = float(int(n_blocks_accepted))
+    ess_metrics["corr_error_ess/ll_evals"] = float(int(n_ll_evals))
+    ess_metrics["corr_error_ess/mean_bracket_steps"] = float(n_bracket_steps / max(1, n_ll_evals))
+    ess_metrics["corr_error_ess/mean_ll_delta"] = float(ll_delta_sum / max(1, max(n_blocks_accepted, 1)))
+    ess_metrics["corr_error_ess/time_ms"] = float(dt_ms)
+    info(
+        f"corr_error ESS(per-station, batched): stations={K}/{K} "
+        f"ll_evals={n_ll_evals} mean_steps={ess_metrics['corr_error_ess/mean_bracket_steps']:.2f} "
+        f"time_ms={dt_ms:.1f}",
+        section="ESS",
+    )
+    return ess_metrics
+
+
+@torch.no_grad()
+def _slowness_re_ess_update(
+    *,
+    state: LocateState,
+    epoch_index: int,
+) -> Dict[str, float]:
+    """
+    Exact ESS update for explicit slowness_re latents (component + station).
+    """
+    ess_metrics: Dict[str, float] = {}
+    try:
+        if not bool(state.params.get("_slowness_re_explicit_enabled", False)):
+            return ess_metrics
+        if not bool(state.params.get("_slowness_re_ess_enabled", False)):
+            return ess_metrics
+    except Exception:
+        return ess_metrics
+
+    ess_metrics["slowness_re_ess/enabled"] = float(1.0)
+    ess_metrics["slowness_re_ess/updated"] = float(0.0)
+
+    ddp_enabled, _, _, ddp_is_main = _ddp_info(state.params)
+    if ddp_enabled:
+        if ddp_is_main:
+            warn("slowness_re ESS is not supported under torchrun/DDP yet; skipping.", section="ESS")
+        return ess_metrics
+
+    try:
+        every = int(state.params.get("_slowness_re_ess_update_every", 1))
+        start_after = int(state.params.get("_slowness_re_ess_start_after", 0))
+        if every < 1:
+            every = 1
+        if start_after < 0:
+            start_after = 0
+    except Exception:
+        every, start_after = 1, 0
+    if int(epoch_index) < int(start_after):
+        return ess_metrics
+    if (int(epoch_index) % int(every)) != 0:
+        return ess_metrics
+
+    # Latents
+    s_comp_p = getattr(state, "slowness_re_comp_p", None)
+    s_comp_s = getattr(state, "slowness_re_comp_s", None)
+    a_sta_p = getattr(state, "slowness_re_station_p", None)
+    a_sta_s = getattr(state, "slowness_re_station_s", None)
+    if not all(isinstance(x, torch.nn.Parameter) for x in (s_comp_p, s_comp_s, a_sta_p, a_sta_s)):
+        return ess_metrics
+
+    n_comp = int(s_comp_p.numel())
+    n_sta = int(a_sta_p.numel())
+    if n_comp <= 0 or n_sta <= 0:
+        return ess_metrics
+
+    N = int(getattr(state, "N", 0) or 0)
+    if N <= 0:
+        return ess_metrics
+
+    sta_idx_all = getattr(state, "row_station_index", None)
+    if not isinstance(sta_idx_all, torch.Tensor) or int(sta_idx_all.numel()) != int(N):
+        warn("slowness_re ESS requires row_station_index; skipping.", section="ESS")
+        return ess_metrics
+
+    cid_ev = getattr(state, "cluster_ids", None)
+    if not isinstance(cid_ev, torch.Tensor):
+        warn("slowness_re ESS requires event cluster_ids; skipping.", section="ESS")
+        return ess_metrics
+
+    try:
+        bs = int(state.params.get("_slowness_re_ess_batch_size", 50_000))
+        bs = max(1, int(bs))
+    except Exception:
+        bs = 50_000
+
+    t0 = time.perf_counter()
+
+    σp, σs = _current_noise_scales(state)
+    ph = state.YY[:, 4]
+    is_p = (ph < 0.5)
+    sigma_all = torch.where(is_p, σp, σs).to(device=state.device, dtype=torch.float32).clamp_min(1e-12)
+
+    # Base residuals: dt_obs - dt_pred (no slowness correction)
+    resid0 = torch.empty((N,), device=state.device, dtype=torch.float32)
+    for i0 in range(0, N, bs):
+        i1 = min(i0 + bs, N)
+        II_b = state.II[i0:i1]
+        YY_b = state.YY[i0:i1]
+        r = compute_residuals(II_b, YY_b, state.X_src, state.dX_src, state.model).detach().to(torch.float32)
+        resid0[i0:i1] = r
+
+    # Separation magnitude g_ij (same as component_station).
+    g_all = torch.empty((N,), device=state.device, dtype=torch.float32)
+    sep_cap_km = float(state.params.get("_slowness_re_sep_cap_km", 0.0))
+    freeze_g = bool(state.params.get("_slowness_re_freeze_g_at_map", False))
+    if freeze_g:
+        X_map = state.params.get("_slowness_re_g_x_map", None)
+        if not isinstance(X_map, torch.Tensor) or int(X_map.shape[0]) != int(state.X_src.shape[0]):
+            X_map = (state.X_src + state.dX_src)[:, :3].detach().to(device=state.device, dtype=torch.float32)
+            state.params["_slowness_re_g_x_map"] = X_map
+    for i0 in range(0, N, bs):
+        i1 = min(i0 + bs, N)
+        idx_b = state.II[i0:i1].to(torch.int64)
+        if freeze_g:
+            x1 = X_map.index_select(0, idx_b[:, 0])
+            x2 = X_map.index_select(0, idx_b[:, 1])
+        else:
+            x1 = state.X_src.index_select(0, idx_b[:, 0])[:, :3] + state.dX_src.index_select(0, idx_b[:, 0])[:, :3]
+            x2 = state.X_src.index_select(0, idx_b[:, 1])[:, :3] + state.dX_src.index_select(0, idx_b[:, 1])[:, :3]
+        g = torch.linalg.norm(x1 - x2, dim=1).clamp_min(1e-6)
+        if sep_cap_km > 0.0 and math.isfinite(sep_cap_km):
+            g = g.clamp_max(float(sep_cap_km))
+        g_all[i0:i1] = g
+
+    comp_row_all = cid_ev.index_select(0, state.II[:, 0].to(torch.int64))
+
+    tau_ps = state.params.get("_slowness_re_tau_s", [0.0, 0.0])
+    tau_sta_ps = state.params.get("_slowness_re_tau_station_s", [0.0, 0.0])
+    tau_p = float(tau_ps[0]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+    tau_s = float(tau_ps[1]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+    tau_sta_p = float(tau_sta_ps[0]) if isinstance(tau_sta_ps, (list, tuple)) and len(tau_sta_ps) >= 2 else float(tau_sta_ps)
+    tau_sta_s = float(tau_sta_ps[1]) if isinstance(tau_sta_ps, (list, tuple)) and len(tau_sta_ps) >= 2 else float(tau_sta_ps)
+    tau_units = str(state.params.get("_slowness_re_tau_units", "abs")).strip().lower()
+    if tau_units == "vel_frac":
+        vp = float(state.params.get("_slowness_re_vp_km_s", 6.0))
+        vs = float(state.params.get("_slowness_re_vs_km_s", 3.5))
+        tau_p = tau_p / max(vp, 1e-6)
+        tau_s = tau_s / max(vs, 1e-6)
+        tau_sta_p = tau_sta_p / max(vp, 1e-6)
+        tau_sta_s = tau_sta_s / max(vs, 1e-6)
+
+    sweeps = int(state.params.get("_slowness_re_ess_sweeps_per_update", 1))
+    sweeps = max(1, int(sweeps))
+    max_steps = int(state.params.get("_slowness_re_ess_max_bracket_steps", 64))
+    max_steps = max(8, int(max_steps))
+    seed = int(state.params.get("_slowness_re_ess_seed", 0))
+    seed0 = int(state.params.get("runtime_seed", 0))
+    rng = np.random.default_rng(int(seed0 + 10000079 * int(epoch_index) + int(seed)))
+
+    n_ll_evals = 0
+    n_bracket_steps = 0
+    n_blocks = 0
+    n_blocks_accepted = 0
+    ll_delta_sum = 0.0
+
+    def _ess_update_vector(x0: torch.Tensor, loglike_fn, *, sample_nu_fn) -> tuple[torch.Tensor, int, int, float]:
+        nu = sample_nu_fn()
+        ll0 = float(loglike_fn(x0))
+        logy = ll0 + float(np.log(max(rng.random(), 1e-30)))
+        theta = float(rng.uniform(0.0, 2.0 * np.pi))
+        theta_min = theta - 2.0 * np.pi
+        theta_max = theta
+        evals = 1
+        for _ in range(int(max_steps)):
+            ct = math.cos(theta)
+            st = math.sin(theta)
+            x_prop = (x0 * ct + nu * st).to(dtype=x0.dtype, device=x0.device)
+            ll = float(loglike_fn(x_prop))
+            evals += 1
+            if ll >= logy:
+                return x_prop, evals, 1, float(ll - ll0)
+            if theta < 0.0:
+                theta_min = theta
+            else:
+                theta_max = theta
+            theta = float(rng.uniform(theta_min, theta_max))
+        return x0, evals, 0, 0.0
+
+    def _update_phase(
+        *,
+        phase_mask: torch.Tensor,
+        s_comp: torch.nn.Parameter,
+        a_sta: torch.nn.Parameter,
+        tau_comp: float,
+        tau_sta: float,
+        label: str,
+    ) -> None:
+        nonlocal n_ll_evals, n_bracket_steps, n_blocks, n_blocks_accepted, ll_delta_sum
+        if int(phase_mask.numel()) <= 0:
+            return
+        if not (tau_comp > 0.0 and tau_sta > 0.0):
+            return
+        resid_p = resid0.index_select(0, phase_mask)
+        g_p = g_all.index_select(0, phase_mask)
+        comp_p = comp_row_all.index_select(0, phase_mask)
+        sta_p = sta_idx_all.index_select(0, phase_mask)
+        sigma_p = sigma_all.index_select(0, phase_mask)
+
+        std = torch.cat(
+            [
+                torch.full((n_comp,), float(tau_comp), device=state.device, dtype=torch.float32),
+                torch.full((n_sta,), float(tau_sta), device=state.device, dtype=torch.float32),
+            ],
+            dim=0,
+        )
+
+        def loglike_fn(x: torch.Tensor) -> torch.Tensor:
+            s_c = x[:n_comp]
+            a_k = x[n_comp:]
+            pred = g_p * (s_c.index_select(0, comp_p) + a_k.index_select(0, sta_p))
+            r = resid_p - pred
+            return -0.5 * ((r / sigma_p).square().sum())
+
+        def sample_nu_fn() -> torch.Tensor:
+            return torch.randn_like(std) * std
+
+        x0 = torch.cat([s_comp.detach(), a_sta.detach()], dim=0)
+        for _ in range(int(sweeps)):
+            x1, evals, acc, dll = _ess_update_vector(x0, loglike_fn, sample_nu_fn=sample_nu_fn)
+            n_blocks += 1
+            n_ll_evals += int(evals)
+            n_bracket_steps += int(max(0, evals - 1))
+            n_blocks_accepted += int(acc)
+            ll_delta_sum += float(dll)
+            x0 = x1
+        s_comp.data.copy_(x0[:n_comp])
+        a_sta.data.copy_(x0[n_comp:])
+        ess_metrics[f"slowness_re_ess/{label}_updated"] = float(1.0)
+
+    # Precompute indices for P/S masks.
+    idx_p = torch.nonzero(is_p, as_tuple=False).flatten()
+    idx_s = torch.nonzero(~is_p, as_tuple=False).flatten()
+    _update_phase(phase_mask=idx_p, s_comp=s_comp_p, a_sta=a_sta_p, tau_comp=tau_p, tau_sta=tau_sta_p, label="p")
+    _update_phase(phase_mask=idx_s, s_comp=s_comp_s, a_sta=a_sta_s, tau_comp=tau_s, tau_sta=tau_sta_s, label="s")
+
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    ess_metrics["slowness_re_ess/updated"] = float(1.0 if (n_blocks > 0) else 0.0)
+    ess_metrics["slowness_re_ess/sweeps"] = float(int(sweeps))
+    ess_metrics["slowness_re_ess/blocks"] = float(int(n_blocks))
+    ess_metrics["slowness_re_ess/blocks_accepted"] = float(int(n_blocks_accepted))
+    ess_metrics["slowness_re_ess/ll_evals"] = float(int(n_ll_evals))
+    ess_metrics["slowness_re_ess/mean_bracket_steps"] = float(n_bracket_steps / max(1, n_blocks))
+    ess_metrics["slowness_re_ess/mean_ll_delta"] = float(ll_delta_sum / max(1, n_blocks_accepted))
+    ess_metrics["slowness_re_ess/time_ms"] = float(dt_ms)
+
+    return ess_metrics
+
+
+@torch.no_grad()
+def _dd_graph_re_ess_update(
+    *,
+    state: LocateState,
+    epoch_index: int,
+) -> Dict[str, float]:
+    """
+    Exact ESS update for dd_graph_re event latents (per phase), blocked by connected components.
+    """
+    ess_metrics: Dict[str, float] = {}
+    try:
+        if not bool(state.params.get("_dd_graph_re_enabled", False)):
+            return ess_metrics
+        if not bool(state.params.get("_dd_graph_re_ess_enabled", False)):
+            return ess_metrics
+    except Exception:
+        return ess_metrics
+
+    ess_metrics["dd_graph_re_ess/enabled"] = float(1.0)
+    ess_metrics["dd_graph_re_ess/updated"] = float(0.0)
+
+    ddp_enabled, _, _, ddp_is_main = _ddp_info(state.params)
+    if ddp_enabled:
+        if ddp_is_main:
+            warn("dd_graph_re ESS is not supported under torchrun/DDP yet; skipping.", section="ESS")
+        return ess_metrics
+
+    try:
+        every = int(state.params.get("_dd_graph_re_ess_update_every", 1))
+        start_after = int(state.params.get("_dd_graph_re_ess_start_after", 0))
+        if every < 1:
+            every = 1
+        if start_after < 0:
+            start_after = 0
+    except Exception:
+        every, start_after = 1, 0
+    if int(epoch_index) < int(start_after):
+        return ess_metrics
+    if (int(epoch_index) % int(every)) != 0:
+        return ess_metrics
+
+    b_p = getattr(state, "dd_graph_re_b_p", None)
+    b_s = getattr(state, "dd_graph_re_b_s", None)
+    if not (isinstance(b_p, torch.nn.Parameter) and isinstance(b_s, torch.nn.Parameter)):
+        return ess_metrics
+
+    comp_id = getattr(state, "cluster_ids", None)
+    if not isinstance(comp_id, torch.Tensor):
+        return ess_metrics
+
+    u = state.params.get("_dd_graph_re_u", None)
+    v = state.params.get("_dd_graph_re_v", None)
+    w = state.params.get("_dd_graph_re_w", None)
+    if not (isinstance(u, torch.Tensor) and isinstance(v, torch.Tensor) and isinstance(w, torch.Tensor)):
+        return ess_metrics
+
+    tau_ps = state.params.get("_dd_graph_re_tau_s", [0.0, 0.0])
+    tau_p = float(tau_ps[0]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+    tau_s = float(tau_ps[1]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+    q_diag = float(state.params.get("_dd_graph_re_q_diag", 0.0))
+    max_steps = int(state.params.get("_dd_graph_re_ess_max_bracket_steps", 64))
+    max_steps = max(8, int(max_steps))
+    sweeps = int(state.params.get("_dd_graph_re_ess_sweeps_per_update", 1))
+    sweeps = max(1, int(sweeps))
+    seed = int(state.params.get("_dd_graph_re_ess_seed", 0))
+    seed0 = int(state.params.get("runtime_seed", 0))
+
+    # Residuals and sigma (full data)
+    resid0 = compute_residuals(state.II, state.YY, state.X_src, state.dX_src, state.model).detach().to(torch.float32)
+    σp, σs = _current_noise_scales(state)
+    ph = state.YY[:, 4]
+    is_p = (ph < 0.5)
+    sigma_all = torch.where(is_p, σp, σs).to(device=state.device, dtype=torch.float32).clamp_min(1e-12)
+
+    II = state.II.to(torch.int64)
+    ev1 = II[:, 0]
+    ev2 = II[:, 1]
+    comp_id_cpu = comp_id.detach().cpu().numpy()
+    ev1_cpu = ev1.detach().cpu().numpy()
+    ev2_cpu = ev2.detach().cpu().numpy()
+    is_p_cpu = is_p.detach().cpu().numpy()
+
+    u_cpu = u.detach().cpu().numpy()
+    v_cpu = v.detach().cpu().numpy()
+    w_cpu = w.detach().cpu().numpy()
+
+    rng = np.random.default_rng(int(seed0 + 10000091 * int(epoch_index) + int(seed)))
+
+    n_blocks = 0
+    n_blocks_accepted = 0
+    n_ll_evals = 0
+    n_bracket_steps = 0
+    ll_delta_sum = 0.0
+    t0 = time.perf_counter()
+
+    def _ess_update_vector(x0: torch.Tensor, loglike_fn, *, sample_nu_fn) -> tuple[torch.Tensor, int, int, float]:
+        nu = sample_nu_fn()
+        ll0 = float(loglike_fn(x0))
+        logy = ll0 + float(np.log(max(rng.random(), 1e-30)))
+        theta = float(rng.uniform(0.0, 2.0 * np.pi))
+        theta_min = theta - 2.0 * np.pi
+        theta_max = theta
+        evals = 1
+        for _ in range(int(max_steps)):
+            ct = math.cos(theta)
+            st = math.sin(theta)
+            x_prop = (x0 * ct + nu * st).to(dtype=x0.dtype, device=x0.device)
+            ll = float(loglike_fn(x_prop))
+            evals += 1
+            if ll >= logy:
+                return x_prop, evals, 1, float(ll - ll0)
+            if theta < 0.0:
+                theta_min = theta
+            else:
+                theta_max = theta
+            theta = float(rng.uniform(theta_min, theta_max))
+        return x0, evals, 0, 0.0
+
+    def _sample_nu(chol: torch.Tensor, n: int, tau: float) -> torch.Tensor:
+        if n <= 0 or not (tau > 0.0):
+            return torch.zeros((n,), device=state.device, dtype=torch.float32)
+        z = torch.randn((n, 1), device=chol.device, dtype=chol.dtype)
+        # Solve chol @ y = z, then chol.T @ x = y  -> x ~ N(0, Q^{-1})
+        y = torch.linalg.solve_triangular(chol, z, upper=False)
+        x = torch.linalg.solve_triangular(chol.T, y, upper=True)
+        return x.squeeze(1).to(device=state.device, dtype=torch.float32) * float(tau)
+
+    # Build component blocks
+    n_comp = int(comp_id.max().item()) + 1 if comp_id.numel() > 0 else 0
+    for c in range(int(n_comp)):
+        ev_mask = (comp_id_cpu == c)
+        ev_ids = np.nonzero(ev_mask)[0]
+        if ev_ids.size <= 1:
+            continue
+        # Map global event -> local index
+        map_local = -np.ones((int(comp_id_cpu.size),), dtype=np.int64)
+        map_local[ev_ids] = np.arange(ev_ids.size, dtype=np.int64)
+
+        row_mask = ev_mask[ev1_cpu] & ev_mask[ev2_cpu]
+        if not np.any(row_mask):
+            continue
+        row_idx = np.nonzero(row_mask)[0]
+        row_idx_p = row_idx[is_p_cpu[row_idx]]
+        row_idx_s = row_idx[~is_p_cpu[row_idx]]
+
+        # Edges for prior
+        edge_mask = ev_mask[u_cpu] & ev_mask[v_cpu]
+        u_loc_np = map_local[u_cpu[edge_mask]]
+        v_loc_np = map_local[v_cpu[edge_mask]]
+        w_loc_np = w_cpu[edge_mask].astype(np.float32, copy=False)
+        u_loc = torch.tensor(u_loc_np, device="cpu", dtype=torch.int64)
+        v_loc = torch.tensor(v_loc_np, device="cpu", dtype=torch.int64)
+        w_loc = torch.tensor(w_loc_np, device="cpu", dtype=torch.float64)
+        # Build dense Laplacian for this component (CPU) and factor once.
+        n_loc = int(ev_ids.size)
+        if n_loc <= 1:
+            continue
+        L = torch.zeros((n_loc, n_loc), device="cpu", dtype=torch.float64)
+        if u_loc.numel() > 0:
+            L[u_loc, u_loc] += w_loc
+            L[v_loc, v_loc] += w_loc
+            L[u_loc, v_loc] -= w_loc
+            L[v_loc, u_loc] -= w_loc
+        if float(q_diag) > 0.0:
+            L = L + float(q_diag) * torch.eye(n_loc, device="cpu", dtype=torch.float64)
+        # Enforce symmetry and add a data-driven diagonal shift to ensure PD.
+        L = 0.5 * (L + L.T)
+        try:
+            eig_min = float(torch.linalg.eigvalsh(L).min().item()) if n_loc > 0 else 0.0
+        except Exception:
+            eig_min = float("nan")
+        shift = 0.0
+        if not math.isfinite(eig_min):
+            shift = 1e-3
+        elif eig_min < 1e-8:
+            shift = float(-eig_min + 1e-6)
+        try:
+            chol = torch.linalg.cholesky(L + float(shift) * torch.eye(n_loc, device="cpu", dtype=torch.float64))
+        except Exception:
+            warn(f"dd_graph_re ESS: chol failed for component size={n_loc}; skipping.", section="ESS")
+            continue
+
+        def _update_phase(*, row_idx_phase: np.ndarray, b_param: torch.nn.Parameter, tau: float, label: str) -> None:
+            nonlocal n_blocks, n_blocks_accepted, n_ll_evals, n_bracket_steps, ll_delta_sum
+            if row_idx_phase.size == 0 or not (tau > 0.0):
+                return
+            ev1_loc = torch.tensor(map_local[ev1_cpu[row_idx_phase]], device=state.device, dtype=torch.int64)
+            ev2_loc = torch.tensor(map_local[ev2_cpu[row_idx_phase]], device=state.device, dtype=torch.int64)
+            r0 = resid0.index_select(0, torch.tensor(row_idx_phase, device=state.device, dtype=torch.int64))
+            sig = sigma_all.index_select(0, torch.tensor(row_idx_phase, device=state.device, dtype=torch.int64))
+            # current block
+            b0 = b_param.index_select(0, torch.tensor(ev_ids, device=state.device, dtype=torch.int64))
+
+            def loglike_fn(x: torch.Tensor) -> torch.Tensor:
+                pred = x.index_select(0, ev1_loc) - x.index_select(0, ev2_loc)
+                rr = r0 - pred
+                return -0.5 * ((rr / sig).square().sum())
+
+            def sample_nu_fn() -> torch.Tensor:
+                return _sample_nu(chol, int(ev_ids.size), tau)
+
+            x0 = b0
+            for _ in range(int(sweeps)):
+                x1, evals, acc, dll = _ess_update_vector(x0, loglike_fn, sample_nu_fn=sample_nu_fn)
+                n_blocks += 1
+                n_ll_evals += int(evals)
+                n_bracket_steps += int(max(0, evals - 1))
+                n_blocks_accepted += int(acc)
+                ll_delta_sum += float(dll)
+                x0 = x1
+            b_param.data.index_copy_(0, torch.tensor(ev_ids, device=state.device, dtype=torch.int64), x0)
+            ess_metrics[f"dd_graph_re_ess/{label}_updated"] = float(1.0)
+
+        _update_phase(row_idx_phase=row_idx_p, b_param=b_p, tau=tau_p, label="p")
+        _update_phase(row_idx_phase=row_idx_s, b_param=b_s, tau=tau_s, label="s")
+
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    ess_metrics["dd_graph_re_ess/updated"] = float(1.0 if (n_blocks > 0) else 0.0)
+    ess_metrics["dd_graph_re_ess/sweeps"] = float(int(sweeps))
+    ess_metrics["dd_graph_re_ess/blocks"] = float(int(n_blocks))
+    ess_metrics["dd_graph_re_ess/blocks_accepted"] = float(int(n_blocks_accepted))
+    ess_metrics["dd_graph_re_ess/ll_evals"] = float(int(n_ll_evals))
+    ess_metrics["dd_graph_re_ess/mean_bracket_steps"] = float(n_bracket_steps / max(1, n_blocks))
+    ess_metrics["dd_graph_re_ess/mean_ll_delta"] = float(ll_delta_sum / max(1, n_blocks_accepted))
+    ess_metrics["dd_graph_re_ess/time_ms"] = float(dt_ms)
+
+    return ess_metrics
 
 def _maybe_apply_gauge_projection_for_optimizer(state: LocateState, optimizer: torch.optim.Optimizer) -> None:
     """
@@ -146,24 +1273,32 @@ def _ddp_info(params: dict) -> tuple[bool, int, int, bool]:
 def _ddp_allreduce_grads(optimizer: torch.optim.Optimizer) -> None:
     """All-reduce gradients (SUM) across ranks. Assumes dist is initialized."""
     grads = []
+    # Control tensor device for tiny collectives (e.g., all_gather on totals).
+    # IMPORTANT: even if a rank has no grads this step, it must still participate
+    # in the same collectives as other ranks, otherwise NCCL will deadlock.
+    ctrl_dev = None
     for g in optimizer.param_groups:  # type: ignore[attr-defined]
         for p in g.get("params", []):
             if p is None:
                 continue
+            if ctrl_dev is None and isinstance(p, torch.Tensor):
+                ctrl_dev = p.device
             gg = getattr(p, "grad", None)
             if gg is None:
                 continue
             if not isinstance(gg, torch.Tensor) or gg.numel() <= 0:
                 continue
             grads.append(gg)
-    if not grads:
-        return
+
+    if ctrl_dev is None:
+        # Extremely defensive: if optimizer has no tensor params, fall back to CPU.
+        ctrl_dev = torch.device("cpu")
 
     # Coalesce into a single buffer to reduce per-parameter allreduce overhead.
     # This matters a lot on systems without fast GPU interconnect, where many small allreduces
     # can dominate the step time.
-    dev0 = grads[0].device
-    dt0 = grads[0].dtype
+    dev0 = grads[0].device if grads else ctrl_dev
+    dt0 = grads[0].dtype if grads else torch.float32
     same = True
     total = 0
     for gg in grads:
@@ -171,8 +1306,34 @@ def _ddp_allreduce_grads(optimizer: torch.optim.Optimizer) -> None:
         if gg.device != dev0 or gg.dtype != dt0:
             same = False
             break
-    if (not same) or total <= 0:
-        # Fallback: allreduce each grad separately.
+
+    # Fail fast if different ranks have different parameter sets / grad sizes.
+    # IMPORTANT: avoid ReduceOp.MIN/MAX on int64 here — some NCCL stacks return garbage for those.
+    # Instead, all_gather the scalar totals and compare exactly.
+    total_t = torch.tensor([int(total)], device=dev0, dtype=torch.int64)
+    try:
+        ws = int(dist.get_world_size())
+    except Exception:
+        ws = 0
+    if ws > 1:
+        totals = [torch.empty_like(total_t) for _ in range(ws)]
+        dist.all_gather(totals, total_t)
+        vals = [int(t.item()) for t in totals]
+        if any(v != vals[0] for v in vals[1:]):
+            raise RuntimeError(
+                "DDP grad buffer size mismatch across ranks: "
+                + ", ".join(f"rank{i}={v}" for i, v in enumerate(vals))
+                + ". This usually means some rank is missing a Parameter (e.g., optional latent disabled) or "
+                "a rank hit an exception and skipped initializing part of the model."
+            )
+
+    # If *all* ranks have total==0, there's nothing to reduce this step.
+    # (But we still did the all_gather above to keep the collective schedule aligned.)
+    if (not grads) or total <= 0:
+        return
+
+    if (not same):
+        # Fallback: allreduce each grad separately (after the mismatch check above).
         for gg in grads:
             dist.all_reduce(gg, op=dist.ReduceOp.SUM)
         return
@@ -224,7 +1385,10 @@ def _ddp_set_step_seed(params: dict, step: int, *, device: torch.device) -> None
         pass
     try:
         if device.type == "cuda":
-            torch.cuda.manual_seed_all(s)
+            # IMPORTANT: do NOT call manual_seed_all() here.
+            # That can initialize CUDA contexts on *all* visible GPUs, including devices not used by this rank,
+            # which can cause major slowdowns and can violate user-intended device selection.
+            torch.cuda.manual_seed(s)
     except Exception:
         pass
 
@@ -305,7 +1469,6 @@ def _update_svrg_snapshot(state: LocateState, batch_size: int, optimizer: torch.
     l_prior = compute_prior_loss(
         ΔX_src=state.dX_src,
         prior_event=state.prior_event,
-        prior_centroid=state.prior_centroid,
         σ_p=σp,
         σ_s=σs,
         N_total=state.N,
@@ -433,10 +1596,303 @@ def _run_epoch(
     # --- Per-prior runtime enables (materialized by validate_and_materialize_priors) ---
     # Hard break: priors are active in all phases when enabled (no per-phase scheduling).
     state.params["_prior_event_runtime_enable"] = bool(state.params.get("prior_event_enable", True))
-    state.params["_prior_centroid_runtime_enable"] = bool(state.params.get("prior_centroid_enable", True))
     # Noise prior removed (fixed phase_unc only).
 
     ddp_enabled, ddp_rank, ddp_world_size, ddp_is_main = _ddp_info(state.params)
+
+    # One-time diagnostics: residual correlation tests across candidate groupings.
+    if (
+        bool(state.params.get("_slowness_re_explicit_enabled", False))
+        and not bool(state.params.get("_slowness_re_ddhop_corr_logged", False))
+        and (not ddp_enabled)
+    ):
+        try:
+            state.params["_slowness_re_ddhop_corr_logged"] = True
+            resid_all = compute_residuals(state.II, state.YY, state.X_src, state.dX_src, state.model)
+            resid_np = resid_all.detach().float().cpu().numpy()
+            ph_np = state.YY[:, 4].detach().cpu().numpy().astype(np.int64, copy=False)
+            sta_idx = getattr(state, "row_station_index", None)
+            if isinstance(sta_idx, torch.Tensor):
+                sta_np = sta_idx.detach().cpu().numpy().astype(np.int64, copy=False)
+            else:
+                sta_np = None
+            II_np = state.II.detach().cpu().numpy().astype(np.int64, copy=False)
+            if sta_np is None or sta_np.size != resid_np.size:
+                warn("corr tests: missing station index; skipping station-based tests.", section="DIAG")
+
+            ev1 = II_np[:, 0]
+            ev2 = II_np[:, 1]
+
+            def _corr(a, b) -> float:
+                if a.size < 2:
+                    return float("nan")
+                a0 = a - a.mean()
+                b0 = b - b.mean()
+                denom = np.sqrt((a0 * a0).mean() * (b0 * b0).mean())
+                if denom <= 0.0:
+                    return float("nan")
+                return float((a0 * b0).mean() / denom)
+
+            def _loo_corr_from_keys(keys: np.ndarray, r: np.ndarray) -> tuple[float, int, int]:
+                if keys.size == 0:
+                    return float("nan"), 0, 0
+                uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+                counts = np.bincount(inv)
+                sums = np.bincount(inv, weights=r)
+                cnt = counts[inv]
+                s = sums[inv]
+                valid = cnt > 1
+                if not np.any(valid):
+                    return float("nan"), int(uniq.shape[0]), 0
+                r_v = r[valid]
+                loo = (s[valid] - r_v) / (cnt[valid] - 1.0)
+                return _corr(r_v, loo), int(uniq.shape[0]), int(r_v.size)
+
+            # Same phase (global)
+            try:
+                keys_phase = ph_np.reshape(-1, 1)
+                corr_phase, g_phase, n_phase = _loo_corr_from_keys(keys_phase, resid_np)
+                print(f"[corr phase] corr={corr_phase:.4f} groups={g_phase} rows={n_phase}", flush=True)
+            except Exception:
+                pass
+
+            # Same station (regardless of phase)
+            if sta_np is not None:
+                try:
+                    keys_sta = sta_np.reshape(-1, 1)
+                    corr_sta, g_sta, n_sta = _loo_corr_from_keys(keys_sta, resid_np)
+                    print(f"[corr station] corr={corr_sta:.4f} groups={g_sta} rows={n_sta}", flush=True)
+                except Exception:
+                    pass
+
+            # Same station-phase
+            if sta_np is not None:
+                try:
+                    keys_sp = np.stack([sta_np, ph_np], axis=1)
+                    corr_sp, g_sp, n_sp = _loo_corr_from_keys(keys_sp, resid_np)
+                    print(f"[corr station-phase] corr={corr_sp:.4f} groups={g_sp} rows={n_sp}", flush=True)
+                except Exception:
+                    pass
+
+            # Same event (event-only, and event+phase)
+            try:
+                ev_all = np.concatenate([ev1, ev2], axis=0)
+                r_all = np.concatenate([resid_np, resid_np], axis=0)
+                if ev_all.size > 0:
+                    keys_e = ev_all.reshape(-1, 1)
+                    corr_e, g_e, n_e = _loo_corr_from_keys(keys_e, r_all)
+                    print(f"[corr event] corr={corr_e:.4f} groups={g_e} rows={n_e}", flush=True)
+                if ev_all.size > 0:
+                    ph_all = np.concatenate([ph_np, ph_np], axis=0)
+                    keys_ep = np.stack([ev_all, ph_all], axis=1)
+                    corr_ep, g_ep, n_ep = _loo_corr_from_keys(keys_ep, r_all)
+                    print(f"[corr event-phase] corr={corr_ep:.4f} groups={g_ep} rows={n_ep}", flush=True)
+            except Exception:
+                pass
+
+            # One-hop DD correlation: same event + station + phase
+            if sta_np is not None:
+                try:
+                    ev_all = np.concatenate([ev1, ev2], axis=0)
+                    sta_all = np.concatenate([sta_np, sta_np], axis=0)
+                    ph_all = np.concatenate([ph_np, ph_np], axis=0)
+                    r_all = np.concatenate([resid_np, resid_np], axis=0)
+                    msk = np.isfinite(r_all) & (sta_all >= 0) & (ph_all >= 0)
+                    ev_all = ev_all[msk]
+                    sta_all = sta_all[msk]
+                    ph_all = ph_all[msk]
+                    r_all = r_all[msk]
+                    keys_esp = np.stack([ev_all, sta_all, ph_all], axis=1)
+                    corr_esp, g_esp, n_esp = _loo_corr_from_keys(keys_esp, r_all)
+                    print(f"[dd-hop corr] corr={corr_esp:.4f} groups={g_esp} rows={n_esp}", flush=True)
+                except Exception:
+                    pass
+
+            # k-hop DD correlation proxy (k=1,2) using neighbor event means for same station-phase
+            if sta_np is not None:
+                try:
+                    n_events = int(state.X_src.shape[0])
+                    n_sta = int(getattr(state, "n_stations", 0) or 0)
+                    if n_events > 0 and n_sta > 0:
+                        # Build adjacency
+                        adj = [[] for _ in range(n_events)]
+                        for a, b in zip(ev1, ev2):
+                            if int(a) >= 0 and int(b) >= 0 and int(a) < n_events and int(b) < n_events:
+                                adj[int(a)].append(int(b))
+                                adj[int(b)].append(int(a))
+                        # Per-event, station, phase mean residual
+                        ev_all = np.concatenate([ev1, ev2], axis=0)
+                        sta_all = np.concatenate([sta_np, sta_np], axis=0)
+                        ph_all = np.concatenate([ph_np, ph_np], axis=0)
+                        r_all = np.concatenate([resid_np, resid_np], axis=0)
+                        msk = np.isfinite(r_all) & (sta_all >= 0) & (ph_all >= 0)
+                        ev_all = ev_all[msk]
+                        sta_all = sta_all[msk]
+                        ph_all = ph_all[msk]
+                        r_all = r_all[msk]
+                        key = (ev_all.astype(np.int64) * n_sta + sta_all.astype(np.int64)) * 2 + ph_all.astype(np.int64)
+                        uniq, inv = np.unique(key, return_inverse=True)
+                        sums = np.bincount(inv, weights=r_all)
+                        counts = np.bincount(inv)
+                        mu = sums / np.maximum(1, counts)
+                        mu_map = dict(zip(uniq.tolist(), mu.tolist()))
+                        # Duplicate rows for ev1/ev2 entries
+                        ev_du = np.concatenate([ev1, ev2], axis=0)
+                        sta_du = np.concatenate([sta_np, sta_np], axis=0)
+                        ph_du = np.concatenate([ph_np, ph_np], axis=0)
+                        r_du = np.concatenate([resid_np, resid_np], axis=0)
+                        def _neighbor_mean(ev_id: int, sta_id: int, ph_id: int, k: int) -> float:
+                            if ev_id < 0 or ev_id >= n_events:
+                                return float("nan")
+                            if k == 1:
+                                neigh = adj[ev_id]
+                            else:
+                                s = set(adj[ev_id])
+                                for nb in list(s):
+                                    s.update(adj[nb])
+                                neigh = list(s)
+                            if not neigh:
+                                return float("nan")
+                            vals = []
+                            for nb in neigh:
+                                kk = (nb * n_sta + int(sta_id)) * 2 + int(ph_id)
+                                vv = mu_map.get(kk, None)
+                                if vv is not None and np.isfinite(vv):
+                                    vals.append(float(vv))
+                            if not vals:
+                                return float("nan")
+                            return float(np.mean(vals))
+                        for k in (1, 2):
+                            loo_vals = []
+                            r_vals = []
+                            for ev_id, sta_id, ph_id, r0 in zip(ev_du, sta_du, ph_du, r_du):
+                                if sta_id < 0 or ph_id < 0 or not np.isfinite(r0):
+                                    continue
+                                m = _neighbor_mean(int(ev_id), int(sta_id), int(ph_id), k)
+                                if np.isfinite(m):
+                                    loo_vals.append(m)
+                                    r_vals.append(r0)
+                            if len(r_vals) > 1:
+                                corr_k = _corr(np.asarray(r_vals), np.asarray(loo_vals))
+                                print(f"[dd-hop{k} corr] corr={corr_k:.4f} rows={len(r_vals)}", flush=True)
+                except Exception:
+                    pass
+
+            # Spatial proximity (event-pair midpoint bins)
+            try:
+                X_cur = (state.X_src + state.dX_src).detach().cpu().numpy()
+                x1 = X_cur[ev1, :2]
+                x2 = X_cur[ev2, :2]
+                mid = 0.5 * (x1 + x2)
+                bin_km = 10.0
+                bx = np.floor(mid[:, 0] / bin_km).astype(np.int64)
+                by = np.floor(mid[:, 1] / bin_km).astype(np.int64)
+                keys_xy = np.stack([bx, by], axis=1)
+                corr_xy, g_xy, n_xy = _loo_corr_from_keys(keys_xy, resid_np)
+                print(f"[corr midpoint_xy] corr={corr_xy:.4f} groups={g_xy} rows={n_xy}", flush=True)
+            except Exception:
+                pass
+
+            # Path similarity (event-pair azimuth + distance bins)
+            try:
+                X_cur = (state.X_src + state.dX_src).detach().cpu().numpy()
+                dx = X_cur[ev2, 0] - X_cur[ev1, 0]
+                dy = X_cur[ev2, 1] - X_cur[ev1, 1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                az = np.arctan2(dy, dx)  # [-pi, pi]
+                az = (az + 2.0 * np.pi) % (2.0 * np.pi)
+                az_bin = np.floor(az / (np.pi / 6.0)).astype(np.int64)  # 30 deg
+                dist_bin = np.floor(dist / 10.0).astype(np.int64)       # 10 km
+                keys_ad = np.stack([az_bin, dist_bin], axis=1)
+                corr_ad, g_ad, n_ad = _loo_corr_from_keys(keys_ad, resid_np)
+                print(f"[corr az_dist] corr={corr_ad:.4f} groups={g_ad} rows={n_ad}", flush=True)
+            except Exception:
+                pass
+
+            # Time drift (event time bins) if available
+            try:
+                if isinstance(state.origins0, pl.DataFrame):
+                    for col in ("origin_time", "time", "t0", "event_time"):
+                        if col in state.origins0.columns:
+                            t_ev = state.origins0[col].to_numpy()
+                            if t_ev.size == int(state.X_src.shape[0]):
+                                t1 = t_ev[ev1]
+                                t2 = t_ev[ev2]
+                                tmid = 0.5 * (t1 + t2)
+                                # Bin by 1-day intervals (seconds)
+                                bin_t = np.floor(np.asarray(tmid, dtype=np.float64) / 86400.0).astype(np.int64)
+                                corr_t, g_t, n_t = _loo_corr_from_keys(bin_t.reshape(-1, 1), resid_np)
+                                print(f"[corr time_bin] corr={corr_t:.4f} groups={g_t} rows={n_t}", flush=True)
+                            break
+            except Exception:
+                pass
+
+            # Cross-phase correlation: P vs S residuals within shared groups.
+            try:
+                if sta_np is not None:
+                    # Build per-event, per-station, per-phase mean residuals
+                    ev_all = np.concatenate([ev1, ev2], axis=0)
+                    sta_all = np.concatenate([sta_np, sta_np], axis=0)
+                    ph_all = np.concatenate([ph_np, ph_np], axis=0)
+                    r_all = np.concatenate([resid_np, resid_np], axis=0)
+                    msk = np.isfinite(r_all) & (sta_all >= 0) & (ph_all >= 0)
+                    ev_all = ev_all[msk]
+                    sta_all = sta_all[msk]
+                    ph_all = ph_all[msk]
+                    r_all = r_all[msk]
+                    # Mean residual per (event,station,phase)
+                    keys_esp = np.stack([ev_all, sta_all, ph_all], axis=1)
+                    uniq_esp, inv_esp = np.unique(keys_esp, axis=0, return_inverse=True)
+                    sums = np.bincount(inv_esp, weights=r_all)
+                    counts = np.bincount(inv_esp)
+                    means = sums / np.maximum(1, counts)
+                    esp_map = {tuple(k): means[i] for i, k in enumerate(uniq_esp)}
+
+                    # P/S pairs within same event+station
+                    ps_pairs = []
+                    uniq_es = np.unique(np.stack([ev_all, sta_all], axis=1), axis=0)
+                    for ev_id, sta_id in uniq_es:
+                        mp = esp_map.get((int(ev_id), int(sta_id), 0), None)
+                        ms = esp_map.get((int(ev_id), int(sta_id), 1), None)
+                        if (mp is not None) and (ms is not None) and np.isfinite(mp) and np.isfinite(ms):
+                            ps_pairs.append((mp, ms))
+                    if ps_pairs:
+                        p_arr = np.asarray([x[0] for x in ps_pairs])
+                        s_arr = np.asarray([x[1] for x in ps_pairs])
+                        corr_ps_es = _corr(p_arr, s_arr)
+                        print(f"[corr P-S | event+station] corr={corr_ps_es:.4f} pairs={len(ps_pairs)}", flush=True)
+
+                    # P/S pairs within same event (aggregate across stations)
+                    uniq_e = np.unique(ev_all)
+                    ps_e = []
+                    for ev_id in uniq_e:
+                        mp = np.mean([v for k, v in esp_map.items() if k[0] == int(ev_id) and k[2] == 0], dtype=np.float64) if True else float("nan")
+                        ms = np.mean([v for k, v in esp_map.items() if k[0] == int(ev_id) and k[2] == 1], dtype=np.float64) if True else float("nan")
+                        if np.isfinite(mp) and np.isfinite(ms):
+                            ps_e.append((mp, ms))
+                    if ps_e:
+                        p_arr = np.asarray([x[0] for x in ps_e])
+                        s_arr = np.asarray([x[1] for x in ps_e])
+                        corr_ps_e = _corr(p_arr, s_arr)
+                        print(f"[corr P-S | event] corr={corr_ps_e:.4f} pairs={len(ps_e)}", flush=True)
+
+                    # P/S pairs within same station (aggregate across events)
+                    uniq_s = np.unique(sta_all)
+                    ps_s = []
+                    for sta_id in uniq_s:
+                        mp = np.mean([v for k, v in esp_map.items() if k[1] == int(sta_id) and k[2] == 0], dtype=np.float64) if True else float("nan")
+                        ms = np.mean([v for k, v in esp_map.items() if k[1] == int(sta_id) and k[2] == 1], dtype=np.float64) if True else float("nan")
+                        if np.isfinite(mp) and np.isfinite(ms):
+                            ps_s.append((mp, ms))
+                    if ps_s:
+                        p_arr = np.asarray([x[0] for x in ps_s])
+                        s_arr = np.asarray([x[1] for x in ps_s])
+                        corr_ps_s = _corr(p_arr, s_arr)
+                        print(f"[corr P-S | station] corr={corr_ps_s:.4f} pairs={len(ps_s)}", flush=True)
+            except Exception:
+                pass
+        except Exception as e:
+            warn(f"dd-hop corr failed: {e}", section="DIAG")
     
     use_event_batches = bool(state.params.get("event_batch_enable", False))
     if ddp_enabled and use_event_batches:
@@ -487,6 +1943,13 @@ def _run_epoch(
     u_end_count_s = None
     u_end_maxnorm_p = None
     u_end_maxnorm_s = None
+    # corr_error: track RMS of the *actual per-row correction* delta_corr = W(sta)·(b_e2 - b_e1) (split P/S).
+    corr_dc_sumsq_p = None
+    corr_dc_sumsq_s = None
+    corr_dc_count_p = None
+    corr_dc_count_s = None
+    corr_dc_maxabs_p = None
+    corr_dc_maxabs_s = None
     # Online ESS metrics are computed only when enough *saved samples* exist and the cadence triggers.
     # To avoid gaps in W&B time series (epochs where ESS isn't recomputed), we cache the last metrics
     # on the state object and re-log them each epoch.
@@ -540,7 +2003,14 @@ def _run_epoch(
         if isinstance(optimizer, torch.optim.Adam):
             bs_key = "batch_size_warmup"
         batch_size = int(state.params.get(bs_key, 10000))
-        batch_iter = range(0, state.N // batch_size + 1)
+        # IMPORTANT: avoid an extra empty final batch when N is exactly divisible by batch_size.
+        # `range(0, N//bs + 1)` yields a last iteration with i_start==i_end==N (no data),
+        # which can create rank-divergent control flow and pointless DDP collectives.
+        if batch_size <= 0:
+            batch_iter = range(0)
+        else:
+            n_batches = int((int(state.N) + int(batch_size) - 1) // int(batch_size))
+            batch_iter = range(int(n_batches))
         use_buckets = False
         # Expose standard batching parameters for lower-level caching.
         state.params["_runtime_batch_size"] = int(batch_size)
@@ -549,6 +2019,12 @@ def _run_epoch(
     # Noise setup (generic sampler backend)
     # If noise_scale_factor > 0, enable noise; else disable (e.g., Phase 2). Phase 3 ramps it.
     _set_backend_noise(optimizer, enabled=(noise_scale_factor > 0.0), scale=float(noise_scale_factor))
+    # If we are using corr_error ESS (blocked update for corr_error_b), freeze the corr_error
+    # param group in the sampler backend so only ΔX_src is updated by Langevin.
+    if bool(is_sampling):
+        _maybe_freeze_corr_error_group_for_sampler(state, optimizer)
+        _maybe_freeze_slowness_re_group_for_sampler(state, optimizer)
+        _maybe_freeze_dd_graph_re_group_for_sampler(state, optimizer)
 
     # For AdaptiveSGHMC we want burn-in driven by *epochs* (Phase 3) rather than optimizer step counts.
     # Expose this via `param_group['is_burnin']`, which the optimizer reads.
@@ -755,6 +2231,16 @@ def _run_epoch(
                     state.params["_runtime_bucket_comp_index"] = comp_b
                 except Exception:
                     state.params["_runtime_bucket_comp_index"] = None
+                # Provide per-row original indices for Student-t scale-mixture (lambda).
+                try:
+                    if reorder_all and getattr(state, "_bucket_rows_order", None) is not None:
+                        state.params["_runtime_batch_rows"] = state._bucket_rows_order[i0:i1]
+                    elif isinstance(rows, torch.Tensor):
+                        state.params["_runtime_batch_rows"] = rows
+                    else:
+                        state.params["_runtime_batch_rows"] = None
+                except Exception:
+                    state.params["_runtime_batch_rows"] = None
                 # Not a standard batch; clear standard ids to avoid accidental cache hits.
                 state.params["_runtime_batch_id"] = -1
                 state.params["_runtime_batch_i0"] = -1
@@ -796,6 +2282,8 @@ def _run_epoch(
                 except Exception:
                     state.params["_runtime_bucket_station_index"] = None
                 state.params["_runtime_bucket_comp_index"] = None
+                # Provide per-row original indices for Student-t scale-mixture (lambda).
+                state.params["_runtime_batch_rows"] = rows
                 # Not a standard batch; clear standard ids to avoid accidental cache hits.
                 state.params["_runtime_batch_id"] = -1
                 state.params["_runtime_batch_i0"] = -1
@@ -819,6 +2307,16 @@ def _run_epoch(
             state.params["_runtime_bucket_nodes_s"] = None
             state.params["_runtime_bucket_u_s"] = None
             state.params["_runtime_bucket_v_s"] = None
+            # Provide per-row original indices for Student-t scale-mixture (lambda).
+            try:
+                if getattr(state, "_perm_epoch", None) is not None:
+                    state.params["_runtime_batch_rows"] = state._perm_epoch[i_start:i_end]
+                else:
+                    state.params["_runtime_batch_rows"] = torch.arange(
+                        int(i_start), int(i_end), device=II_b.device, dtype=torch.int64
+                    )
+            except Exception:
+                state.params["_runtime_batch_rows"] = None
             state.params["_runtime_bucket_chunks_p"] = None
             state.params["_runtime_bucket_chunks_s"] = None
             # Stable standard batch id (only meaningful when _runtime_batch_shuffle is false).
@@ -843,14 +2341,23 @@ def _run_epoch(
                 B = int(II_b.shape[0]) if isinstance(II_b, torch.Tensor) else 0
                 if B != int(global_bsz):
                     global_bsz = int(B)
-                # Deterministic contiguous shard per rank.
-                s = int((global_bsz * ddp_rank) // ddp_world_size)
-                e = int((global_bsz * (ddp_rank + 1)) // ddp_world_size)
-                II_b = II_b[s:e, :]
-                YY_b = YY_b[s:e]
+                # IMPORTANT:
+                # Use a *strided* shard (interleaved rows) rather than a contiguous slice.
+                #
+                # Rationale: if rows are partially sorted (e.g., by phase/component/station),
+                # contiguous sharding can give different ranks different data *types* within the same
+                # global batch. That can lead to rank-specific unused Parameters (grad=None) and
+                # NCCL deadlocks in our manual gradient allreduce.
+                #
+                # Strided sharding is deterministic and tends to preserve mixture across ranks.
+                if global_bsz > 0:
+                    sel = torch.arange(int(ddp_rank), int(global_bsz), int(ddp_world_size), device=II_b.device)
+                    II_b = II_b.index_select(0, sel)
+                    YY_b = YY_b.index_select(0, sel)
                 sta_rt = state.params.get("_runtime_bucket_station_index", None)
                 if isinstance(sta_rt, torch.Tensor) and int(sta_rt.shape[0]) == int(global_bsz):
-                    state.params["_runtime_bucket_station_index"] = sta_rt[s:e]
+                    if global_bsz > 0:
+                        state.params["_runtime_bucket_station_index"] = sta_rt.index_select(0, sel)
             except Exception:
                 # Leave batch unsharded if something goes wrong; better than crashing mid-run.
                 pass
@@ -1465,13 +2972,16 @@ def _run_epoch(
 
         # sigma_inflation removed (start fresh).
 
-        # Optional: corr_error latent (low-rank station basis × event-graph GMRF) contribution to likelihood.
+        # Optional: corr_error latent contribution to likelihood.
+        # Supports:
+        #  - low-rank station basis W (n_stations,R) with b (n_events,R,2)
+        #  - per-station coefficients (station_basis.enabled=false): b (n_events,n_stations,2) and we index by sta_idx
         try:
             if bool(state.params.get("_corr_error_enabled", False)):
                 W = getattr(state, "corr_error_station_basis_W", None)
                 b = getattr(state, "corr_error_b", None)
                 sta_b = state.params.get("_runtime_bucket_station_index", None)
-                if isinstance(W, torch.Tensor) and isinstance(b, torch.Tensor) and isinstance(sta_b, torch.Tensor):
+                if isinstance(b, torch.Tensor) and isinstance(sta_b, torch.Tensor):
                     e1 = II_b[:, 0].to(torch.int64)
                     e2 = II_b[:, 1].to(torch.int64)
                     bi = b.index_select(0, e1)  # (B,R,2)
@@ -1480,9 +2990,38 @@ def _run_epoch(
                     ph = YY_b[:, 4]
                     is_s = (ph >= 0.5)
                     db_phase = torch.where(is_s.view(-1, 1), db[:, :, 1], db[:, :, 0])  # (B,R)
-                    Wr = W.index_select(0, sta_b.to(torch.int64))  # (B,R)
-                    delta_corr = (Wr * db_phase).sum(dim=1)  # (B,)
+                    if isinstance(W, torch.Tensor):
+                        Wr = W.index_select(0, sta_b.to(torch.int64))  # (B,R)
+                        delta_corr = (Wr * db_phase).sum(dim=1)  # (B,)
+                    else:
+                        # Per-station coefficients: pick the coefficient corresponding to sta_idx.
+                        sidx = sta_b.to(torch.int64).view(-1, 1)
+                        delta_corr = db_phase.gather(1, sidx).squeeze(1)
                     nuisance_delta = delta_corr if nuisance_delta is None else (nuisance_delta + delta_corr)
+                    # Per-epoch stats for the *actual* correction delta_corr (split by phase).
+                    # Keep these as scalar tensors so we can all-reduce in DDP.
+                    dc = delta_corr.detach().to(torch.float32)
+                    if corr_dc_sumsq_p is None:
+                        z = torch.zeros((), device=dc.device, dtype=torch.float32)
+                        corr_dc_sumsq_p = z.clone()
+                        corr_dc_sumsq_s = z.clone()
+                        corr_dc_count_p = z.clone()
+                        corr_dc_count_s = z.clone()
+                        corr_dc_maxabs_p = z.clone()
+                        corr_dc_maxabs_s = z.clone()
+                    try:
+                        if (~is_s).any():
+                            dc_p = dc[~is_s]
+                            corr_dc_sumsq_p = corr_dc_sumsq_p + (dc_p * dc_p).sum()
+                            corr_dc_count_p = corr_dc_count_p + float(dc_p.numel())
+                            corr_dc_maxabs_p = torch.maximum(corr_dc_maxabs_p, torch.max(torch.abs(dc_p)))
+                        if is_s.any():
+                            dc_s = dc[is_s]
+                            corr_dc_sumsq_s = corr_dc_sumsq_s + (dc_s * dc_s).sum()
+                            corr_dc_count_s = corr_dc_count_s + float(dc_s.numel())
+                            corr_dc_maxabs_s = torch.maximum(corr_dc_maxabs_s, torch.max(torch.abs(dc_s)))
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -1529,6 +3068,22 @@ def _run_epoch(
                         sl_re_t0 = _time.perf_counter()
                     except Exception:
                         sl_re_t0 = None
+                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_prelog", False)):
+                    state.params["_shared_event_re_prelog"] = True
+                    try:
+                        n_rows = int(II_b.shape[0]) if isinstance(II_b, torch.Tensor) else 0
+                        solver = str(state.params.get("_shared_event_re_solver", ""))
+                        grouping = str(state.params.get("_shared_event_re_grouping", ""))
+                        # Sentinels to verify shared_event_re block executed.
+                        state.params["_shared_event_re_runtime_last_groups"] = -1
+                        state.params["_shared_event_re_runtime_last_groups_pcg"] = -1
+                        state.params["_shared_event_re_runtime_last_groups_fallback_diag"] = -1
+                        info(
+                            f"shared_event_re prelog rows={n_rows} solver={solver} grouping={grouping}",
+                            section="LIKELIHOOD",
+                        )
+                    except Exception:
+                        pass
                 loss_like = compute_likelihood_loss(
                     idx=II_b,
                     y=YY_b,
@@ -1541,6 +3096,213 @@ def _run_epoch(
                     nuisance_delta=nuisance_delta,
                     sigma_extra_var=sigma_extra_var,
                 )
+                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_postlog", False)):
+                    state.params["_shared_event_re_postlog"] = True
+                    g = int(state.params.get("_shared_event_re_runtime_last_groups", -1))
+                    g_pcg = int(state.params.get("_shared_event_re_runtime_last_groups_pcg", -1))
+                    g_fb = int(state.params.get("_shared_event_re_runtime_last_groups_fallback_diag", -1))
+                    info(
+                        f"shared_event_re postlog groups={g} pcg={g_pcg} fallback={g_fb}",
+                        section="LIKELIHOOD",
+                    )
+                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_batch_logged", False)):
+                    state.params["_shared_event_re_batch_logged"] = True
+                    try:
+                        n_rows = int(II_b.shape[0])
+                        info(f"shared_event_re batch rows={n_rows}", section="LIKELIHOOD")
+                        if n_rows > 0:
+                            ph_id = torch.where(
+                                YY_b[:, 4] < 0.5,
+                                torch.zeros_like(YY_b[:, 4], dtype=torch.int64),
+                                torch.ones_like(YY_b[:, 4], dtype=torch.int64),
+                            )
+                            grouping = str(state.params.get("_shared_event_re_grouping", "phase")).strip().lower()
+                            if grouping in {"stationphase", "station-phase"}:
+                                grouping = "station_phase"
+                            if grouping == "station_phase":
+                                sta_idx = state.params.get("_runtime_bucket_station_index", None)
+                                if isinstance(sta_idx, torch.Tensor) and int(sta_idx.numel()) == int(ph_id.numel()):
+                                    keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id
+                                else:
+                                    keys = ph_id
+                                    grouping = "phase"
+                            else:
+                                keys = ph_id
+                            keys_sorted, _ = torch.sort(keys)
+                            if keys_sorted.numel() > 0:
+                                is_new = torch.ones_like(keys_sorted, dtype=torch.bool)
+                                is_new[1:] = keys_sorted[1:] != keys_sorted[:-1]
+                                n_groups = int(torch.nonzero(is_new, as_tuple=False).shape[0])
+                            else:
+                                n_groups = 0
+                            info(f"shared_event_re batch grouping={grouping} groups={n_groups}", section="LIKELIHOOD")
+                    except Exception as e:
+                        info(f"shared_event_re batch log failed: {e}", section="LIKELIHOOD")
+                if not bool(state.params.get("_shared_event_re_flag_logged", False)):
+                    state.params["_shared_event_re_flag_logged"] = True
+                    info(
+                        f"shared_event_re flag={bool(state.params.get('_shared_event_re_enabled', False))}",
+                        section="LIKELIHOOD",
+                    )
+                # One-time shared_event_re runtime report (from modeling.py stats).
+                if bool(state.params.get("_shared_event_re_enabled", False)):
+                    g = int(state.params.get("_shared_event_re_runtime_last_groups", 0) or 0)
+                    g_pcg = int(state.params.get("_shared_event_re_runtime_last_groups_pcg", 0) or 0)
+                    g_fb = int(state.params.get("_shared_event_re_runtime_last_groups_fallback_diag", 0) or 0)
+                    g_rows = int(state.params.get("_shared_event_re_runtime_last_groups_rows_cap", 0) or 0)
+                    g_nodes = int(state.params.get("_shared_event_re_runtime_last_groups_nodes_cap", 0) or 0)
+                    g_tau0 = int(state.params.get("_shared_event_re_runtime_last_groups_tau_zero", 0) or 0)
+                    mr = int(state.params.get("_shared_event_re_runtime_last_max_rows", 0) or 0)
+                    mn = int(state.params.get("_shared_event_re_runtime_last_max_nodes", 0) or 0)
+                    mr_all = int(state.params.get("_shared_event_re_runtime_last_max_rows_all", 0) or 0)
+                    mn_all = int(state.params.get("_shared_event_re_runtime_last_max_nodes_all", 0) or 0)
+                    tg = state.params.get("_shared_event_re_tau_s", [0.0, 0.0])
+                    log_every = int(state.params.get("_shared_event_re_stats_log_every_epochs", 0) or 0)
+                    if log_every > 0 and (epoch_index % log_every == 0):
+                        grouping = str(state.params.get("_shared_event_re_runtime_last_grouping", "phase"))
+                        info(
+                            f"shared_event_re stats epoch={epoch_index} grouping={grouping} "
+                            f"groups={g} pcg={g_pcg} fallback={g_fb} "
+                            f"rows_cap={g_rows} nodes_cap={g_nodes} tau0={g_tau0} "
+                            f"max_rows={mr} max_nodes={mn} max_rows_all={mr_all} max_nodes_all={mn_all}",
+                            section="LIKELIHOOD",
+                        )
+                    if not bool(state.params.get("_shared_event_re_reported", False)):
+                        state.params["_shared_event_re_reported"] = True
+                        info(
+                            f"shared_event_re stats groups={g} pcg={g_pcg} fallback={g_fb} "
+                            f"max_rows={mr} max_nodes={mn} tau_s={tg}",
+                            section="LIKELIHOOD",
+                        )
+                    if g_fb > 0:
+                        info(
+                            f"shared_event_re fallback reasons rows_cap={g_rows} nodes_cap={g_nodes} tau_zero={g_tau0}",
+                            section="LIKELIHOOD",
+                        )
+                        if (not ddp_enabled) or ddp_is_main:
+                            if bool(state.params.get("_shared_event_re_auto_tune_nodes_cap", False)) and (g_nodes > 0):
+                                cur = int(state.params.get("_shared_event_re_max_nodes_per_group", 0) or 0)
+                                cap = int(state.params.get("_shared_event_re_auto_tune_nodes_max", 0) or 0)
+                                target = int(min(max(mn_all, cur), cap)) if cap > 0 else int(max(mn_all, cur))
+                                if target > cur and mn_all > 0:
+                                    state.params["_shared_event_re_max_nodes_per_group"] = target
+                                    info(
+                                        f"shared_event_re auto-tune: max_nodes_per_group -> {target}",
+                                        section="LIKELIHOOD",
+                                    )
+                            if bool(state.params.get("_shared_event_re_auto_tune_rows_cap", False)) and (g_rows > 0):
+                                cur = int(state.params.get("_shared_event_re_max_rows_per_group", 0) or 0)
+                                cap = int(state.params.get("_shared_event_re_auto_tune_rows_max", 0) or 0)
+                                target = int(min(max(mr_all, cur), cap)) if cap > 0 else int(max(mr_all, cur))
+                                if target > cur and mr_all > 0:
+                                    state.params["_shared_event_re_max_rows_per_group"] = target
+                                    info(
+                                        f"shared_event_re auto-tune: max_rows_per_group -> {target}",
+                                        section="LIKELIHOOD",
+                                    )
+                    if g > 0 and g_pcg == 0 and g_fb >= g:
+                        info(
+                            "shared_event_re warning: all groups fell back to diagonal; "
+                            "increase shared_event_re.max_nodes_per_group or max_rows_per_group",
+                            section="LIKELIHOOD",
+                        )
+                if bool(state.params.get("_shared_event_re_whitening_enabled", False)) and not bool(state.params.get("_shared_event_re_whitening_reported", False)):
+                    state.params["_shared_event_re_whitening_reported"] = True
+                    wg = int(state.params.get("_shared_event_re_whitening_last_groups", 0) or 0)
+                    wchol = int(state.params.get("_shared_event_re_whitening_last_groups_chol", 0) or 0)
+                    wfb = int(state.params.get("_shared_event_re_whitening_last_groups_fallback_diag", 0) or 0)
+                    wrows = int(state.params.get("_shared_event_re_whitening_last_groups_rows_cap", 0) or 0)
+                    wnodes = int(state.params.get("_shared_event_re_whitening_last_groups_nodes_cap", 0) or 0)
+                    wtau0 = int(state.params.get("_shared_event_re_whitening_last_groups_tau_zero", 0) or 0)
+                    wmr = int(state.params.get("_shared_event_re_whitening_last_max_rows", 0) or 0)
+                    wmn = int(state.params.get("_shared_event_re_whitening_last_max_nodes", 0) or 0)
+                    info(
+                        f"shared_event_re whitening groups={wg} chol={wchol} fallback={wfb} max_rows={wmr} max_nodes={wmn}",
+                        section="LIKELIHOOD",
+                    )
+                    if wfb > 0:
+                        info(
+                            f"shared_event_re whitening fallback reasons rows_cap={wrows} nodes_cap={wnodes} tau_zero={wtau0}",
+                            section="LIKELIHOOD",
+                        )
+                # One-time debug: compare shared_event_re vs baseline loss on this batch.
+                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_debug_compare_logged", False)):
+                    state.params["_shared_event_re_debug_compare_logged"] = True
+                    try:
+                        with torch.no_grad():
+                            params_dbg = dict(state.params)
+                            params_dbg["_shared_event_re_enabled"] = False
+                            loss_base = compute_likelihood_loss(
+                                idx=II_b,
+                                y=YY_b,
+                                X_src=state.X_src,
+                                ΔX_src=state.dX_src,
+                                model=state.model,
+                                σ_p=σp,
+                                σ_s=σs,
+                                params=params_dbg,
+                                nuisance_delta=nuisance_delta,
+                                sigma_extra_var=sigma_extra_var,
+                            )
+                        delta = float((loss_like - loss_base).detach().item())
+                        print(f"[shared_event_re] loss delta vs baseline = {delta:.6e}", flush=True)
+                    except Exception as e:
+                        print(f"[shared_event_re] debug compare failed: {e}", flush=True)
+                # One-time debug: compare slowness_re vs baseline loss on this batch.
+                if bool(state.params.get("_slowness_re_enabled", False)) and not bool(state.params.get("_slowness_re_debug_compare_logged", False)):
+                    state.params["_slowness_re_debug_compare_logged"] = True
+                    try:
+                        with torch.no_grad():
+                            params_dbg = dict(state.params)
+                            params_dbg["_slowness_re_enabled"] = False
+                            loss_base = compute_likelihood_loss(
+                                idx=II_b,
+                                y=YY_b,
+                                X_src=state.X_src,
+                                ΔX_src=state.dX_src,
+                                model=state.model,
+                                σ_p=σp,
+                                σ_s=σs,
+                                params=params_dbg,
+                                nuisance_delta=nuisance_delta,
+                                sigma_extra_var=sigma_extra_var,
+                            )
+                        delta = float((loss_like - loss_base).detach().item())
+                        print(f"[slowness_re] loss delta vs baseline = {delta:.6e}", flush=True)
+                    except Exception as e:
+                        print(f"[slowness_re] debug compare failed: {e}", flush=True)
+                # One-time shared_event_re runtime summary after the first loss call.
+                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_runtime_logged", False)):
+                    state.params["_shared_event_re_runtime_logged"] = True
+                    try:
+                        g = int(state.params.get("_shared_event_re_runtime_last_groups", 0) or 0)
+                        g_pcg = int(state.params.get("_shared_event_re_runtime_last_groups_pcg", 0) or 0)
+                        g_fb = int(state.params.get("_shared_event_re_runtime_last_groups_fallback_diag", 0) or 0)
+                        mr = int(state.params.get("_shared_event_re_runtime_last_max_rows", 0) or 0)
+                        mn = int(state.params.get("_shared_event_re_runtime_last_max_nodes", 0) or 0)
+                        print(
+                            f"[shared_event_re] runtime groups={g} pcg={g_pcg} fallback={g_fb} "
+                            f"max_rows={mr} max_nodes={mn}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+                # One-time slowness_re runtime summary after the first loss call.
+                if bool(state.params.get("_slowness_re_enabled", False)) and not bool(state.params.get("_slowness_re_runtime_logged", False)):
+                    state.params["_slowness_re_runtime_logged"] = True
+                    try:
+                        g = int(state.params.get("_slowness_re_runtime_last_groups", 0) or 0)
+                        g_pcg = int(state.params.get("_slowness_re_runtime_last_groups_woodbury", 0) or 0)
+                        g_fb = int(state.params.get("_slowness_re_runtime_last_groups_fallback_diag", 0) or 0)
+                        mr = int(state.params.get("_slowness_re_runtime_last_max_rows", 0) or 0)
+                        mn = int(state.params.get("_slowness_re_runtime_last_max_nodes", 0) or 0)
+                        print(
+                            f"[slowness_re] runtime groups={g} pcg={g_pcg} fallback={g_fb} "
+                            f"max_rows={mr} max_nodes={mn}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
                 if prof_se_re and (se_re_t0 is not None) and bool(state.params.get("_shared_event_re_enabled", False)):
                     try:
                         import time as _time
@@ -1602,7 +3364,6 @@ def _run_epoch(
             loss_prior = compute_prior_loss(
                 ΔX_src=state.dX_src,
                 prior_event=state.prior_event,
-                prior_centroid=state.prior_centroid,
                 σ_p=σp,
                 σ_s=σs,
                 N_total=state.N,
@@ -1645,19 +3406,115 @@ def _run_epoch(
                         sl_re_t0 = _time.perf_counter()
                     except Exception:
                         sl_re_t0 = None
+                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_prelog", False)):
+                    state.params["_shared_event_re_prelog"] = True
+                    try:
+                        n_rows = int(II_b.shape[0]) if isinstance(II_b, torch.Tensor) else 0
+                        solver = str(state.params.get("_shared_event_re_solver", ""))
+                        grouping = str(state.params.get("_shared_event_re_grouping", ""))
+                        # Sentinels to verify shared_event_re block executed.
+                        state.params["_shared_event_re_runtime_last_groups"] = -1
+                        state.params["_shared_event_re_runtime_last_groups_pcg"] = -1
+                        state.params["_shared_event_re_runtime_last_groups_fallback_diag"] = -1
+                        info(
+                            f"shared_event_re prelog rows={n_rows} solver={solver} grouping={grouping}",
+                            section="LIKELIHOOD",
+                        )
+                    except Exception:
+                        pass
 
                 loss_like = compute_likelihood_loss(
-                idx=II_b,
-                y=YY_b,
-                X_src=state.X_src,
-                ΔX_src=state.dX_src,
-                model=state.model,
+                    idx=II_b,
+                    y=YY_b,
+                    X_src=state.X_src,
+                    ΔX_src=state.dX_src,
+                    model=state.model,
                     σ_p=σp,
                     σ_s=σs,
                     params=state.params,
                     nuisance_delta=nuisance_delta,
                     sigma_extra_var=sigma_extra_var,
                 )
+                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_postlog", False)):
+                    state.params["_shared_event_re_postlog"] = True
+                    g = int(state.params.get("_shared_event_re_runtime_last_groups", -1))
+                    g_pcg = int(state.params.get("_shared_event_re_runtime_last_groups_pcg", -1))
+                    g_fb = int(state.params.get("_shared_event_re_runtime_last_groups_fallback_diag", -1))
+                    info(
+                        f"shared_event_re postlog groups={g} pcg={g_pcg} fallback={g_fb}",
+                        section="LIKELIHOOD",
+                    )
+                if bool(state.params.get("_shared_event_re_enabled", False)):
+                    g = int(state.params.get("_shared_event_re_runtime_last_groups", 0) or 0)
+                    g_pcg = int(state.params.get("_shared_event_re_runtime_last_groups_pcg", 0) or 0)
+                    g_fb = int(state.params.get("_shared_event_re_runtime_last_groups_fallback_diag", 0) or 0)
+                    g_rows = int(state.params.get("_shared_event_re_runtime_last_groups_rows_cap", 0) or 0)
+                    g_nodes = int(state.params.get("_shared_event_re_runtime_last_groups_nodes_cap", 0) or 0)
+                    g_tau0 = int(state.params.get("_shared_event_re_runtime_last_groups_tau_zero", 0) or 0)
+                    mr = int(state.params.get("_shared_event_re_runtime_last_max_rows", 0) or 0)
+                    mn = int(state.params.get("_shared_event_re_runtime_last_max_nodes", 0) or 0)
+                    tg = state.params.get("_shared_event_re_tau_s", [0.0, 0.0])
+                    if not bool(state.params.get("_shared_event_re_reported", False)):
+                        state.params["_shared_event_re_reported"] = True
+                        info(
+                            f"shared_event_re stats groups={g} pcg={g_pcg} fallback={g_fb} "
+                            f"max_rows={mr} max_nodes={mn} tau_s={tg}",
+                            section="LIKELIHOOD",
+                        )
+                    if g_fb > 0:
+                        info(
+                            f"shared_event_re fallback reasons rows_cap={g_rows} nodes_cap={g_nodes} tau_zero={g_tau0}",
+                            section="LIKELIHOOD",
+                        )
+                        if (not ddp_enabled) or ddp_is_main:
+                            if bool(state.params.get("_shared_event_re_auto_tune_nodes_cap", False)) and (g_nodes > 0):
+                                cur = int(state.params.get("_shared_event_re_max_nodes_per_group", 0) or 0)
+                                cap = int(state.params.get("_shared_event_re_auto_tune_nodes_max", 0) or 0)
+                                target = int(min(max(mn_all, cur), cap)) if cap > 0 else int(max(mn_all, cur))
+                                if target > cur and mn_all > 0:
+                                    state.params["_shared_event_re_max_nodes_per_group"] = target
+                                    info(
+                                        f"shared_event_re auto-tune: max_nodes_per_group -> {target}",
+                                        section="LIKELIHOOD",
+                                    )
+                            if bool(state.params.get("_shared_event_re_auto_tune_rows_cap", False)) and (g_rows > 0):
+                                cur = int(state.params.get("_shared_event_re_max_rows_per_group", 0) or 0)
+                                cap = int(state.params.get("_shared_event_re_auto_tune_rows_max", 0) or 0)
+                                target = int(min(max(mr_all, cur), cap)) if cap > 0 else int(max(mr_all, cur))
+                                if target > cur and mr_all > 0:
+                                    state.params["_shared_event_re_max_rows_per_group"] = target
+                                    info(
+                                        f"shared_event_re auto-tune: max_rows_per_group -> {target}",
+                                        section="LIKELIHOOD",
+                                    )
+                    if g > 0 and g_pcg == 0 and g_fb >= g:
+                        info(
+                            "shared_event_re warning: all groups fell back to diagonal; "
+                            "increase shared_event_re.max_nodes_per_group or max_rows_per_group",
+                            section="LIKELIHOOD",
+                        )
+                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_debug_compare_logged", False)):
+                    state.params["_shared_event_re_debug_compare_logged"] = True
+                    try:
+                        with torch.no_grad():
+                            params_dbg = dict(state.params)
+                            params_dbg["_shared_event_re_enabled"] = False
+                            loss_base = compute_likelihood_loss(
+                                idx=II_b,
+                                y=YY_b,
+                                X_src=state.X_src,
+                                ΔX_src=state.dX_src,
+                                model=state.model,
+                                σ_p=σp,
+                                σ_s=σs,
+                                params=params_dbg,
+                                nuisance_delta=nuisance_delta,
+                                sigma_extra_var=sigma_extra_var,
+                            )
+                        delta = float((loss_like - loss_base).detach().item())
+                        info(f"shared_event_re loss delta vs baseline = {delta:.6e}", section="LIKELIHOOD")
+                    except Exception as e:
+                        info(f"shared_event_re debug compare failed: {e}", section="LIKELIHOOD")
 
                 if prof_se_re and (se_re_t0 is not None) and bool(state.params.get("_shared_event_re_enabled", False)):
                     try:
@@ -1719,7 +3576,6 @@ def _run_epoch(
             loss_prior = compute_prior_loss(
                 ΔX_src=state.dX_src,
                 prior_event=state.prior_event,
-                prior_centroid=state.prior_centroid,
                 σ_p=σp,
                 σ_s=σs,
                 N_total=state.N,
@@ -1750,10 +3606,44 @@ def _run_epoch(
         #     lap_term = (diff * diff).sum(dim=1).mean()
         #     loss = loss + lap_w * lap_term
 
-        if not torch.isfinite(loss):
-            # Warning/Skip
+        # IMPORTANT DDP invariant:
+        # All ranks must execute the same sequence of collectives.
+        #
+        # Previously, a rank could hit a non-finite loss and `continue` here, while other ranks
+        # proceeded into gradient allreduce, causing NCCL to deadlock until watchdog timeout.
+        #
+        # Fix: in DDP mode, detect non-finite loss, synchronize a `bad_loss` flag, and if any
+        # rank is bad, run a *dummy* backward that touches all parameters (zero gradients) so
+        # the collective schedule stays aligned. Then skip the optimizer step on all ranks.
+        bad_loss = 0
+        try:
+            bad_loss = 0 if bool(torch.isfinite(loss).item()) else 1
+        except Exception:
+            bad_loss = 1
+        if ddp_enabled:
+            try:
+                bad_t0 = torch.tensor([bad_loss], device=state.device, dtype=torch.int32)
+                dist.all_reduce(bad_t0, op=dist.ReduceOp.MAX)
+                bad_loss = int(bad_t0.item())
+            except Exception:
+                bad_loss = 1
+        if (not ddp_enabled) and bad_loss:
+            # Non-DDP: keep historical behavior (skip this batch).
             continue
-            
+
+        if ddp_enabled and bad_loss:
+            # Dummy loss: depends on parameters but yields zero gradients.
+            # This ensures p.grad tensors exist and `_ddp_allreduce_grads` can run safely.
+            loss0 = torch.zeros((), device=state.device, dtype=torch.float32)
+            try:
+                for g in optimizer.param_groups:  # type: ignore[attr-defined]
+                    for p in g.get("params", []):
+                        if isinstance(p, torch.Tensor) and bool(getattr(p, "requires_grad", False)):
+                            loss0 = loss0 + (p.sum() * 0.0)
+            except Exception:
+                pass
+            loss = loss0
+
         loss.backward()
 
         # DDP: all-reduce gradients (SUM) so all ranks take identical optimizer steps.
@@ -1782,6 +3672,41 @@ def _run_epoch(
             if bad:
                 optimizer.zero_grad(set_to_none=True)
                 continue
+            # Also skip the step if any rank had a non-finite loss (handled via dummy backward above).
+            if bad_loss:
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+        # Optional: log explicit slowness_re latent RMS + grad RMS (debugging).
+        if bool(state.params.get("_slowness_re_explicit_enabled", False)) and not ddp_enabled:
+            try:
+                if int(state.params.get("_slowness_re_explicit_grad_logged_epoch", -1)) != int(epoch_index):
+                    state.params["_slowness_re_explicit_grad_logged_epoch"] = int(epoch_index)
+                    s_cp = getattr(state, "slowness_re_comp_p", None)
+                    s_cs = getattr(state, "slowness_re_comp_s", None)
+                    s_sp = getattr(state, "slowness_re_station_p", None)
+                    s_ss = getattr(state, "slowness_re_station_s", None)
+                    def _rms(t: torch.Tensor | None) -> float:
+                        if not isinstance(t, torch.Tensor) or t.numel() == 0:
+                            return float("nan")
+                        return float(t.detach().square().mean().sqrt().item())
+                    def _grms(t: torch.Tensor | None) -> float:
+                        if not isinstance(t, torch.Tensor):
+                            return float("nan")
+                        g = getattr(t, "grad", None)
+                        if not isinstance(g, torch.Tensor) or g.numel() == 0:
+                            return float("nan")
+                        return float(g.detach().square().mean().sqrt().item())
+                    print(
+                        f"[slowness_re] explicit latents rms/grad: "
+                        f"comp_p={_rms(s_cp):.3g}/{_grms(s_cp):.3g} "
+                        f"comp_s={_rms(s_cs):.3g}/{_grms(s_cs):.3g} "
+                        f"sta_p={_rms(s_sp):.3g}/{_grms(s_sp):.3g} "
+                        f"sta_s={_rms(s_ss):.3g}/{_grms(s_ss):.3g}",
+                        flush=True,
+                    )
+            except Exception:
+                pass
 
         # SVRG Correction
         if svrg_enabled and state.svrg_grad_full is not None and state.svrg_dX_snapshot is not None:
@@ -1804,7 +3729,6 @@ def _run_epoch(
                 ΔX_src=state.dX_src, # Now holding snapshot
                 model=state.model,
                 prior_event=state.prior_event,
-                prior_centroid=state.prior_centroid,
                 σ_p=σp,
                 σ_s=σs,
                 N_total=state.N,
@@ -1871,6 +3795,7 @@ def _run_epoch(
         
         _clamp_dX_inplace(state)
         _apply_shared_event_latent_constraints_inplace(state)
+        _apply_dd_graph_re_constraints_inplace(state)
         
         # Sampling (Phase 4)
         if is_sampling:
@@ -2065,6 +3990,119 @@ def _run_epoch(
                     # Avoid silent failures; warn once per epoch.
                     warn("Hierarchical event prior update failed; leaving P0 unchanged for this epoch.", section="PRIORS")
 
+        # Optional gauge-fixing: center corr_error_b within each connected component.
+        #
+        # This is only needed for an *intrinsic* GMRF prior (Laplacian-only, q_diag=0), where the
+        # precision has a constant-nullspace per graph component and the likelihood is difference-only.
+        # If q_diag > 0 (proper prior) or the event graph is disabled (IID prior), centering would
+        # bias the posterior by enforcing a hard mean-zero constraint, so we skip it.
+        need_gauge_fix = False
+        try:
+            graph_enabled = bool(state.params.get("_corr_error_event_graph_enabled", True))
+            qd = float(state.params.get("_corr_error_q_diag", 0.0))
+            u = state.params.get("_corr_error_u", None)
+            has_edges = bool(isinstance(u, torch.Tensor) and int(u.numel()) > 0)
+            need_gauge_fix = bool(graph_enabled and has_edges and (qd <= 0.0))
+        except Exception:
+            need_gauge_fix = False
+
+        if need_gauge_fix and isinstance(getattr(state, "corr_error_b", None), torch.nn.Parameter):
+            with torch.no_grad():
+                b_param = getattr(state, "corr_error_b")  # (n_events,R,2)
+                comp = getattr(state, "corr_error_component_id", None)
+                n_comp = int(getattr(state, "corr_error_n_components", 0) or 0)
+                # Fallback (should not happen): treat as single component.
+                if (not isinstance(comp, torch.Tensor)) or (comp.ndim != 1) or (int(comp.shape[0]) != int(b_param.shape[0])) or (n_comp <= 0):
+                    comp = torch.zeros((int(b_param.shape[0]),), dtype=torch.int64, device=b_param.device)
+                    n_comp = 1
+                comp = comp.to(device=b_param.device, dtype=torch.int64)
+
+                x = b_param.reshape(int(b_param.shape[0]), -1)  # (N, K) where K=R*2
+                K = int(x.shape[1])
+                sums = torch.zeros((n_comp, K), device=x.device, dtype=x.dtype)
+                sums.index_add_(0, comp, x)
+                counts = torch.bincount(comp, minlength=n_comp).to(device=x.device, dtype=x.dtype).clamp_min(1.0)
+                means = sums / counts.view(-1, 1)
+                x = x - means.index_select(0, comp)
+                b_param.copy_(x.view_as(b_param))
+
+        # Optional: Gibbs update for correlated-error tau (P/S covariance).
+        try:
+            hier_tau_enable = (
+                bool(state.params.get("_corr_error_enabled", False))
+                and bool(state.params.get("_corr_error_hierarchical_tau_enabled", False))
+                and isinstance(getattr(state, "corr_error_b", None), torch.nn.Parameter)
+            )
+        except Exception:
+            hier_tau_enable = False
+        if hier_tau_enable:
+            try:
+                update_every = int(state.params.get("_corr_error_hierarchical_tau_update_every", 5))
+                start_after = int(state.params.get("_corr_error_hierarchical_tau_start_after_epochs", 0) or 0)
+                if start_after < 0:
+                    start_after = 0
+                do_update = (epoch_index >= start_after) and ((epoch_index % max(1, update_every)) == 0)
+                if do_update:
+                    nu = float(state.params.get("_corr_error_hierarchical_tau_dof", 10.0))
+                    p_std = torch.tensor(state.params["_corr_error_hierarchical_tau_scale_ps"], device=state.device, dtype=torch.float32)
+                    V_inv = nu * torch.diag(p_std ** 2)
+                    
+                    b = getattr(state, "corr_error_b").detach()
+                    u = getattr(state, "corr_error_u")
+                    v = getattr(state, "corr_error_v")
+                    w = getattr(state, "corr_error_w")
+                    q_diag = float(state.params.get("_corr_error_q_diag", 1e-3))
+                    
+                    # Compute Gibbs update for covariance matrix
+                    cov_sample = update_corr_error_tau_hyperparameter(
+                        b, u, v, w, q_diag, nu, V_inv, mode="sample"
+                    )
+                    
+                    # Convert covariance to tau_p, tau_s, rho_ps
+                    t2p = float(cov_sample[0, 0].item())
+                    t2s = float(cov_sample[1, 1].item())
+                    tps = float(cov_sample[0, 1].item())
+                    
+                    tp = math.sqrt(max(1e-12, t2p))
+                    ts = math.sqrt(max(1e-12, t2s))
+                    rho = tps / (tp * ts + 1e-12)
+                    rho = max(-0.999, min(0.999, rho))
+                    
+                    # Damping: move only 20% toward the new sample per update.
+                    # This prevents sudden massive jumps in the prior energy that can destabilize the Langevin sampler.
+                    old_tau_ps = state.params.get("_corr_error_tau_s", [tp, ts])
+                    old_rho = float(state.params.get("_corr_error_rho_ps", rho))
+                    alpha = float(state.params.get("_corr_error_hierarchical_tau_damping", 0.2))
+                    tp = (1.0 - alpha) * old_tau_ps[0] + alpha * tp
+                    ts = (1.0 - alpha) * old_tau_ps[1] + alpha * ts
+                    rho = (1.0 - alpha) * old_rho + alpha * rho
+
+                    # Optional safety clamps (seconds).
+                    try:
+                        mn = state.params.get("_corr_error_hierarchical_tau_min_tau_s", None)
+                        mx = state.params.get("_corr_error_hierarchical_tau_max_tau_s", None)
+                        if isinstance(mn, list) and len(mn) == 2:
+                            tp = max(float(mn[0]), float(tp))
+                            ts = max(float(mn[1]), float(ts))
+                        if isinstance(mx, list) and len(mx) == 2:
+                            tp = min(float(mx[0]), float(tp))
+                            ts = min(float(mx[1]), float(ts))
+                    except Exception:
+                        pass
+                    
+                    state.params["_corr_error_tau_s"] = [tp, ts]
+                    state.params["_corr_error_rho_ps"] = rho
+                    
+                    # Log to console periodically
+                    log_every = int(state.params.get("display_precond_every", 10))
+                    if (epoch_index % max(1, log_every)) == 0:
+                        info(
+                            f"Hierarchical corr_error tau updated: tau_p={tp:.3g}s tau_s={ts:.3g}s rho_ps={rho:.3g}",
+                            section="PRIORS"
+                        )
+            except Exception as e:
+                warn(f"Hierarchical corr_error tau update failed: {e}", section="PRIORS")
+
         # Prefer weighted mean over edges; fallback to unweighted mean if something went wrong.
         if total_loss_weighted_denom > 0:
             total_loss_mean = total_loss_weighted_sum / float(total_loss_weighted_denom)
@@ -2165,6 +4203,22 @@ def _run_epoch(
             "dt_centered_med_abs": dt_centered_med_abs,
             "dt_centered_p90_abs": dt_centered_p90_abs,
         }
+        # dd_graph_re RMS metrics (per epoch)
+        try:
+            if bool(state.params.get("_dd_graph_re_enabled", False)):
+                for k in (
+                    "_dd_graph_re_pred_rms",
+                    "_dd_graph_re_resid_rms",
+                    "_dd_graph_re_pred_rms_p",
+                    "_dd_graph_re_pred_rms_s",
+                    "_dd_graph_re_resid_rms_p",
+                    "_dd_graph_re_resid_rms_s",
+                    "_dd_graph_re_loss_delta",
+                ):
+                    if k in state.params:
+                        metrics[f"dd_graph_re/{k[1:]}"] = float(state.params.get(k))
+        except Exception:
+            pass
         # sigma_inflation removed (start fresh).
         # Optional: timing summary for shared_event_latent nuisance reconstruction (per epoch).
         try:
@@ -2194,6 +4248,9 @@ def _run_epoch(
                     metrics["shared_event_re/groups_fallback_diag_mean"] = float(int(state.params.get("_se_re_groups_fallback_sum", 0) or 0) / float(c))
                     metrics["shared_event_re/max_rows_max"] = float(int(state.params.get("_se_re_max_rows_max", 0) or 0))
                     metrics["shared_event_re/max_nodes_max"] = float(int(state.params.get("_se_re_max_nodes_max", 0) or 0))
+                if bool(state.params.get("_shared_event_re_station_phase_enabled", False)):
+                    metrics["shared_event_re/station_phase_groups"] = float(int(state.params.get("_shared_event_re_station_phase_last_groups", 0) or 0))
+                    metrics["shared_event_re/station_phase_quad"] = float(state.params.get("_shared_event_re_station_phase_last_quad", 0.0) or 0.0)
         except Exception:
             pass
         # Optional: timing + breakdown summary for collapsed slowness_re likelihood (per epoch).
@@ -2430,7 +4487,6 @@ def _run_epoch(
                 l_prior = compute_prior_loss(
                     state.dX_src,
                     state.prior_event,
-                    state.prior_centroid,
                     σp_now,
                     σs_now,
                     int(state.N),
@@ -2603,7 +4659,6 @@ def _run_epoch(
                                 ΔX_src=state.dX_src,
                                 model=state.model,
                                 prior_event=state.prior_event,
-                                prior_centroid=state.prior_centroid,
                                 σ_p=σp_eval,
                                 σ_s=σs_eval,
                                 N_total=state.N,
@@ -2662,14 +4717,32 @@ def _run_epoch(
                         n_s = 0
                         n_all = 0
 
-                        # Mean correction: shared_event_latent (b) if enabled and available.
-                        use_b = bool(state.params.get("_shared_event_latent_enabled", False))
-                        if use_b:
+                        # Mean correction: corr_error (if enabled and available).
+                        def _corr_error_delta_for_rows(II_b: torch.Tensor, YY_b: torch.Tensor, sta_b: torch.Tensor) -> torch.Tensor | None:
                             try:
-                                if getattr(state, "shared_event_latent_b", None) is None or getattr(state, "row_station_index", None) is None:
-                                    use_b = False
+                                if not bool(state.params.get("_corr_error_enabled", False)):
+                                    return None
+                                W = getattr(state, "corr_error_station_basis_W", None)
+                                b = getattr(state, "corr_error_b", None)
+                                if not (isinstance(b, torch.Tensor) and isinstance(sta_b, torch.Tensor)):
+                                    return None
+                                if b.ndim != 3 or int(b.shape[2]) != 2:
+                                    return None
+                                e1 = II_b[:, 0].to(torch.int64)
+                                e2 = II_b[:, 1].to(torch.int64)
+                                bi = b.index_select(0, e1)
+                                bj = b.index_select(0, e2)
+                                db = (bj - bi).to(torch.float32)
+                                ph = YY_b[:, 4]
+                                is_s = (ph >= 0.5)
+                                db_phase = torch.where(is_s.view(-1, 1), db[:, :, 1], db[:, :, 0])
+                                if isinstance(W, torch.Tensor):
+                                    Wr = W.index_select(0, sta_b.to(torch.int64)).to(torch.float32)
+                                    return (Wr * db_phase).sum(dim=1)
+                                sidx = sta_b.to(torch.int64).view(-1, 1)
+                                return db_phase.gather(1, sidx).squeeze(1)
                             except Exception:
-                                use_b = False
+                                return None
 
                         σp_eval, σs_eval = _current_noise_scales(state)
                         sigma_p_base = float(σp_eval.item())
@@ -2698,125 +4771,13 @@ def _run_epoch(
                                     n_s += int((~is_p).sum().item())
 
                             if log_corr:
-                                # Build nuisance_delta (mean correction) for this batch.
-                                nuisance = None
-                                if use_b:
-                                    try:
-                                        b_lat = getattr(state, "shared_event_latent_b", None)
-                                        sta = getattr(state, "row_station_index", None)
-                                        if not isinstance(b_lat, torch.Tensor):
-                                            raise RuntimeError("missing shared_event_latent_b")
-                                        if not isinstance(sta, torch.Tensor):
-                                            raise RuntimeError("missing row_station_index")
-                                        if b_lat.ndim != 3 or int(b_lat.shape[2]) != 2:
-                                            raise RuntimeError("invalid shared_event_latent_b shape")
-                                        sta_b = sta.index_select(0, rows_t).to(torch.int64)
-                                        e1 = II_b[:, 0].to(torch.int64)
-                                        e2 = II_b[:, 1].to(torch.int64)
-                                        ph2 = YY_b[:, 4]
-                                        is_s2 = (ph2 >= 0.5)
-                                        mode = str(state.params.get("_shared_event_latent_parameterization", "full")).strip().lower()
-                                        if mode not in {"full", "inducing_gp", "graph_gmrf"}:
-                                            mode = "full"
-
-                                        if mode == "inducing_gp":
-                                            nei_idx = getattr(state, "shared_event_latent_inducing_neighbor_idx", None)
-                                            nei_k = getattr(state, "shared_event_latent_inducing_neighbor_k", None)
-                                            if not isinstance(nei_idx, torch.Tensor) or not isinstance(nei_k, torch.Tensor):
-                                                raise RuntimeError("missing inducing_gp neighbor tensors")
-                                            # (B,m) neighbor lists per endpoint event
-                                            idx1 = nei_idx.index_select(0, e1)
-                                            idx2 = nei_idx.index_select(0, e2)
-                                            k1 = nei_k.index_select(0, e1).to(torch.float32)
-                                            k2 = nei_k.index_select(0, e2).to(torch.float32)
-                                            m1 = (idx1 >= 0)
-                                            m2 = (idx2 >= 0)
-                                            idx1c = idx1.clamp_min(0)
-                                            idx2c = idx2.clamp_min(0)
-                                            # Support both parameterizations for inducing_gp:
-                                            # - per-station coefficients: b_lat shape (n_stations, M, 2)
-                                            # - station-basis coefficients: b_lat shape (R, M, 2) with W_sta shape (n_stations, R)
-                                            W_sta = getattr(state, "shared_event_latent_station_basis_W", None)
-                                            n_stations_rt = int(getattr(state, "n_stations", 0))
-                                            is_basis = (
-                                                isinstance(W_sta, torch.Tensor)
-                                                and W_sta.ndim == 2
-                                                and int(W_sta.shape[0]) == int(n_stations_rt)
-                                                and int(b_lat.shape[0]) == int(W_sta.shape[1])
-                                            )
-                                            is_per_station = (n_stations_rt > 0) and (int(b_lat.shape[0]) == int(n_stations_rt))
-                                            if is_basis:
-                                                # Basis mode: b(s,·) = Σ_r W[s,r] * a_r(·)
-                                                Wb = W_sta.index_select(0, sta_b).to(torch.float32)  # (B,R)
-                                                A = b_lat.to(torch.float32)  # (R,M,2)
-                                                R = int(A.shape[0])
-                                                M = int(A.shape[1])
-
-                                                def _recon_endpoint(idxc: torch.Tensor, kk: torch.Tensor, mm: torch.Tensor) -> torch.Tensor:
-                                                    # idxc: (B,m) clamped >=0; kk: (B,m); mm: (B,m) bool
-                                                    w = kk * mm.to(torch.float32)  # (B,m)
-                                                    m = int(idxc.shape[1])
-                                                    idx4 = idxc.unsqueeze(0).unsqueeze(-1).expand(R, -1, -1, 2)  # (R,B,m,2)
-                                                    Aexp = A.unsqueeze(1).expand(R, int(idxc.shape[0]), M, 2)
-                                                    g = torch.gather(Aexp, 2, idx4)  # (R,B,m,2)
-                                                    Wr = Wb.transpose(0, 1).unsqueeze(-1).unsqueeze(-1)  # (R,B,1,1)
-                                                    bm2 = (g * Wr).sum(dim=0)  # (B,m,2)
-                                                    return (bm2 * w.unsqueeze(-1)).sum(dim=1)  # (B,2)
-
-                                                b1 = _recon_endpoint(idx1c, k1, m1)
-                                                b2 = _recon_endpoint(idx2c, k2, m2)
-                                                d = (b2 - b1).to(torch.float32)
-                                                delta_b = torch.where(is_s2, d[:, 1], d[:, 0]).to(torch.float32)
-                                            elif is_per_station:
-                                                # Per-station coefficients
-                                                cP = b_lat[:, :, 0]
-                                                cS = b_lat[:, :, 1]
-                                                v1P = cP[sta_b[:, None], idx1c] * k1 * m1
-                                                v2P = cP[sta_b[:, None], idx2c] * k2 * m2
-                                                v1S = cS[sta_b[:, None], idx1c] * k1 * m1
-                                                v2S = cS[sta_b[:, None], idx2c] * k2 * m2
-                                                dP = (v2P.sum(dim=1) - v1P.sum(dim=1)).to(torch.float32)
-                                                dS = (v2S.sum(dim=1) - v1S.sum(dim=1)).to(torch.float32)
-                                                delta_b = torch.where(is_s2, dS, dP).to(torch.float32)
-                                            else:
-                                                raise RuntimeError("inducing_gp shared_event_latent_b shape mismatch (neither per-station nor station-basis)")
-                                        else:
-                                            # Explicit event-latent (full / graph_gmrf):
-                                            # - per-station: b_lat shape (n_stations, n_events, 2)
-                                            # - station-basis: b_lat shape (R, n_events, 2) with W_sta shape (n_stations, R)
-                                            W_sta2 = getattr(state, "shared_event_latent_station_basis_W", None)
-                                            n_stations_rt2 = int(getattr(state, "n_stations", 0))
-                                            is_per_station2 = (n_stations_rt2 > 0) and (int(b_lat.shape[0]) == int(n_stations_rt2))
-                                            is_basis2 = (
-                                                isinstance(W_sta2, torch.Tensor)
-                                                and W_sta2.ndim == 2
-                                                and int(W_sta2.shape[0]) == int(n_stations_rt2)
-                                                and int(b_lat.shape[0]) == int(W_sta2.shape[1])
-                                            )
-                                            if is_basis2:
-                                                A2 = b_lat.to(torch.float32)  # (R,Ne,2)
-                                                W2 = W_sta2.index_select(0, sta_b).to(torch.float32)  # (B,R)
-                                                A1 = A2.index_select(1, e1).transpose(0, 1).contiguous()  # (B,R,2)
-                                                A2e = A2.index_select(1, e2).transpose(0, 1).contiguous()  # (B,R,2)
-                                                b1 = (W2.unsqueeze(-1) * A1).sum(dim=1)  # (B,2)
-                                                b2 = (W2.unsqueeze(-1) * A2e).sum(dim=1)  # (B,2)
-                                                d = (b2 - b1).to(torch.float32)
-                                                delta_b = torch.where(is_s2, d[:, 1], d[:, 0]).to(torch.float32)
-                                            elif is_per_station2:
-                                                bP1 = b_lat[sta_b, e1, 0]
-                                                bP2 = b_lat[sta_b, e2, 0]
-                                                bS1 = b_lat[sta_b, e1, 1]
-                                                bS2 = b_lat[sta_b, e2, 1]
-                                                delta_b = torch.where(is_s2, (bS2 - bS1), (bP2 - bP1)).to(torch.float32)
-                                            else:
-                                                raise RuntimeError("explicit shared_event_latent_b shape mismatch (neither per-station nor station-basis)")
-                                        nuisance = delta_b if nuisance is None else (nuisance + delta_b)
-                                    except Exception:
-                                        pass
-                                if nuisance is None:
-                                    rc = rb
+                                sta = getattr(state, "row_station_index", None)
+                                if isinstance(sta, torch.Tensor):
+                                    sta_b = sta.index_select(0, rows_t).to(torch.int64)
+                                    dc = _corr_error_delta_for_rows(II_b, YY_b, sta_b)
                                 else:
-                                    rc = rb - nuisance
+                                    dc = None
+                                rc = rb if dc is None else (rb - dc)
                                 r2c = (rc * rc)
                                 sumsq_corr_all += float(r2c.sum().item())
                                 if bool(is_p.any().item()):
@@ -2864,6 +4825,105 @@ def _run_epoch(
                     "hier_corr_yz": float(Cov[1, 2].item()) / (s1 * s2 + 1e-12),
                     "hier_corr_zt": float(Cov[2, 3].item()) / (s2 * s3 + 1e-12),
                 })
+        except Exception:
+            pass
+
+        # --- corr_error diagnostics (W&B; cheap subsampled proxies) ---
+        # These answer: is b blowing up? are neighbor diffs reasonable? is the graph present?
+        try:
+            if not (_want_wandb_group(state.params, "corr_error") or _want_wandb_group(state.params, "priors")):
+                raise RuntimeError("skip corr_error metrics")
+            if ddp_enabled and (not ddp_is_main):
+                raise RuntimeError("skip corr_error metrics on non-main rank")
+            if bool(state.params.get("_corr_error_enabled", False)) and isinstance(getattr(state, "corr_error_b", None), torch.Tensor):
+                b = getattr(state, "corr_error_b").detach()
+                if b.ndim == 3 and int(b.shape[2]) == 2:
+                    n_ev = int(b.shape[0])
+                    R = int(b.shape[1])
+                    metrics["corr_error/R"] = float(R)
+                    metrics["corr_error/n_events"] = float(n_ev)
+                    metrics["corr_error/radius_km"] = float(state.params.get("_corr_error_event_graph_radius_km", float("nan")))
+                    metrics["corr_error/k"] = float(state.params.get("_corr_error_event_graph_k", float("nan")))
+                    metrics["corr_error/q_diag"] = float(state.params.get("_corr_error_q_diag", state.params.get("_corr_error_event_graph_q_diag", float("nan"))))
+                    metrics["corr_error/graph_dt_s"] = float(state.params.get("_corr_error_event_graph_dt_s", float("nan")))
+                    metrics["corr_error/graph_backend_id"] = float(state.params.get("_corr_error_event_graph_backend_id", float("nan")))
+
+                    # Hierarchical tau metrics
+                    tau_ps = state.params.get("_corr_error_tau_s", [0.0, 0.0])
+                    rho = float(state.params.get("_corr_error_rho_ps", 0.0))
+                    metrics["corr_error/tau_p"] = float(tau_ps[0])
+                    metrics["corr_error/tau_s"] = float(tau_ps[1])
+                    metrics["corr_error/rho_ps"] = float(rho)
+
+                    # Subsample events for amplitude stats.
+                    m_ev = int(min(max(1, 4096), n_ev))
+                    seed0 = int(state.params.get("runtime_seed", 0) or 0)
+                    gen = torch.Generator(device=b.device)
+                    try:
+                        gen.manual_seed(int(seed0 + 1000003 * int(epoch_index)))
+                    except Exception:
+                        pass
+                    ev_idx = torch.randint(0, n_ev, (m_ev,), device=b.device, dtype=torch.int64, generator=gen)
+                    b_s = b.index_select(0, ev_idx)  # [m,R,2]
+                    bP = b_s[:, :, 0]
+                    bS = b_s[:, :, 1]
+                    metrics["corr_error/b_rms_p"] = float(torch.sqrt(torch.mean(bP * bP)).item())
+                    metrics["corr_error/b_rms_s"] = float(torch.sqrt(torch.mean(bS * bS)).item())
+                    metrics["corr_error/b_maxabs_p"] = float(torch.max(torch.abs(bP)).item())
+                    metrics["corr_error/b_maxabs_s"] = float(torch.max(torch.abs(bS)).item())
+
+                    # Edge-difference stats (subsample edges; proxy for Laplacian energy).
+                    u = getattr(state, "corr_error_u", state.params.get("_corr_error_u", None))
+                    v = getattr(state, "corr_error_v", state.params.get("_corr_error_v", None))
+                    w = getattr(state, "corr_error_w", state.params.get("_corr_error_w", None))
+                    if isinstance(u, torch.Tensor) and isinstance(v, torch.Tensor) and isinstance(w, torch.Tensor):
+                        E = int(u.numel())
+                        metrics["corr_error/graph_edges"] = float(E)
+                        if (E > 0) and (n_ev > 0):
+                            metrics["corr_error/graph_deg_mean_approx"] = float(2.0 * float(E) / float(n_ev))
+                        if E > 0:
+                            m_e = int(min(max(1, 20000), E))
+                            e_idx = torch.randint(0, E, (m_e,), device=u.device, dtype=torch.int64, generator=gen)
+                            uu = u.index_select(0, e_idx).to(torch.int64)
+                            vv = v.index_select(0, e_idx).to(torch.int64)
+                            ww = w.index_select(0, e_idx).to(dtype=b.dtype, device=b.device)
+
+                            b_full_P = b[:, :, 0]
+                            b_full_S = b[:, :, 1]
+                            dP = b_full_P.index_select(0, uu) - b_full_P.index_select(0, vv)  # [m_e,R]
+                            dS = b_full_S.index_select(0, uu) - b_full_S.index_select(0, vv)
+                            metrics["corr_error/edge_diff_rms_p"] = float(torch.sqrt(torch.mean(dP * dP)).item())
+                            metrics["corr_error/edge_diff_rms_s"] = float(torch.sqrt(torch.mean(dS * dS)).item())
+                            metrics["corr_error/edge_wdiff_rms_p"] = float(torch.sqrt(torch.mean((dP * dP) * ww.unsqueeze(1))).item())
+                            metrics["corr_error/edge_wdiff_rms_s"] = float(torch.sqrt(torch.mean((dS * dS) * ww.unsqueeze(1))).item())
+                # Also report RMS/max|.| of the *actual per-row* correction delta_corr (accumulated over the epoch).
+                try:
+                    if isinstance(corr_dc_sumsq_p, torch.Tensor) and isinstance(corr_dc_count_p, torch.Tensor):
+                        s2p = corr_dc_sumsq_p.detach().clone()
+                        cP = corr_dc_count_p.detach().clone()
+                        mP = corr_dc_maxabs_p.detach().clone() if isinstance(corr_dc_maxabs_p, torch.Tensor) else None
+                        s2s = corr_dc_sumsq_s.detach().clone()
+                        cS = corr_dc_count_s.detach().clone()
+                        mS = corr_dc_maxabs_s.detach().clone() if isinstance(corr_dc_maxabs_s, torch.Tensor) else None
+                        if ddp_enabled:
+                            dist.all_reduce(s2p, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(cP, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(s2s, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(cS, op=dist.ReduceOp.SUM)
+                            if isinstance(mP, torch.Tensor):
+                                dist.all_reduce(mP, op=dist.ReduceOp.MAX)
+                            if isinstance(mS, torch.Tensor):
+                                dist.all_reduce(mS, op=dist.ReduceOp.MAX)
+                        if float(cP.item()) > 0.0:
+                            metrics["corr_error/delta_corr_rms_p"] = float(torch.sqrt(s2p / cP.clamp_min(1.0)).item())
+                            if isinstance(mP, torch.Tensor):
+                                metrics["corr_error/delta_corr_maxabs_p"] = float(mP.item())
+                        if float(cS.item()) > 0.0:
+                            metrics["corr_error/delta_corr_rms_s"] = float(torch.sqrt(s2s / cS.clamp_min(1.0)).item())
+                            if isinstance(mS, torch.Tensor):
+                                metrics["corr_error/delta_corr_maxabs_s"] = float(mS.item())
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2917,6 +4977,76 @@ def _run_epoch(
                         )
             except Exception:
                 pass
+
+        # Optional: exact ESS update for corr_error_b (blocked latent update) at end of Phase 4 epochs.
+        try:
+            st_stats = _student_t_scale_update_full(state=state, epoch_index=int(epoch_index))
+            if isinstance(st_stats, dict) and st_stats:
+                for k, v in st_stats.items():
+                    try:
+                        metrics[str(k)] = float(v)
+                    except Exception:
+                        pass
+                if (not ddp_enabled) or ddp_is_main:
+                    try:
+                        info(
+                            "student_t_scale lambda: "
+                            f"mean={st_stats.get('student_t_scale/lambda_mean', float('nan')):.3g} "
+                            f"p50={st_stats.get('student_t_scale/lambda_p50', float('nan')):.3g} "
+                            f"p90={st_stats.get('student_t_scale/lambda_p90', float('nan')):.3g} "
+                            f"p99={st_stats.get('student_t_scale/lambda_p99', float('nan')):.3g}",
+                            section="LIKELIHOOD",
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            try:
+                warn(f"student_t_scale update failed: {e}", section="LIKELIHOOD")
+            except Exception:
+                pass
+
+        # Optional: exact ESS update for corr_error_b (blocked latent update) at end of Phase 4 epochs.
+        if bool(is_sampling):
+            try:
+                m_ess = _corr_error_ess_update(state=state, epoch_index=int(epoch_index))
+                if isinstance(m_ess, dict) and m_ess:
+                    for k, v in m_ess.items():
+                        try:
+                            metrics[str(k)] = float(v)
+                        except Exception:
+                            pass
+            except Exception as e:
+                warn(f"corr_error ESS update failed: {e}", section="ESS")
+            try:
+                m_sl_ess = _slowness_re_ess_update(state=state, epoch_index=int(epoch_index))
+                if isinstance(m_sl_ess, dict) and m_sl_ess:
+                    for k, v in m_sl_ess.items():
+                        try:
+                            metrics[str(k)] = float(v)
+                        except Exception:
+                            pass
+            except Exception as e:
+                warn(f"slowness_re ESS update failed: {e}", section="ESS")
+            try:
+                m_dd_ess = _dd_graph_re_ess_update(state=state, epoch_index=int(epoch_index))
+                if isinstance(m_dd_ess, dict) and m_dd_ess:
+                    for k, v in m_dd_ess.items():
+                        try:
+                            metrics[str(k)] = float(v)
+                        except Exception:
+                            pass
+            except Exception as e:
+                warn(f"dd_graph_re ESS update failed: {e}", section="ESS")
+
+        # Optional: whitening PCG metrics (if available).
+        try:
+            if bool(state.params.get("_shared_event_re_whitening_enabled", False)):
+                metrics["shared_event_re_whitening/pcg_groups"] = float(state.params.get("_shared_event_re_whitening_last_groups_pcg", 0))
+                metrics["shared_event_re_whitening/pcg_iters_sum"] = float(state.params.get("_shared_event_re_whitening_last_pcg_iters_sum", 0))
+                metrics["shared_event_re_whitening/pcg_iters_max"] = float(state.params.get("_shared_event_re_whitening_last_pcg_iters_max", 0))
+                metrics["shared_event_re_whitening/pcg_fail"] = float(state.params.get("_shared_event_re_whitening_last_pcg_fail", 0))
+        except Exception:
+            pass
 
         return metrics
 

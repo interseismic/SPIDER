@@ -1,5 +1,11 @@
-# Code-only repo: ignore everything by default, except `spider/`
+# Code-only repo: ignore everything by default, except key packages
 *
 !.gitignore
 !spider/
 !spider/**
+!spider_old/
+!spider_old/**
+spider/**/__pycache__/
+spider/**/*.pyc
+spider_old/**/__pycache__/
+spider_old/**/*.pyc

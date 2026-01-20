@@ -1,130 +1,146 @@
 {
-  "io": {
-    "dtime_file": "PATH/TO/dtimes.csv",
-    "station_file": "PATH/TO/stations.csv",
-    "catalog_infile": "PATH/TO/events.csv",
-    "catalog_outfile": "PATH/TO/output_catalog.csv",
-    "samples_outfile": "PATH/TO/output_samples.h5",
-    "checkpoint_dir": "PATH/TO/checkpoints/",
-    "checkpoint_interval": 1000,
-    "sample_write_interval": 1000,
-    "save_every_n": 10,
-    "write_samples": true
-  },
-  "wandb": {
-    "enabled": false,
-    "project_name": null,
-    "run_name": null
-  },
-  "model": {
-    "model_file": "PATH/TO/eikonet_state_dict.pt",
-    "domain": {
-      "lon_min": -120.0,
-      "lat_min": 35.0,
-      "z_min": -5.0,
-      "z_max": 30.0,
-      "scale": 400.0
+    "io": {
+        "dtime_file": "/path/to/dtimes.csv",
+        "station_file": "/path/to/stations.csv",
+        "catalog_infile": "/path/to/catalog.csv",
+        "catalog_outfile": "/path/to/output_catalog.csv",
+        "samples_outfile": "/path/to/SPIDER_samples.h5",
+        "checkpoint_dir": "/path/to/checkpoints/",
+        "checkpoint_interval": 25,
+        "save_every_n": 10,
+        "sample_write_interval": 25,
+        "write_samples": true
     },
-    "priors": {
-      "event": {
-        "enabled": true,
-        "type": "gaussian",
-        "params": { "std": [0.2, 0.2, 0.2, 0.1] },
-        "hyper": { "enabled": false, "type": "wishart_precision", "params": { "df": 1000, "scale_std": [0.01, 0.01, 0.01, 0.01] }, "update": { "every_epochs": 1 } }
-      },
-      "centroid": {
+    "wandb": {
         "enabled": false,
-        "type": "gaussian",
-        "params": { "std": [0.01, 0.01, 0.01, 0.01] }
-      }
+        "project_name": "spider",
+        "run_name": "example_run",
+        "log_every_batches": 0,
+        "max_median_samples": 200000,
+        "residual_sample_size": 200000,
+        "precond_sample_size": 200000
     },
-    "likelihood": {
-      "type": "gaussian",
-      "huber_delta": 1.0,
-      "student_t": { "nu": 4.0 },
-      "phase_unc": [0.03, 0.03],
-      "corr_error": {
-        "enabled": false,
-        "r": 8,
-        "tau_s": [0.03, 0.03],
-        "rho_ps": 0.0,
-        "station_basis": { "ell_km": 50.0, "jitter": 1e-6, "method": "eigh_rbf" },
-        "event_graph": { "knn": 16, "ell_km": 5.0, "q_diag": 1e-3, "max_edges_per_step": 0 }
-      }
+    "model": {
+        "model_file": "/path/to/model_state_dict.pt",
+        "domain": {
+            "lon_min": -118.5,
+            "lat_min": 32.5,
+            "z_min": -5.0,
+            "z_max": 80.0,
+            "scale": 400.0
+        },
+        "priors": {
+            "event": {
+                "enabled": true,
+                "params": {
+                    "std": [0.2, 0.2, 0.2, 0.1]
+                }
+            }
+        },
+        "likelihood": {
+            "type": "correlated_gaussian",
+            "phase_unc": [0.01, 0.01],
+            "shared_event_re": {
+                "enabled": true,
+                "grouping": "station_phase",
+                "tau_s": [0.03, 0.04],
+                "max_nodes_per_group": 25000,
+                "max_rows_per_group": 1500000,
+                "solver": "pcg",
+                "pcg_max_iters": 20,
+                "pcg_tol": 0.005,
+                "whitening": {
+                    "solver": "pcg",
+                    "pcg_max_iters": 50,
+                    "pcg_tol": 0.0005,
+                    "pcg_min_iters": 1,
+                    "edge_weighting": "distance_power",
+                    "edge_weight_power": 0.9,
+                    "edge_weight_scale_km": 4.7,
+                    "edge_weight_global_scale": 1.0,
+                    "edge_weight_normalize": true,
+                    "edge_weight_eps_km": 0.001
+                }
+            }
+        },
+        "filters": {
+            "dtimes": {
+                "remove_duplicates": true,
+                "max_abs_input_dt": 99999,
+                "dtime_thin_frac": 1.0,
+                "flip_dt_sign": false,
+                "cc_min": 0.0
+            },
+            "events": {
+                "min_dtimes": 1,
+                "min_unique_phase_per_event": 10,
+                "min_dtimes_per_pair": 4,
+                "min_event_degree": 5,
+                "min_events_per_cluster": 0,
+                "max_pair_station_ratio": 1.0,
+                "ratio_filter_phase": "before",
+                "linearization_error": {
+                    "enabled": true,
+                    "phase": "before",
+                    "max_ratio": 0.05,
+                    "batch_size": 50000,
+                    "sample_size": 200000,
+                    "log_every_batches": 25
+                }
+            },
+            "residual": {
+                "enabled": true,
+                "method": "mad",
+                "mad_sigma": 4.0,
+                "abs_max": 0.5
+            }
+        }
     },
-    "filters": {
-      "dtimes": {
-        "remove_duplicates": true,
-        "max_abs_input_dt": 99999,
-        "dtime_thin_frac": 1.0,
-        "flip_dt_sign": false,
-        "cc_min": 0.0
-      },
-      "events": {
-        "min_dtimes": 1,
-        "min_unique_phase_per_event": 1,
-        "min_dtimes_per_pair": 1,
-        "min_event_degree": 1,
-        "min_events_per_cluster": 0,
-        "max_pair_station_ratio": 1.0,
-        "ratio_filter_phase": "before",
-        "linearization_error": { "enabled": false, "phase": "before", "max_ratio": 0.05, "batch_size": 50000, "sample_size": 200000, "log_every_batches": 25 }
-      },
-      "residual": {
-        "enabled": false,
-        "method": "mad",
-        "mad_sigma": 3.0,
-        "abs_max": 0.5
-      }
-    }
-  },
-  "inference": {
-    "compute": { "devices": [0] },
-    "phases": {
-      "phase1": { "epochs": 200, "lr": 1e-3 },
-      "phase2": { "epochs": 0 },
-      "phase3": { "epochs": 10 },
-      "phase4": { "epochs": 10000 }
+    "inference": {
+        "compute": {
+            "devices": [0]
+        },
+        "sampler": {
+            "backend": "psgld",
+            "epochs_per_phase": [150, 0, 0, 100000],
+            "lr": [0.001, 0.005, 0.003, 0.001],
+            "dt_lr_mult": 1.0,
+            "temperature": 1.0,
+            "eps": 1e-5,
+            "beta": 0.99,
+            "preconditioning": {
+                "enabled": true,
+                "type": "rmsprop",
+                "include_gamma": false
+            },
+            "monge": {
+                "alpha": 1.0,
+                "ema_beta": 0.9,
+                "eps": 1e-12
+            },
+            "freeze_preconditioner_sampling": false
+        },
+        "batching": {
+            "standard": {
+                "warmup": 1500000,
+                "sgld": 1500000,
+                "shuffle": false
+            }
+        }
     },
-    "sampler": {
-      "backend": "sghmc",
-      "lr_mode": "per_obs",
-      "lr": 1e-5,
-      "dt_lr_mult": 1.0,
-      "temperature": 1.0,
-      "sghmc_alpha": 1e-2,
-      "eps": 1e-8,
-      "preconditioning": { "enabled": true, "type": "rmsprop", "include_gamma": false },
-      "beta": 0.999,
-      "freeze_preconditioner_sampling": false,
-      "dd_prec_enable": false,
-      "dd_prec_dims": [0, 1, 2, 3]
-    },
-    "diagnostics": {
-      "pair_count_stats_enable": true,
-      "sgld_log_gnoise": false,
-      "sgld_log_temperature": false,
-      "display_precond_every": 50,
-      "wandb": { "enabled": false, "groups": { "core": true } },
-      "ess_online": { "enabled": false, "every_n_samples": 50, "n_events": 64, "seed": 0, "window": 512, "max_lag": 128, "dims": [0, 1, 2, 3] },
-      "fim": { "enable_phase2": false, "filter_threshold": 1.0 },
-      "svrg": { "enabled": false }
-    },
-    "batching": {
-      "standard": { "warmup": 250000, "sgld": 1000000, "shuffle": false },
-      "event_batches": { "enabled": false, "events_per_batch": 50, "max_edges_per_batch": 200000, "bucket_reorder_all": false, "bucket_reuse_epochs": 1 }
-    },
-    "safety": { "max_abs_dX": null },
     "runtime": {
-      "phase_mads_interval": { "phase2": 0, "phase3": 0, "phase4": 0 },
-      "cuda_empty_cache_every": 0,
-      "reset_batch_numbers": true,
-      "clear_samples_on_reset": true,
-      "min_samples_to_save": 10,
-      "verbose": true,
-      "cluster_events": false,
-      "gauge_projection": { "enabled": false, "mode": "global", "dims": [0, 1, 2], "apply_noise": true, "apply_momentum": true }
+        "seed": 0,
+        "verbose": true,
+        "clear_samples_on_reset": true,
+        "safety": {
+            "max_abs_dX": [2.0, 2.0, 2.0, 1.0]
+        },
+        "gauge_projection": {
+            "enabled": true,
+            "mode": "cluster",
+            "dims": [0, 1, 2, 3],
+            "apply_noise": true,
+            "apply_momentum": false
+        }
     }
-  }
 }
-

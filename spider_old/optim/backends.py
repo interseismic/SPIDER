@@ -3,9 +3,10 @@
 import torch
 from typing import Tuple, List
 
-from .sgld import pSGLD  # default backend
+from .sgld import pSGLD, AdaptiveDriftSGLDAdam  # default backend
 from .sghmc import SGHMC
 from .adaptive_sghmc import AdaptiveSGHMC
+from .sgnht import SGNHT
 
 
 def _attach_set_lr(opt: torch.optim.Optimizer) -> None:
@@ -52,8 +53,10 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
 
     Supported backends:
       - 'psgld' (default)
+      - 'adsgld_adam' (adaptive-drift SGLD, Adam variant)
       - 'sghmc'
       - 'adaptive_sghmc'
+      - 'sgnht'
       - 'sgld_simple' (plain SGD, mostly for debugging)
 
     Legacy aliases are no longer supported; use the canonical backend names above.
@@ -66,6 +69,26 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
     b_corr = getattr(state, "corr_error_b", None)
     use_b_corr = bool((b_corr is not None) and bool(params.get("_corr_error_enabled", False)))
     corr_overrides_active = bool(params.get("_corr_error_sampler_overrides_active", False))
+    # Optional: explicit slowness_re latents (component + station, per phase).
+    b_sl_comp_p = getattr(state, "slowness_re_comp_p", None)
+    b_sl_comp_s = getattr(state, "slowness_re_comp_s", None)
+    b_sl_sta_p = getattr(state, "slowness_re_station_p", None)
+    b_sl_sta_s = getattr(state, "slowness_re_station_s", None)
+    use_b_sl = bool(
+        bool(params.get("_slowness_re_explicit_enabled", False))
+        and isinstance(b_sl_comp_p, torch.nn.Parameter)
+        and isinstance(b_sl_comp_s, torch.nn.Parameter)
+        and isinstance(b_sl_sta_p, torch.nn.Parameter)
+        and isinstance(b_sl_sta_s, torch.nn.Parameter)
+    )
+    # Optional: DD-graph random effects (event latents, per phase).
+    b_dd_p = getattr(state, "dd_graph_re_b_p", None)
+    b_dd_s = getattr(state, "dd_graph_re_b_s", None)
+    use_b_dd = bool(
+        bool(params.get("_dd_graph_re_enabled", False))
+        and isinstance(b_dd_p, torch.nn.Parameter)
+        and isinstance(b_dd_s, torch.nn.Parameter)
+    )
 
     lr = float(params["lr_sampler"])
     lr_mode = str(params["sampler_lr_mode"]).strip().lower()
@@ -88,6 +111,15 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
                 freeze_b = bool(params.get("_corr_error_freeze_preconditioner_sampling", False))
                 g_corr.update({"eps": eps_b, "freeze_preconditioner": freeze_b})
             param_groups.append(g_corr)
+        if use_b_dd:
+            g_dd = {"params": [b_dd_p, b_dd_s], "group_name": "dd_graph_re"}
+            param_groups.append(g_dd)
+        if use_b_sl:
+            g_sl = {"params": [b_sl_comp_p, b_sl_comp_s, b_sl_sta_p, b_sl_sta_s], "group_name": "slowness_re"}
+            param_groups.append(g_sl)
+        precond_arg = str(params["sampler_preconditioner"]).strip().lower()
+        if bool(params.get("sampler_preconditioning", False)) and precond_arg in {"none", "false", ""}:
+            precond_arg = "rmsprop"
         opt = pSGLD(
             params=param_groups,
             n_obs=state.N,
@@ -95,14 +127,16 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
             beta=float(params["sampler_beta"]),
             eps=float(params["sampler_eps"]),
             preconditioning=bool(params["sampler_preconditioning"]),
-            preconditioner=str(params["sampler_preconditioner"]).lower(),
+            preconditioner=precond_arg,
             include_gamma=bool(params.get("sampler_preconditioning_include_gamma", True)),
             add_noise=False,
         )
         _ensure_common_group_keys(opt, params=params, n_obs=state.N)
 
         # Ensure group keys reflect config (avoid accidental "none")
-        precond = str(params["sampler_preconditioner"]).lower()
+        precond = str(params["sampler_preconditioner"]).strip().lower()
+        if bool(params.get("sampler_preconditioning", False)) and precond in {"none", "false", ""}:
+            precond = "rmsprop"
         # Backwards-compatible alias
         if precond == "matrix_ema":
             precond = "blockdiag_fisher"
@@ -110,6 +144,13 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         for g in opt.param_groups:
             g["preconditioner"] = precond
             g["preconditioning"] = bool(params["sampler_preconditioning"])
+            if precond == "monge":
+                g["monge_alpha"] = float(params.get("sampler_preconditioning_monge_alpha", 1.0))
+            if precond == "shampoo":
+                g["shampoo_beta"] = float(params.get("sampler_preconditioning_shampoo_beta", 0.99))
+                g["shampoo_eps"] = float(params.get("sampler_preconditioning_shampoo_eps", 1e-6))
+                g["shampoo_update_every"] = int(params.get("sampler_preconditioning_shampoo_update_every", 10))
+                g["shampoo_max_dim"] = int(params.get("sampler_preconditioning_shampoo_max_dim", 512))
             # Optional: attach static disjoint blocks for blockdiag_fisher (computed in LocateState).
             if precond == "blockdiag_fisher":
                 # Optional: cheap diagonal Γ proxy for blockdiag_fisher.
@@ -123,6 +164,38 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
 
         _maybe_attach_gauge_projection(opt, params=params, state=state)
         return "psgld", opt
+
+    if backend == "adsgld_adam":
+        # Algorithm 1 uses step size epsilon directly (no per-obs scaling).
+        lr_eff = lr
+        base_group = {"params": base_params_list, "group_name": "core"}
+        param_groups = [base_group]
+        if use_b_corr:
+            g_corr = {"params": [b_corr], "group_name": "corr_error"}  # type: ignore[list-item]
+            param_groups.append(g_corr)
+        if use_b_dd:
+            g_dd = {"params": [b_dd_p, b_dd_s], "group_name": "dd_graph_re"}
+            param_groups.append(g_dd)
+        if use_b_sl:
+            g_sl = {"params": [b_sl_comp_p, b_sl_comp_s, b_sl_sta_p, b_sl_sta_s], "group_name": "slowness_re"}
+            param_groups.append(g_sl)
+
+        opt = AdaptiveDriftSGLDAdam(
+            params=param_groups,
+            n_obs=state.N,
+            lr=lr_eff,
+            beta1=float(params.get("adaptive_drift_beta1", 0.9)),
+            beta2=float(params.get("adaptive_drift_beta2", 0.999)),
+            eps_adam=float(params.get("adaptive_drift_eps", 1e-8)),
+            drift_scale=float(params.get("adaptive_drift_scale", 1.0)),
+            add_noise=False,
+        )
+        _ensure_common_group_keys(opt, params=params, n_obs=state.N)
+        for g in opt.param_groups:
+            g["preconditioning"] = False
+            g["preconditioner"] = "none"
+        _maybe_attach_gauge_projection(opt, params=params, state=state)
+        return "adsgld_adam", opt
 
     if backend == "sghmc":
         lr_eff = lr
@@ -139,6 +212,12 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
                 freeze_b = bool(params.get("_corr_error_freeze_preconditioner_sampling", False))
                 g_corr.update({"eps": eps_b, "freeze_preconditioner": freeze_b})
             param_groups.append(g_corr)
+        if use_b_dd:
+            g_dd = {"params": [b_dd_p, b_dd_s], "group_name": "dd_graph_re"}
+            param_groups.append(g_dd)
+        if use_b_sl:
+            g_sl = {"params": [b_sl_comp_p, b_sl_comp_s, b_sl_sta_p, b_sl_sta_s], "group_name": "slowness_re"}
+            param_groups.append(g_sl)
         opt = SGHMC(
             params=param_groups,
             n_obs=state.N,
@@ -152,7 +231,7 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         _ensure_common_group_keys(opt, params=params, n_obs=state.N)
 
         # Force preconditioner mode from config (avoid default "none")
-        precond = str(params["sampler_preconditioner"]).lower()
+        precond = str(params["sampler_preconditioner"]).strip().lower()
         for g in opt.param_groups:
             g["preconditioner"] = precond
             g["preconditioning"] = bool(params["sampler_preconditioning"])
@@ -192,6 +271,9 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
                 freeze_b = bool(params.get("_corr_error_freeze_preconditioner_sampling", False))
                 g_corr.update({"epsilon": eps_b, "eps": eps_b, "freeze_preconditioner": freeze_b})
             param_groups.append(g_corr)
+        if use_b_sl:
+            g_sl = {"params": [b_sl_comp_p, b_sl_comp_s, b_sl_sta_p, b_sl_sta_s], "group_name": "slowness_re"}
+            param_groups.append(g_sl)
         opt = AdaptiveSGHMC(
             params=param_groups,
             lr=lr_eff,
@@ -216,11 +298,47 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         _maybe_attach_gauge_projection(opt, params=params, state=state)
         return "adaptive_sghmc", opt
 
-    if backend in {"sgnht", "sgnht_rmsprop", "psgnht"}:
-        raise ValueError(
-            "Unsupported sampler backend 'sgnht'. SGNHT support has been removed from this codebase. "
-            "Use 'sghmc' or 'psgld' instead."
+    if backend == "sgnht":
+        lr_eff = lr
+        if lr_mode == "per_obs":
+            lr_eff = lr / float(n_obs)
+        diffusion = float(params.get("sgnht_diffusion", 0.01))
+        thermostat_mass = float(params.get("sgnht_thermostat_mass", 1.0))
+        if lr_mode == "per_obs":
+            # Keep SGNHT dynamics comparable to absolute-lr by scaling diffusion and thermostat mass.
+            diffusion = diffusion * float(n_obs)
+            thermostat_mass = thermostat_mass / float(max(1, int(n_obs)))
+        base_group = {"params": base_params_list, "group_name": "core"}
+        param_groups = [base_group]
+        if use_b_corr:
+            g_corr = {"params": [b_corr], "group_name": "corr_error"}  # type: ignore[list-item]
+            if corr_overrides_active:
+                eps_b = float(params.get("_corr_error_eps", max(float(params["sampler_eps"]), 1e-3)))
+                freeze_b = bool(params.get("_corr_error_freeze_preconditioner_sampling", False))
+                g_corr.update({"eps": eps_b, "freeze_preconditioner": freeze_b})
+            param_groups.append(g_corr)
+        if use_b_dd:
+            g_dd = {"params": [b_dd_p, b_dd_s], "group_name": "dd_graph_re"}
+            param_groups.append(g_dd)
+        opt = SGNHT(
+            params=param_groups,
+            n_obs=state.N,
+            lr=lr_eff,
+            beta=float(params["sampler_beta"]),
+            eps=float(params["sampler_eps"]),
+            diffusion=diffusion,
+            thermostat_mass=thermostat_mass,
+            preconditioning=bool(params["sampler_preconditioning"]),
+            add_noise=False,
         )
+        _ensure_common_group_keys(opt, params=params, n_obs=state.N)
+        precond = str(params["sampler_preconditioner"]).strip().lower()
+        for g in opt.param_groups:
+            g["preconditioner"] = precond
+            g["preconditioning"] = bool(params["sampler_preconditioning"])
+        _maybe_attach_gauge_projection(opt, params=params, state=state)
+        _attach_set_lr(opt)
+        return "sgnht", opt
 
     if backend == "sgld_simple":
         # Simple SGD-based backend with no preconditioning; acts as placeholder
@@ -233,13 +351,16 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
                 freeze_b = bool(params.get("_corr_error_freeze_preconditioner_sampling", False))
                 g_corr.update({"eps": eps_b, "freeze_preconditioner": freeze_b})
             param_groups.append(g_corr)
+        if use_b_dd:
+            g_dd = {"params": [b_dd_p, b_dd_s], "group_name": "dd_graph_re"}
+            param_groups.append(g_dd)
         opt = torch.optim.SGD(param_groups, lr=lr)
         _attach_set_lr(opt)
         _ensure_common_group_keys(opt, params=params, n_obs=state.N)
         return "sgld_simple", opt
 
     raise ValueError(
-        f"Unknown sampler backend '{backend}'. Supported: psgld, sghmc, adaptive_sghmc, sgld_simple."
+        f"Unknown sampler backend '{backend}'. Supported: psgld, sghmc, adaptive_sghmc, sgnht, sgld_simple."
     )
 
 

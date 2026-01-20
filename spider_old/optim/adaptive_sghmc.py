@@ -210,7 +210,7 @@ class AdaptiveSGHMC(torch.optim.Optimizer):
                     # Allow SPIDER to ramp/scale noise and apply a temperature (std scales by sqrt(T)).
                     sigma = torch.sqrt(eps_var) * float(noise_scale) * math.sqrt(float(temperature))
                     noise = torch.normal(mean=torch.zeros_like(drift_grad), std=sigma)
-                    # Optional gauge projection of injected noise (prevents centroid random-walk).
+                    # Optional gauge projection of injected noise (prevents mean translation drift).
                     try:
                         if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
                             if bool(getattr(self, "_gauge_project_apply_noise", True)):
@@ -300,10 +300,36 @@ class AdaptiveSGHMC(torch.optim.Optimizer):
         We estimate Var(grad) from EMA stats: var_g = ema_g2 - ema_g^2.
         """
         eps_small = 1e-30
-        any_noise = False
-        all_ratios = []
 
-        for group in self.param_groups:
+        def _summarize(cat: torch.Tensor) -> dict:
+            if cat is None or (not isinstance(cat, torch.Tensor)) or cat.numel() == 0:
+                return {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            log_mean = torch.log(cat.clamp_min(1e-20)).mean()
+            gm = math.exp(float(log_mean.item()))
+            try:
+                x = cat
+                n = int(x.numel())
+                def _k(q: float) -> int:
+                    return int(max(1, min(n, round(q * (n - 1)) + 1)))
+                p10 = float(torch.kthvalue(x, _k(0.10)).values.item())
+                p90 = float(torch.kthvalue(x, _k(0.90)).values.item())
+            except Exception:
+                p10 = float("nan")
+                p90 = float("nan")
+            return {
+                "gm": float(gm),
+                "median": float(cat.median().item()),
+                "p10": float(p10),
+                "p90": float(p90),
+                "min": float(cat.min().item()),
+                "max": float(cat.max().item()),
+            }
+
+        any_noise_global = False
+        all_ratios = []
+        per_group = []
+
+        for gi, group in enumerate(self.param_groups):
             lr = float(group.get("lr", 0.0))
             mdecay = float(group.get("mdecay", 0.05))
             epsilon = float(group.get("epsilon", group.get("eps", 1e-16)))
@@ -312,9 +338,15 @@ class AdaptiveSGHMC(torch.optim.Optimizer):
             temperature = float(group.get("temperature", 1.0))
 
             if add_noise and noise_scale > 0.0 and temperature > 0.0:
-                any_noise = True
+                any_noise_global = True
             if lr <= 0.0:
+                per_group.append({
+                    "group_name": str(group.get("group_name", f"group{gi}")),
+                    "gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0,
+                })
                 continue
+            any_noise_group = bool(add_noise and noise_scale > 0.0 and temperature > 0.0)
+            group_ratios = []
 
             for p in group.get("params", []):
                 if p is None:
@@ -342,35 +374,27 @@ class AdaptiveSGHMC(torch.optim.Optimizer):
                 ratio = (var_drift / denom).clamp_min(1e-30)
                 finite = torch.isfinite(ratio)
                 if finite.any():
-                    all_ratios.append(ratio[finite].flatten())
+                    rr = ratio[finite].flatten()
+                    all_ratios.append(rr)
+                    group_ratios.append(rr)
 
-        if (not any_noise) or (not all_ratios):
-            return {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            if any_noise_group and group_ratios:
+                gcat = torch.cat(group_ratios)
+                gstats = _summarize(gcat)
+            else:
+                gstats = {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            gstats["group_name"] = str(group.get("group_name", f"group{gi}"))
+            per_group.append(gstats)
 
-        cat = torch.cat(all_ratios)
-        if cat.numel() == 0:
-            return {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+        if (not any_noise_global) or (not all_ratios):
+            out = {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            out["per_group"] = per_group
+            return out
 
-        log_mean = torch.log(cat.clamp_min(1e-20)).mean()
-        gm = math.exp(float(log_mean.item()))
-        try:
-            x = cat
-            n = int(x.numel())
-            def _k(q: float) -> int:
-                return int(max(1, min(n, round(q * (n - 1)) + 1)))
-            p10 = float(torch.kthvalue(x, _k(0.10)).values.item())
-            p90 = float(torch.kthvalue(x, _k(0.90)).values.item())
-        except Exception:
-            p10 = float("nan")
-            p90 = float("nan")
-        return {
-            "gm": float(gm),
-            "median": float(cat.median().item()),
-            "p10": float(p10),
-            "p90": float(p90),
-            "min": float(cat.min().item()),
-            "max": float(cat.max().item()),
-        }
+        cat = torch.cat(all_ratios) if all_ratios else torch.tensor([])
+        out = _summarize(cat)
+        out["per_group"] = per_group
+        return out
 
     @torch.no_grad()
     def temperature_stats(self) -> dict:

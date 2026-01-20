@@ -30,7 +30,6 @@ class LocateState:
     # Model and priors
     model: nn.Module
     prior_event: torch.distributions.Distribution
-    prior_centroid: torch.distributions.Distribution
 
     # Optim/SGD
     optimizer: torch.optim.Optimizer
@@ -68,12 +67,12 @@ class LocateState:
     nuisance_k_index: Optional[torch.Tensor] = None       # shape (N,), station-phase index per observation row
     nuisance_basis: str = "poly1"
     nuisance_M: int = 0
-    # Cluster-specific centroid priors
+    # Cluster ids for connected components (used by gauge projection and graph-aware priors)
     cluster_ids: Optional[torch.Tensor] = None         # shape (Ne,) int64
     cluster_counts: Optional[torch.Tensor] = None      # shape (K, 1) float32
 
     # Sampler preconditioner partition (disjoint clusters for blockdiag_fisher)
-    # This is separate from `cluster_ids` above (which is used for centroid priors / component detection).
+    # This is separate from `cluster_ids` above (which is used for component detection / gauge projection).
     # If enabled, blocks partition each connected component into disjoint groups of size <= max_cluster_size
     # based on weighted event-event edges (pair_count).
     precond_block_members: Optional[torch.Tensor] = None    # shape (K, S) int64, padded with -1
@@ -115,6 +114,14 @@ class LocateState:
 
     # --- Optional uncollapsed shared-event latent random effects b[s,event,phase] ---
     shared_event_latent_b: Optional[torch.nn.Parameter] = None    # shape (n_stations, n_events, 2)
+    # --- Optional uncollapsed slowness_re latents (component + station, per phase) ---
+    slowness_re_comp_p: Optional[torch.nn.Parameter] = None       # shape (n_components,)
+    slowness_re_comp_s: Optional[torch.nn.Parameter] = None       # shape (n_components,)
+    slowness_re_station_p: Optional[torch.nn.Parameter] = None    # shape (n_stations,)
+    slowness_re_station_s: Optional[torch.nn.Parameter] = None    # shape (n_stations,)
+    # --- Optional DD-graph random effects (event latents, per phase) ---
+    dd_graph_re_b_p: Optional[torch.nn.Parameter] = None          # shape (n_events,)
+    dd_graph_re_b_s: Optional[torch.nn.Parameter] = None          # shape (n_events,)
     # Optional fixed station-geometry basis for shared_event_latent (dimension reduction across stations).
     # When enabled (see config: model.likelihood.shared_event_latent.station_basis),
     # shared_event_latent_b uses rank-R coefficients rather than per-station coefficients:
@@ -146,6 +153,9 @@ class LocateState:
     corr_error_v: Optional[torch.Tensor] = None  # (E,) int64
     corr_error_w: Optional[torch.Tensor] = None  # (E,) float32
     corr_error_q_diag: float = 0.0
+    # Connected components of the corr_error event graph (for per-component gauge fixing).
+    corr_error_component_id: Optional[torch.Tensor] = None  # (n_events,) int64 labels
+    corr_error_n_components: int = 0
     # Optional FITC-style diagonal correction (Stage 5) for inducing_gp:
     # Q_ee ≈ K_eU K_UU^{-1} K_Ue (approximated using the same m-neighbor subset as interpolation),
     # residual diag Λ_ee = max(0, 1 - Q_ee).
@@ -156,6 +166,10 @@ class LocateState:
     shared_event_latent_v: Optional[torch.Tensor] = None          # (E,) int64
     shared_event_latent_w: Optional[torch.Tensor] = None          # (E,) float32 weights
     shared_event_latent_q_diag: float = 0.0
+    # Optional shared_event_re whitening cache (static covariance operator).
+    shared_event_re_whitening_cache: Optional[dict] = None
+    # Optional Student-t scale-mixture per-row precision (lambda) for robust likelihoods.
+    student_t_lambda: Optional[torch.Tensor] = None
     # CPU mirror of II for fast owner bucketing (kept in sync on rebuilds)
     _II_cpu: Optional[np.ndarray] = None
     # Owner-bucket caching
@@ -361,6 +375,51 @@ def _apply_shared_event_latent_constraints_inplace(state: LocateState) -> None:
         b.sub_((r.to(dtype=b.dtype, device=b.device) / denom_b).view(R, 1, 1) * dot.view(1, -1, 2))
     except Exception:
         # Constraints must never crash inference.
+        return
+
+
+@torch.no_grad()
+def _apply_dd_graph_re_constraints_inplace(state: LocateState) -> None:
+    """
+    Enforce identifiability constraints for dd_graph_re by centering b per component.
+
+    dd_graph_re enters the likelihood via (b_i - b_j). The per-component mean is a
+    gauge mode that can trade off with ΔT. We remove that mode by zero-centering
+    b within each connected component.
+    """
+    try:
+        if not bool(state.params.get("_dd_graph_re_enabled", False)):
+            return
+        b_p = getattr(state, "dd_graph_re_b_p", None)
+        b_s = getattr(state, "dd_graph_re_b_s", None)
+        if not isinstance(b_p, torch.Tensor) and not isinstance(b_s, torch.Tensor):
+            return
+        cid = getattr(state, "cluster_ids", None)
+        if not isinstance(cid, torch.Tensor) or cid.numel() == 0:
+            return
+        cid_dev = cid
+        if b_p is not None and isinstance(b_p, torch.Tensor) and b_p.device != cid.device:
+            cid_dev = cid.to(device=b_p.device)
+        elif b_s is not None and isinstance(b_s, torch.Tensor) and b_s.device != cid.device:
+            cid_dev = cid.to(device=b_s.device)
+        K = int(cid_dev.max().item()) + 1 if cid_dev.numel() > 0 else 0
+        if K <= 0:
+            return
+        counts = torch.bincount(cid_dev, minlength=K).clamp_min(1).to(dtype=torch.float32)
+
+        def _center_inplace(b: torch.Tensor) -> None:
+            if b.numel() == 0:
+                return
+            sums = torch.zeros((K,), device=b.device, dtype=b.dtype)
+            sums.index_add_(0, cid_dev, b)
+            means = sums / counts.to(device=b.device, dtype=b.dtype)
+            b.sub_(means.index_select(0, cid_dev))
+
+        if isinstance(b_p, torch.Tensor):
+            _center_inplace(b_p)
+        if isinstance(b_s, torch.Tensor):
+            _center_inplace(b_s)
+    except Exception:
         return
 
     # Also apply an identifiability constraint for corr_error:

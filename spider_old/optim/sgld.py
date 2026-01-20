@@ -13,7 +13,7 @@ class pSGLD(torch.optim.Optimizer):
 
     Optionally includes the Γ(θ) correction term from the original pSGLD
     paper to account for the drift induced by a state-dependent preconditioner.
-    We use a diagonal, low-cost approximation suitable for RMSprop/Adam-style
+    We use a diagonal, low-cost approximation suitable for RMSprop-style
     diagonal metrics.
 
     Note: for the matrix-valued `blockdiag_fisher` preconditioner we do NOT compute
@@ -39,7 +39,7 @@ class pSGLD(torch.optim.Optimizer):
             eps (float): Small constant for numerical stability
             preconditioning (bool): Whether to use adaptive preconditioning
             add_noise (bool): Whether to add Langevin noise
-            preconditioner (str): 'rmsprop' (default) or 'adam' to control G(θ)
+            preconditioner (str): 'rmsprop' (default) to control G(θ)
             include_gamma (bool): If True, add a diagonal approximation to the
                 Γ(θ) correction term from pSGLD. This adds a small extra drift
                 accounting for state-dependent G. The original paper notes Γ can
@@ -61,11 +61,20 @@ class pSGLD(torch.optim.Optimizer):
         if n_obs <= 0:
             raise ValueError(f"Invalid n_obs: {n_obs}")
 
+        preconditioner = str(preconditioner).strip().lower()
         # Allow blockdiag_fisher (alias: matrix_ema)
         if preconditioner == "matrix_ema":
             preconditioner = "blockdiag_fisher"
-        if preconditioner not in {"rmsprop", "adam", "matrix", "blockdiag_fisher"}:
-            raise ValueError("preconditioner must be 'rmsprop', 'adam', 'matrix', or 'blockdiag_fisher' (alias: 'matrix_ema')")
+        if preconditioner in {"none", "false", ""}:
+            if preconditioning:
+                raise ValueError("preconditioner cannot be 'none' when preconditioning=True")
+            # Keep a valid label even when preconditioning is disabled.
+            preconditioner = "rmsprop"
+        if preconditioner not in {"rmsprop", "matrix", "blockdiag_fisher", "monge", "shampoo"}:
+            raise ValueError(
+                "preconditioner must be 'rmsprop', 'matrix', 'blockdiag_fisher', 'monge', or 'shampoo' "
+                f"(alias: 'matrix_ema'); got '{preconditioner}'"
+            )
 
         defaults = dict(lr=lr, beta=beta, eps=eps, n_obs=n_obs,
                         preconditioning=preconditioning, add_noise=add_noise,
@@ -152,7 +161,7 @@ class pSGLD(torch.optim.Optimizer):
                 if "ema_g" not in state:
                     state['step'] = 0
                     if preconditioning:
-                        if preconditioner in {"rmsprop", "adam"}:
+                        if preconditioner == "rmsprop":
                             state.setdefault('exp_avg_sq', torch.zeros_like(p))
                         elif preconditioner == "blockdiag_fisher" and p.ndim == 2 and p.shape[1] == 4:
                             state.setdefault('exp_avg_outer', torch.zeros((p.shape[0], 4, 4), device=p.device, dtype=p.dtype))
@@ -458,17 +467,162 @@ class pSGLD(torch.optim.Optimizer):
                         continue
                 # ----------------------------------
 
+                if preconditioning and preconditioner in {"monge", "shampoo"}:
+                    # Non-diagonal preconditioners (Monge / Shampoo)
+                    ema_g = state['ema_g']
+                    ema_g2 = state['ema_g2']
+                    ema_g.mul_(grad_ema_beta).add_(grad_for_drift, alpha=(1.0 - grad_ema_beta))
+                    ema_g2.mul_(grad_ema_beta).addcmul_(grad_for_drift, grad_for_drift, value=(1.0 - grad_ema_beta))
+                    state['ema_g'] = ema_g
+                    state['ema_g2'] = ema_g2
+
+                    if preconditioner == "monge":
+                        alpha = float(group.get("monge_alpha", 1.0))
+                        if not (math.isfinite(alpha) and alpha > 0.0):
+                            alpha = 1.0
+                        monge_beta = float(group.get("monge_beta", grad_ema_beta))
+                        if not (math.isfinite(monge_beta) and 0.0 <= monge_beta < 1.0):
+                            monge_beta = grad_ema_beta
+                        # Use EMA of minibatch-mean gradient (paper's v_t / ghat_t).
+                        monge_ema = state.get("monge_ema", None)
+                        if monge_ema is None or not isinstance(monge_ema, torch.Tensor):
+                            monge_ema = torch.zeros_like(p)
+                            state["monge_ema"] = monge_ema
+                        if not freeze_preconditioner:
+                            monge_ema.mul_(monge_beta).add_(grad_for_precond, alpha=(1.0 - monge_beta))
+                        # Monge rank-1 vector u = alpha * v_t
+                        u = monge_ema.mul(alpha)
+                        u_dot_u = float((u * u).sum().item())
+                        denom = 1.0 + u_dot_u
+                        if u_dot_u > 0.0:
+                            u_dot_g = (u * grad_for_drift).sum()
+                            precond_grad = grad_for_drift - u * (u_dot_g / denom)
+                            # Diagonal proxy for diagnostics
+                            diag_g = (1.0 - (u * u) / denom).clamp_min(0.0)
+                            state["precond_diag"] = diag_g
+                        else:
+                            precond_grad = grad_for_drift
+                            state["precond_diag"] = torch.ones_like(p)
+
+                        update = lr * precond_grad
+                        if add_noise:
+                            temp = max(0.0, temperature)
+                            std = math.sqrt(2.0 * lr * temp) * noise_scale
+                            z = torch.randn_like(p) * std
+                            if u_dot_u > 0.0:
+                                c = (1.0 - (1.0 / math.sqrt(1.0 + u_dot_u))) / max(u_dot_u, 1e-12)
+                                u_dot_z = (u * z).sum()
+                                z = z - u * (u_dot_z * c)
+                            update = update + z
+                        # One-time early-step diagnostic print to compare scaling vs RMSprop.
+                        if int(state.get('step', 0)) <= 3 and (p is group.get("params", [None])[0]):
+                            try:
+                                var_g = (ema_g2 - ema_g * ema_g).clamp_min(0.0)
+                                diag_g = state.get("precond_diag", torch.ones_like(p))
+                                var_noise = (2.0 * lr * max(temperature, 0.0)) * (noise_scale * noise_scale) * diag_g
+                                num = (lr * lr) * (diag_g * diag_g) * var_g
+                                ratio = (num / var_noise.clamp_min(1e-30)).clamp_min(1e-30)
+                                g_pre = grad_for_precond
+                                g_drift = grad_for_drift
+                                print(
+                                    "[monge_debug]"
+                                    f" step={int(state.get('step', 0))}"
+                                    f" n_obs={int(n_obs)}"
+                                    f" lr={float(lr):.3e}"
+                                    f" alpha={float(alpha):.3e}"
+                                    f" monge_beta={float(monge_beta):.3e}"
+                                    f" u_dot_u={float(u_dot_u):.3e}"
+                                    f" monge_ema_norm={float(monge_ema.norm().item()):.3e}"
+                                    f" g_pre_norm={float(g_pre.norm().item()):.3e}"
+                                    f" g_drift_norm={float(g_drift.norm().item()):.3e}"
+                                    f" diag_g_med={float(diag_g.median().item()):.3e}"
+                                    f" var_g_med={float(var_g.median().item()):.3e}"
+                                    f" var_noise_med={float(var_noise.median().item()):.3e}"
+                                    f" ratio_med={float(ratio.median().item()):.3e}"
+                                )
+                            except Exception:
+                                pass
+                        p.add_(-update)
+                        continue
+
+                    # Shampoo (Kronecker) for small 2D tensors
+                    if preconditioner == "shampoo":
+                        if p.ndim != 2:
+                            # Fallback to RMSprop for unsupported shapes
+                            v = state['exp_avg_sq']
+                            if not freeze_preconditioner:
+                                v.mul_(beta).addcmul_(grad_for_precond, grad_for_precond, value=1 - beta)
+                            G = 1.0 / (eps + v.sqrt())
+                        else:
+                            n0, n1 = int(p.shape[0]), int(p.shape[1])
+                            max_dim = int(group.get("shampoo_max_dim", 512))
+                            if n0 > max_dim or n1 > max_dim:
+                                v = state['exp_avg_sq']
+                                if not freeze_preconditioner:
+                                    v.mul_(beta).addcmul_(grad_for_precond, grad_for_precond, value=1 - beta)
+                                G = 1.0 / (eps + v.sqrt())
+                            else:
+                                beta_s = float(group.get("shampoo_beta", beta))
+                                eps_s = float(group.get("shampoo_eps", eps))
+                                update_every = int(group.get("shampoo_update_every", 10))
+                                L = state.get("shampoo_L", None)
+                                R = state.get("shampoo_R", None)
+                                if L is None or L.shape != (n0, n0):
+                                    L = torch.zeros((n0, n0), device=p.device, dtype=p.dtype)
+                                    state["shampoo_L"] = L
+                                if R is None or R.shape != (n1, n1):
+                                    R = torch.zeros((n1, n1), device=p.device, dtype=p.dtype)
+                                    state["shampoo_R"] = R
+                                if not freeze_preconditioner:
+                                    L.mul_(beta_s).add_(grad_for_precond @ grad_for_precond.mT, alpha=(1.0 - beta_s))
+                                    R.mul_(beta_s).add_(grad_for_precond.mT @ grad_for_precond, alpha=(1.0 - beta_s))
+                                # Cache inverse sqrt
+                                if (state['step'] % update_every) == 0 or ("shampoo_L_inv_sqrt" not in state):
+                                    eye0 = torch.eye(n0, device=p.device, dtype=p.dtype)
+                                    eye1 = torch.eye(n1, device=p.device, dtype=p.dtype)
+                                    evals0, evecs0 = torch.linalg.eigh(L + eps_s * eye0)
+                                    evals1, evecs1 = torch.linalg.eigh(R + eps_s * eye1)
+                                    inv0 = evecs0 @ torch.diag(1.0 / torch.sqrt(evals0.clamp_min(0.0))) @ evecs0.mT
+                                    inv1 = evecs1 @ torch.diag(1.0 / torch.sqrt(evals1.clamp_min(0.0))) @ evecs1.mT
+                                    state["shampoo_L_inv_sqrt"] = inv0
+                                    state["shampoo_R_inv_sqrt"] = inv1
+                                inv0 = state.get("shampoo_L_inv_sqrt")
+                                inv1 = state.get("shampoo_R_inv_sqrt")
+                                if inv0 is None or inv1 is None:
+                                    G = torch.ones_like(p)
+                                else:
+                                    precond_grad = inv0 @ grad_for_drift @ inv1
+                                    update = lr * precond_grad
+                                    if add_noise:
+                                        temp = max(0.0, temperature)
+                                        std = math.sqrt(2.0 * lr * temp) * noise_scale
+                                        z = torch.randn_like(p) * std
+                                        z = inv0 @ z @ inv1
+                                        update = update + z
+                                    # Diagonal proxy for diagnostics
+                                    diag_g = (inv0.diagonal().unsqueeze(1) * inv1.diagonal().unsqueeze(0)).clamp_min(0.0)
+                                    state["precond_diag"] = diag_g
+                                    p.add_(-update)
+                                    continue
+
+                    # Shampoo fallback uses diagonal G computed above
+                    if preconditioning:
+                        update = lr * (G * grad_for_drift)
+                        if add_noise:
+                            temp = max(0.0, temperature)
+                            std = math.sqrt(2.0 * lr * temp) * noise_scale
+                            noise = torch.randn_like(p) * std * G.sqrt()
+                            update = update + noise
+                        p.add_(-update)
+                        continue
+
                 if preconditioning:
                     v = state['exp_avg_sq']
                     if not freeze_preconditioner:
                         v.mul_(beta).addcmul_(grad_for_precond, grad_for_precond, value=1 - beta)
                     
-                    # Preconditioner choice
-                    if preconditioner == 'rmsprop':
-                        G = 1.0 / (eps + v.sqrt())
-                    else:  # 'adam' bias-corrected second moment
-                        v_hat = v / (1.0 - (beta ** state['step']))
-                        G = 1.0 / (eps + v_hat.sqrt())
+                    # Preconditioner choice (RMSprop)
+                    G = 1.0 / (eps + v.sqrt())
                 else:
                     G = torch.ones_like(p)
 
@@ -484,19 +638,37 @@ class pSGLD(torch.optim.Optimizer):
 
                 # Compute update step
                 update = lr * G * grad_for_drift
+                # One-time early-step diagnostic print for RMSprop-scale comparisons.
+                if int(state.get('step', 0)) <= 3 and (p is group.get("params", [None])[0]):
+                    try:
+                        var_g = (ema_g2 - ema_g * ema_g).clamp_min(0.0)
+                        var_noise = (2.0 * lr * max(temperature, 0.0)) * (noise_scale * noise_scale) * G
+                        num = (lr * lr) * (G * G) * var_g
+                        ratio = (num / var_noise.clamp_min(1e-30)).clamp_min(1e-30)
+                        print(
+                            "[rmsprop_debug]"
+                            f" step={int(state.get('step', 0))}"
+                            f" n_obs={int(n_obs)}"
+                            f" lr={float(lr):.3e}"
+                            f" beta={float(beta):.3e}"
+                            f" eps={float(eps):.3e}"
+                            f" g_pre_norm={float(grad_for_precond.norm().item()):.3e}"
+                            f" g_drift_norm={float(grad_for_drift.norm().item()):.3e}"
+                            f" v_med={float(v.median().item()):.3e}"
+                            f" G_med={float(G.median().item()):.3e}"
+                            f" var_g_med={float(var_g.median().item()):.3e}"
+                            f" var_noise_med={float(var_noise.median().item()):.3e}"
+                            f" ratio_med={float(ratio.median().item()):.3e}"
+                        )
+                    except Exception:
+                        pass
 
                 # Gamma correction term (approximate, diagonal case)
                 # Γ_i ≈ - (1-β) * g_i * sqrt(v_i) / (eps + sqrt(v_i))^2
                 if include_gamma and preconditioning:
-                    if preconditioner == 'rmsprop':
-                        sqrt_v = v.sqrt().clamp_min(0.0)
-                        denom = (eps + sqrt_v)
-                        gamma = - (1.0 - beta) * raw_grad * (sqrt_v / (denom * denom))
-                    else:
-                        v_hat = v / (1.0 - (beta ** state['step']))
-                        sqrt_v = v_hat.sqrt().clamp_min(0.0)
-                        denom = (eps + sqrt_v)
-                        gamma = - (1.0 - beta) * raw_grad * (sqrt_v / (denom * denom))
+                    sqrt_v = v.sqrt().clamp_min(0.0)
+                    denom = (eps + sqrt_v)
+                    gamma = - (1.0 - beta) * raw_grad * (sqrt_v / (denom * denom))
                     update = update + lr * gamma
 
                 # Add Langevin noise if requested:
@@ -535,15 +707,50 @@ class pSGLD(torch.optim.Optimizer):
         return loss
 
     @torch.no_grad()
+    def grad_vs_noise_geomean(self) -> float:
+        stats = self.grad_vs_noise_stats()
+        return stats.get("gm", float("nan"))
+
+    @torch.no_grad()
     def grad_vs_noise_stats(self) -> dict:
         """
         Compute statistics (GeoMean, Median, P10, P90, Min, Max) of the ratio:
         (update variance from minibatch gradient noise) / (injected Langevin noise variance).
         """
         eps = 1e-30
-        any_noise = False
+
+        def _summarize(cat_ratios: torch.Tensor) -> dict:
+            if cat_ratios is None or (not isinstance(cat_ratios, torch.Tensor)) or cat_ratios.numel() == 0:
+                return {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            # Geometric Mean (clamped to avoid log(0))
+            log_mean = torch.log(cat_ratios.clamp_min(1e-20)).mean()
+            gm = math.exp(log_mean.item())
+            median = cat_ratios.median().item()
+            try:
+                x = cat_ratios
+                n = int(x.numel())
+                def _k(q: float) -> int:
+                    return int(max(1, min(n, round(q * (n - 1)) + 1)))
+                p10 = float(torch.kthvalue(x, _k(0.10)).values.item())
+                p90 = float(torch.kthvalue(x, _k(0.90)).values.item())
+            except Exception:
+                p10 = float("nan")
+                p90 = float("nan")
+            return {
+                "gm": float(gm),
+                "median": float(median),
+                "p10": float(p10),
+                "p90": float(p90),
+                "min": float(cat_ratios.min().item()),
+                "max": float(cat_ratios.max().item()),
+            }
+
+        any_noise_global = False
         all_ratios = []
-        for group in self.param_groups:
+        all_dt_ratios = []
+        per_group = []
+
+        for gi, group in enumerate(self.param_groups):
             lr = float(group.get('lr', 0.0))
             beta = float(group.get('beta', 0.99))
             eps_g = float(group.get('eps', 1e-5))
@@ -554,10 +761,17 @@ class pSGLD(torch.optim.Optimizer):
             temperature = float(group.get('temperature', 1.0))
             # If this group injects any noise, flag it
             if add_noise and noise_scale > 0.0 and temperature > 0.0:
-                any_noise = True
+                any_noise_global = True
             # Skip groups with no parameters or undefined lr
             if lr <= 0.0:
+                per_group.append({
+                    "group_name": str(group.get("group_name", f"group{gi}")),
+                    **_summarize(torch.tensor([], device=self.param_groups[0]["params"][0].device) if (self.param_groups and self.param_groups[0].get("params")) else torch.tensor([])),
+                })
                 continue
+            any_noise_group = bool(add_noise and noise_scale > 0.0 and temperature > 0.0)
+            group_ratios = []
+            group_dt_ratios = []
             for p in group['params']:
                 if p is None:
                     continue
@@ -577,6 +791,10 @@ class pSGLD(torch.optim.Optimizer):
                             # Use diag of M^{-1} as a per-parameter variance proxy
                             G = torch.diagonal(M_inv, dim1=-2, dim2=-1)  # (N,4)
                         else:
+                            G = torch.ones_like(ema_g)
+                    elif precond in {"monge", "shampoo"}:
+                        G = state.get("precond_diag", None)
+                        if G is None or not isinstance(G, torch.Tensor):
                             G = torch.ones_like(ema_g)
                     else:
                         v = state.get('exp_avg_sq', None)
@@ -599,43 +817,60 @@ class pSGLD(torch.optim.Optimizer):
                 ratio = (num / denom).clamp_min(1e-30)
                 finite_mask = torch.isfinite(ratio)
                 if finite_mask.any():
-                    all_ratios.append(ratio[finite_mask].flatten())
+                    rr = ratio[finite_mask].flatten()
+                    all_ratios.append(rr)
+                    group_ratios.append(rr)
+                # Track dt column (index 3) for hypocenter-like tensors (N,4).
+                if ratio.ndim == 2 and int(ratio.shape[1]) == 4:
+                    dt_ratio = ratio[:, 3]
+                    dt_mask = torch.isfinite(dt_ratio)
+                    if dt_mask.any():
+                        rdt = dt_ratio[dt_mask].flatten()
+                        all_dt_ratios.append(rdt)
+                        group_dt_ratios.append(rdt)
 
-        if not any_noise or not all_ratios:
-            return {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
-        
-        cat_ratios = torch.cat(all_ratios)
-        if cat_ratios.numel() == 0:
-             return {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            # Per-group summary (only meaningful when this group actually injects noise)
+            if any_noise_group and group_ratios:
+                gcat = torch.cat(group_ratios)
+                gstats = _summarize(gcat)
+            else:
+                gstats = {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            if any_noise_group and group_dt_ratios:
+                gdt = torch.cat(group_dt_ratios)
+                gdt_stats = _summarize(gdt)
+                gstats["dt_gm"] = float(gdt_stats.get("gm", 0.0))
+                gstats["dt_median"] = float(gdt_stats.get("median", 0.0))
+            else:
+                gstats["dt_gm"] = 0.0
+                gstats["dt_median"] = 0.0
+            gstats["group_name"] = str(group.get("group_name", f"group{gi}"))
+            per_group.append(gstats)
 
-        # Geometric Mean (clamped to avoid log(0))
-        log_mean = torch.log(cat_ratios.clamp_min(1e-20)).mean()
-        gm = math.exp(log_mean.item())
-        
-        # Median and other stats
-        median = cat_ratios.median().item()
-        # Quantiles (selection to avoid full sort)
-        try:
-            x = cat_ratios
-            n = int(x.numel())
-            def _k(q: float) -> int:
-                return int(max(1, min(n, round(q * (n - 1)) + 1)))
-            p10 = float(torch.kthvalue(x, _k(0.10)).values.item())
-            p90 = float(torch.kthvalue(x, _k(0.90)).values.item())
-        except Exception:
-            p10 = float("nan")
-            p90 = float("nan")
-        min_val = cat_ratios.min().item()
-        max_val = cat_ratios.max().item()
-        
-        return {"gm": gm, "median": median, "p10": p10, "p90": p90, "min": min_val, "max": max_val}
+        # Global summary
+        if (not any_noise_global) or (not all_ratios):
+            out = {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0, "dt_gm": 0.0, "dt_median": 0.0}
+            out["per_group"] = per_group
+            return out
+
+        cat_ratios = torch.cat(all_ratios) if all_ratios else torch.tensor([])
+        out = _summarize(cat_ratios)
+        if all_dt_ratios:
+            dt_cat = torch.cat(all_dt_ratios)
+            dt_stats = _summarize(dt_cat)
+            out["dt_gm"] = float(dt_stats.get("gm", 0.0))
+            out["dt_median"] = float(dt_stats.get("median", 0.0))
+        else:
+            out["dt_gm"] = 0.0
+            out["dt_median"] = 0.0
+        out["per_group"] = per_group
+        return out
 
     @torch.no_grad()
     def temperature_stats(self) -> dict:
         """
-        Placeholder for temperature statistics. SGLD does not have a stationary 
-        momentum distribution, so thermal energy diagnostics are less direct 
-         than in SGHMC.
+        Placeholder for temperature statistics. SGLD does not have a stationary
+        momentum distribution, so thermal energy diagnostics are less direct
+        than in SGHMC.
         """
         return {
             "msq_gm": float("nan"), "msq_median": float("nan"),
@@ -643,6 +878,321 @@ class pSGLD(torch.optim.Optimizer):
             "msq_median_over_target": float("nan"),
             "var_median_over_target": float("nan")
         }
+
+
+class AdaptiveDriftSGLDAdam(torch.optim.Optimizer):
+    """
+    SGLD with adaptive drift (Adam-variant) from:
+      Kim, Song, Liang (2020) "Stochastic Gradient Langevin Dynamics Algorithms with Adaptive Drifts".
+
+    Update:
+      theta <- theta - lr * (g + a * A) + sqrt(2 * lr * T) * noise
+    where A is an Adam-style normalized momentum term:
+      m <- beta1 * m + (1 - beta1) * g_adapt
+      v <- beta2 * v + (1 - beta2) * g_adapt^2
+      A = m_hat / (sqrt(v_hat) + eps)
+    """
+
+    def __init__(
+        self,
+        params,
+        *,
+        n_obs: int,
+        lr: float = 1e-3,
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        eps_adam: float = 1e-8,
+        drift_scale: float = 1.0,
+        add_noise: bool = True,
+    ) -> None:
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= beta1 < 1.0:
+            raise ValueError(f"Invalid beta1: {beta1}")
+        if not 0.0 <= beta2 < 1.0:
+            raise ValueError(f"Invalid beta2: {beta2}")
+        if not 0.0 < eps_adam or not math.isfinite(float(eps_adam)):
+            raise ValueError(f"Invalid eps_adam: {eps_adam}")
+        if not 0.0 <= drift_scale or not math.isfinite(float(drift_scale)):
+            raise ValueError(f"Invalid drift_scale: {drift_scale}")
+        if n_obs <= 0:
+            raise ValueError(f"Invalid n_obs: {n_obs}")
+
+        defaults = dict(
+            lr=float(lr),
+            beta1=float(beta1),
+            beta2=float(beta2),
+            eps_adam=float(eps_adam),
+            drift_scale=float(drift_scale),
+            n_obs=int(n_obs),
+            add_noise=bool(add_noise),
+            temperature=1.0,
+            noise_scale=1.0,
+            preconditioning=False,
+            preconditioner="none",
+            freeze_preconditioner=False,
+            # Compatibility keys for logging/helpers
+            beta=float(beta2),
+            eps=float(eps_adam),
+            grad_ema_beta=0.99,
+        )
+        super().__init__(params, defaults)
+
+    def set_lr(self, new_lr: float) -> None:
+        for g in self.param_groups:
+            g["lr"] = float(new_lr)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = float(group.get("lr", 0.0))
+            beta1 = float(group.get("beta1", 0.9))
+            beta2 = float(group.get("beta2", 0.999))
+            eps_adam = float(group.get("eps_adam", 1e-8))
+            drift_scale = float(group.get("drift_scale", 1.0))
+            n_obs = int(group.get("n_obs", 1))
+            add_noise = bool(group.get("add_noise", True))
+            noise_scale = float(group.get("noise_scale", 1.0))
+            grad_ema_beta = float(group.get("grad_ema_beta", 0.99))
+
+            if not math.isfinite(noise_scale) or noise_scale < 0.0:
+                noise_scale = 0.0
+
+            for p in group["params"]:
+                if p is None or p.grad is None:
+                    continue
+
+                grad_mean = p.grad.data
+                # Optional gauge projection (remove translation mode before adaptation).
+                try:
+                    gauge_enable = bool(getattr(self, "_gauge_project_enable", False))
+                    gauge_param = getattr(self, "_gauge_project_param", None)
+                    if gauge_enable and (gauge_param is p):
+                        if isinstance(grad_mean, torch.Tensor) and grad_mean.ndim == 2 and int(grad_mean.shape[1]) >= 4:
+                            dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                            mode = str(getattr(self, "_gauge_project_mode", "global"))
+                            cid = getattr(self, "_gauge_cluster_ids", None)
+                            cc = getattr(self, "_gauge_cluster_counts", None)
+                            project_event_mean_inplace(grad_mean, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                except Exception:
+                    pass
+
+                # Algorithm 1 uses mean gradient g_t (no N scaling).
+                drift_grad = grad_mean
+
+                dd_degree = getattr(p, "_dd_degree", None)
+                if dd_degree is not None:
+                    try:
+                        adapt_grad = grad_mean / dd_degree
+                    except Exception:
+                        adapt_grad = grad_mean
+                else:
+                    adapt_grad = grad_mean
+
+                state = self.state[p]
+                if "step" not in state:
+                    state["step"] = 0
+                    state["m"] = torch.zeros_like(p)
+                    state["v"] = torch.zeros_like(p)
+                    state["ema_g"] = torch.zeros_like(p)
+                    state["ema_g2"] = torch.zeros_like(p)
+
+                state["step"] += 1
+                t = int(state["step"])
+                m = state.get("m", None)
+                v = state.get("v", None)
+                if m is None or not isinstance(m, torch.Tensor) or m.shape != p.shape:
+                    m = torch.zeros_like(p)
+                    state["m"] = m
+                if v is None or not isinstance(v, torch.Tensor) or v.shape != p.shape:
+                    v = torch.zeros_like(p)
+                    state["v"] = v
+
+                m.mul_(beta1).add_(adapt_grad, alpha=(1.0 - beta1))
+                v.mul_(beta2).addcmul_(adapt_grad, adapt_grad, value=(1.0 - beta2))
+
+                # Algorithm 1 uses uncorrected moments and lambda inside the sqrt.
+                adapt = m / (v.add(eps_adam).sqrt())
+
+                # Update EMA stats (drift-scaled gradients) for diagnostics.
+                ema_g = state.get("ema_g", None)
+                ema_g2 = state.get("ema_g2", None)
+                if ema_g is None:
+                    ema_g = torch.zeros_like(p)
+                    state["ema_g"] = ema_g
+                if ema_g2 is None:
+                    ema_g2 = torch.zeros_like(p)
+                    state["ema_g2"] = ema_g2
+                ema_g.mul_(grad_ema_beta).add_(drift_grad, alpha=(1.0 - grad_ema_beta))
+                ema_g2.mul_(grad_ema_beta).addcmul_(drift_grad, drift_grad, value=(1.0 - grad_ema_beta))
+
+                # Total drift = (lr/2) * (g + a*A)
+                update = 0.5 * lr * (drift_grad + drift_scale * adapt)
+
+                if add_noise and noise_scale > 0.0:
+                    # Algorithm 1: noise ~ sqrt(lr / N)
+                    std = math.sqrt(lr / float(max(1, n_obs))) * noise_scale
+                    noise = torch.randn_like(p) * std
+                    # Optional gauge projection of injected noise.
+                    try:
+                        if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                            if bool(getattr(self, "_gauge_project_apply_noise", True)):
+                                dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                                mode = str(getattr(self, "_gauge_project_mode", "global"))
+                                cid = getattr(self, "_gauge_cluster_ids", None)
+                                cc = getattr(self, "_gauge_cluster_counts", None)
+                                project_event_mean_inplace(noise, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                    except Exception:
+                        pass
+                    update = update + noise
+
+                # Optional gauge projection of total update.
+                try:
+                    if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                        dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                        mode = str(getattr(self, "_gauge_project_mode", "global"))
+                        cid = getattr(self, "_gauge_cluster_ids", None)
+                        cc = getattr(self, "_gauge_cluster_counts", None)
+                        project_event_mean_inplace(update, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                except Exception:
+                    pass
+
+                p.add_(-update)
+
+        return loss
+
+    @torch.no_grad()
+    def grad_vs_noise_stats(self) -> dict:
+        """
+        Compute statistics (GeoMean, Median, P10, P90, Min, Max) of the ratio:
+        (update variance from minibatch gradient noise) / (injected Langevin noise variance).
+        """
+        eps = 1e-30
+
+        def _summarize(cat_ratios: torch.Tensor) -> dict:
+            if cat_ratios is None or (not isinstance(cat_ratios, torch.Tensor)) or cat_ratios.numel() == 0:
+                return {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            log_mean = torch.log(cat_ratios.clamp_min(1e-20)).mean()
+            gm = math.exp(log_mean.item())
+            median = cat_ratios.median().item()
+            try:
+                x = cat_ratios
+                n = int(x.numel())
+                def _k(q: float) -> int:
+                    return int(max(1, min(n, round(q * (n - 1)) + 1)))
+                p10 = float(torch.kthvalue(x, _k(0.10)).values.item())
+                p90 = float(torch.kthvalue(x, _k(0.90)).values.item())
+            except Exception:
+                p10 = float("nan")
+                p90 = float("nan")
+            return {
+                "gm": float(gm),
+                "median": float(median),
+                "p10": float(p10),
+                "p90": float(p90),
+                "min": float(cat_ratios.min().item()),
+                "max": float(cat_ratios.max().item()),
+            }
+
+        any_noise_global = False
+        all_ratios = []
+        all_dt_ratios = []
+        per_group = []
+        all_var_g = []
+        all_var_noise = []
+
+        for gi, group in enumerate(self.param_groups):
+            lr = float(group.get("lr", 0.0))
+            add_noise = bool(group.get("add_noise", True))
+            noise_scale = float(group.get("noise_scale", 1.0))
+            temperature = float(group.get("temperature", 1.0))
+            if add_noise and noise_scale > 0.0:
+                any_noise_global = True
+            if lr <= 0.0:
+                per_group.append({
+                    "group_name": str(group.get("group_name", f"group{gi}")),
+                    **_summarize(torch.tensor([], device=self.param_groups[0]["params"][0].device) if (self.param_groups and self.param_groups[0].get("params")) else torch.tensor([])),
+                })
+                continue
+            any_noise_group = bool(add_noise and noise_scale > 0.0)
+            group_ratios = []
+            group_dt_ratios = []
+            for p in group.get("params", []):
+                if p is None:
+                    continue
+                state = self.state.get(p, {})
+                if "ema_g" not in state or "ema_g2" not in state:
+                    continue
+                ema_g = state["ema_g"]
+                ema_g2 = state["ema_g2"]
+                var_g = (ema_g2 - ema_g * ema_g).clamp_min(0.0)
+                n_obs = int(group.get("n_obs", 1))
+                var_noise = (lr / float(max(1, n_obs))) * (noise_scale * noise_scale)
+                denom = var_g.new_full(var_g.shape, max(var_noise, eps))
+                num = (lr * lr) * var_g
+                ratio = (num / denom).clamp_min(1e-30)
+                finite_mask = torch.isfinite(ratio)
+                if finite_mask.any():
+                    rr = ratio[finite_mask].flatten()
+                    all_ratios.append(rr)
+                    group_ratios.append(rr)
+                    all_var_g.append(var_g[finite_mask].flatten())
+                    all_var_noise.append(var_noise.new_full(var_g[finite_mask].shape, var_noise).flatten())
+                # Track dt column (index 3) for hypocenter-like tensors (N,4).
+                if ratio.ndim == 2 and int(ratio.shape[1]) == 4:
+                    dt_ratio = ratio[:, 3]
+                    dt_mask = torch.isfinite(dt_ratio)
+                    if dt_mask.any():
+                        rdt = dt_ratio[dt_mask].flatten()
+                        all_dt_ratios.append(rdt)
+                        group_dt_ratios.append(rdt)
+
+            if any_noise_group and group_ratios:
+                gcat = torch.cat(group_ratios)
+                gstats = _summarize(gcat)
+            else:
+                gstats = {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0}
+            if any_noise_group and group_dt_ratios:
+                gdt = torch.cat(group_dt_ratios)
+                gdt_stats = _summarize(gdt)
+                gstats["dt_gm"] = float(gdt_stats.get("gm", 0.0))
+                gstats["dt_median"] = float(gdt_stats.get("median", 0.0))
+            else:
+                gstats["dt_gm"] = 0.0
+                gstats["dt_median"] = 0.0
+            gstats["group_name"] = str(group.get("group_name", f"group{gi}"))
+            per_group.append(gstats)
+
+        if (not any_noise_global) or (not all_ratios):
+            out = {"gm": 0.0, "median": 0.0, "p10": 0.0, "p90": 0.0, "min": 0.0, "max": 0.0, "dt_gm": 0.0, "dt_median": 0.0}
+            out["per_group"] = per_group
+            return out
+
+        cat_ratios = torch.cat(all_ratios) if all_ratios else torch.tensor([])
+        out = _summarize(cat_ratios)
+        if all_dt_ratios:
+            dt_cat = torch.cat(all_dt_ratios)
+            dt_stats = _summarize(dt_cat)
+            out["dt_gm"] = float(dt_stats.get("gm", 0.0))
+            out["dt_median"] = float(dt_stats.get("median", 0.0))
+        else:
+            out["dt_gm"] = 0.0
+            out["dt_median"] = 0.0
+        try:
+            if all_var_g:
+                out["var_g_median"] = float(torch.cat(all_var_g).median().item())
+            if all_var_noise:
+                out["var_noise_median"] = float(torch.cat(all_var_noise).median().item())
+        except Exception:
+            pass
+        out["per_group"] = per_group
+        return out
+
 
     @torch.no_grad()
     def grad_vs_noise_geomean(self) -> float:
@@ -657,7 +1207,7 @@ class pSGLD(torch.optim.Optimizer):
         """
         Return summary stats of the preconditioner (dict):
           {min, p25, median, p75, max}
-        - rmsprop/adam: stats of diagonal G
+        - rmsprop: stats of diagonal G
         - matrix/blockdiag_fisher: stats of diagonal entries of M^{-1} (from state['matrix_inv'])
         """
         try:

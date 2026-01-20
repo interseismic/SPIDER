@@ -15,13 +15,11 @@ from typing import Any, Dict, List, Tuple
 _FORBIDDEN_TOPLEVEL_KEYS: Tuple[str, ...] = (
     # Prior enable toggles
     "prior_event_enable",
-    "prior_centroid_enable",
     "prior_noise_enable",
     "prior_laplacian_enable",
     "prior_laplacian_phase4_only",
-    # Event / centroid prior params
+    # Event prior params
     "prior_event_std",
-    "prior_centroid_std",
     # Hierarchical event prior
     "hierarchical_event_prior",
     "hierarchical_prior_dof",
@@ -182,6 +180,10 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
             raise _err("priors.event.hyper.type", "supported types: 'wishart_precision'")
         ev_hyper_params = _require_dict(_require(ev_hyper, "params", "priors.event.hyper"), "priors.event.hyper.params")
         ev_hyper_df = _require_pos_float(_require(ev_hyper_params, "df", "priors.event.hyper.params"), "priors.event.hyper.params.df")
+        # Wishart(df, ·) is only well-defined for df > p-1, where p is the dimension (here p=4 for [dx,dy,dz,dt]).
+        # Using a smaller df can make sampling/updates unstable or undefined.
+        if not (float(ev_hyper_df) > 3.0):
+            raise _err("priors.event.hyper.params.df", "must be > 3 (Wishart dof constraint for 4D event prior)")
         # Explicit scale for hyperprior (no implicit coupling to base std)
         ev_hyper_scale_std = _require_float_list(
             _require(ev_hyper_params, "scale_std", "priors.event.hyper.params"),
@@ -204,21 +206,6 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
         ev_hyper_scale_std = None
         ev_hyper_every = None
 
-    # ---- Centroid prior ----
-    cen = _require_dict(_require(priors, "centroid", "priors"), "priors.centroid")
-    cen_enabled = _require_bool(_require(cen, "enabled", "priors.centroid"), "priors.centroid.enabled")
-    cen_type = _require_str(_require(cen, "type", "priors.centroid"), "priors.centroid.type").lower()
-    if cen_type not in {"gaussian"}:
-        raise _err("priors.centroid.type", "supported types: 'gaussian'")
-    cen_params = _require_dict(_require(cen, "params", "priors.centroid"), "priors.centroid.params")
-    if cen_enabled:
-        cen_std = _require_float_list(_require(cen_params, "std", "priors.centroid.params"), "priors.centroid.params.std", length=4)
-    else:
-        cen_std = None
-
-    if "schedule" in cen:
-        raise _err("priors.centroid.schedule", "removed; priors are active in all phases when enabled (delete this block)")
-
     # Noise prior removed (start fresh): fixed phase_unc only, no σ learning.
     if "noise" in priors:
         raise _err("priors.noise", "removed; delete this block from your config")
@@ -226,7 +213,6 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
     # ---- Materialize internal flat keys (used elsewhere in the codebase) ----
     # Enables
     params["prior_event_enable"] = ev_enabled
-    params["prior_centroid_enable"] = cen_enabled
 
     # Event prior
     if ev_enabled:
@@ -237,10 +223,6 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
         params["hierarchical_prior_dof"] = float(ev_hyper_df)
         params["_hierarchical_scale_std"] = ev_hyper_scale_std
         params["_hierarchical_update_every_epochs"] = int(ev_hyper_every)
-
-    # Centroid prior
-    if cen_enabled:
-        params["prior_centroid_std"] = cen_std
 
     return params
 

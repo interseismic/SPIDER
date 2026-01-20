@@ -9,7 +9,7 @@ import polars as pl
 import torch
 import torch.nn as nn
 from pyproj import Proj
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import connected_components
 
 from spider.core.state import LocateState, _attach_dd_preconditioner_metric, _parse_clamp_tensor
@@ -184,12 +184,12 @@ def _build_initial_state(
     batch_size_warmup = params["batch_size_warmup"]
     batch_size_sgld = params["batch_size_sgld"]
     N = dtimes.shape[0]
+    info(f"Differential times rows N={int(N):,}", section="DATA")
 
     # Priors: strict enable keys are materialized by `validate_and_materialize_priors`.
     # If disabled, we create placeholder distributions purely to satisfy existing plumbing; they
     # are never used in the loss because compute_prior_loss gates by enable flags.
     event_prior_enable = bool(params["prior_event_enable"])
-    centroid_prior_enable = bool(params["prior_centroid_enable"])
 
     prior_event_std = params.get("prior_event_std", None)
     if event_prior_enable and prior_event_std is None:
@@ -197,19 +197,9 @@ def _build_initial_state(
     if prior_event_std is None:
         prior_event_std = [9999.0, 9999.0, 9999.0, 9999.0]
 
-    prior_centroid_std = params.get("prior_centroid_std", None)
-    if centroid_prior_enable and prior_centroid_std is None:
-        raise KeyError("prior_centroid_std is required when prior_centroid_enable=true")
-    if prior_centroid_std is None:
-        prior_centroid_std = [9999.0, 9999.0, 9999.0, 9999.0]
-
     prior_event = torch.distributions.multivariate_normal.MultivariateNormal(
         loc=torch.zeros(len(prior_event_std), device=device, dtype=torch.float32),
         covariance_matrix=torch.diag(torch.tensor(prior_event_std, device=device, dtype=torch.float32) ** 2),
-    )
-    prior_centroid = torch.distributions.multivariate_normal.MultivariateNormal(
-        loc=torch.zeros(len(prior_centroid_std), device=device, dtype=torch.float32),
-        covariance_matrix=torch.diag(torch.tensor(prior_centroid_std, device=device, dtype=torch.float32) ** 2),
     )
 
     # Noise scales: fixed (scalar phase_unc only)
@@ -223,7 +213,7 @@ def _build_initial_state(
     optimizer = torch.optim.Adam(opt_params, lr=params["lr_warmup"])
     clamp_abs_dX = _parse_clamp_tensor(params, device)
 
-    # Cluster analysis for centroid priors
+    # Cluster analysis for connected components (used by gauge projection and graph-aware priors)
     # Build adjacency matrix from event pairings
     n_events = origins0.shape[0]
     row = np.array(evid1_idx)
@@ -253,6 +243,90 @@ def _build_initial_state(
         if n_components > 1:
             top_k = sorted(c_sizes, reverse=True)[:5]
             info(f"Largest clusters top5={top_k}", section="GRAPH")
+
+    # Optional: DD graph k-hop clustering for shared_event_re (greedy non-overlapping balls).
+    def _build_khop_clusters(indptr: np.ndarray, indices: np.ndarray, k: int) -> np.ndarray:
+        n = int(indptr.shape[0] - 1)
+        labels = -np.ones((n,), dtype=np.int64)
+        if k <= 0:
+            labels[:] = np.arange(n, dtype=np.int64)
+            return labels
+        from collections import deque
+        cid = 0
+        for i in range(n):
+            if labels[i] != -1:
+                continue
+            labels[i] = cid
+            dq = deque([i])
+            depth = deque([0])
+            while dq:
+                v = dq.popleft()
+                d = depth.popleft()
+                if d >= k:
+                    continue
+                start = int(indptr[v])
+                end = int(indptr[v + 1])
+                for nb in indices[start:end]:
+                    if labels[nb] == -1:
+                        labels[nb] = cid
+                        dq.append(int(nb))
+                        depth.append(d + 1)
+            cid += 1
+        return labels
+
+    try:
+        se_cluster_mode = str(params.get("_shared_event_re_cluster_mode", "none")).strip().lower()
+        se_cluster_k_raw = params.get("_shared_event_re_cluster_k", 1)
+        se_cluster_k = int(se_cluster_k_raw) if se_cluster_k_raw is not None else 1
+    except Exception:
+        se_cluster_mode = "none"
+        se_cluster_k = 1
+    if se_cluster_mode == "component":
+        try:
+            params["_shared_event_re_cluster_ids"] = cluster_ids
+            params["_shared_event_re_cluster_k"] = int(se_cluster_k)
+            counts_k = np.bincount(labels, minlength=int(n_components))
+            if counts_k.size > 0:
+                cmin = int(counts_k.min())
+                cmax = int(counts_k.max())
+                cmed = float(np.median(counts_k))
+                ns = int(np.sum(counts_k == 1))
+                info(
+                    f"shared_event_re component clusters "
+                    f"n_clusters={int(counts_k.size)} min={cmin} max={cmax} median={cmed:.1f} singletons={ns}",
+                    section="GRAPH",
+                )
+        except Exception as e:
+            warn(f"shared_event_re component clustering failed; falling back to no clustering: {e}", section="GRAPH")
+    elif se_cluster_mode == "dd_khop":
+        try:
+            row_np = np.asarray(evid1_idx, dtype=np.int64)
+            col_np = np.asarray(evid2_idx, dtype=np.int64)
+            if row_np.size > 0:
+                row_all = np.concatenate([row_np, col_np], axis=0)
+                col_all = np.concatenate([col_np, row_np], axis=0)
+                data_all = np.ones((int(row_all.shape[0]),), dtype=np.int8)
+                adj_csr = csr_matrix((data_all, (row_all, col_all)), shape=(n_events, n_events))
+                khop_labels = _build_khop_clusters(adj_csr.indptr, adj_csr.indices, int(se_cluster_k))
+            else:
+                khop_labels = np.arange(int(n_events), dtype=np.int64)
+            khop_ids = torch.tensor(khop_labels, dtype=torch.int64, device=device)
+            params["_shared_event_re_cluster_ids"] = khop_ids
+            params["_shared_event_re_cluster_k"] = int(se_cluster_k)
+            # Stats
+            counts_k = np.bincount(khop_labels, minlength=int(khop_labels.max() + 1) if khop_labels.size > 0 else 0)
+            if counts_k.size > 0:
+                cmin = int(counts_k.min())
+                cmax = int(counts_k.max())
+                cmed = float(np.median(counts_k))
+                ns = int(np.sum(counts_k == 1))
+                info(
+                    f"shared_event_re k-hop clusters k={int(se_cluster_k)} "
+                    f"n_clusters={int(counts_k.size)} min={cmin} max={cmax} median={cmed:.1f} singletons={ns}",
+                    section="GRAPH",
+                )
+        except Exception as e:
+            warn(f"shared_event_re k-hop clustering failed; falling back to no clustering: {e}", section="GRAPH")
 
     # Optional: unique event-event pair count distribution (useful for graph-aware features like blockdiag_fisher).
     pair_count_stats_enable = bool(params.get("pair_count_stats_enable", False))
@@ -402,7 +476,6 @@ def _build_initial_state(
         dd_event_degree=dd_event_degree,
         model=model,
         prior_event=prior_event,
-        prior_centroid=prior_centroid,
         optimizer=optimizer,
         N=N,
         batch_size_warmup=batch_size_warmup,
@@ -426,6 +499,21 @@ def _build_initial_state(
         hierarchical_prior_enable=hierarchical_prior_enable,
         event_precision_matrix=P0_init,
     )
+    # Optional Student-t scale-mixture per-row precision (lambda).
+    try:
+        if bool(params.get("_student_t_scale_enabled", False)):
+            init_mode = str(params.get("_student_t_scale_init", "ones")).strip().lower()
+            nu = float(params.get("_student_t_scale_nu", 4.0))
+            N = int(state.N)
+            if init_mode == "mean" and nu > 2.0 and math.isfinite(nu):
+                init_val = float(nu / max(nu - 2.0, 1e-6))
+            else:
+                init_val = 1.0
+            lam = torch.full((N,), float(init_val), device=device, dtype=torch.float32)
+            state.student_t_lambda = lam
+            params["_student_t_lambda"] = lam
+    except Exception:
+        pass
     # Expose a few runtime tensors in params so modeling.py can implement component-wise correlated
     # likelihoods without needing the full LocateState object.
     try:
@@ -434,6 +522,102 @@ def _build_initial_state(
         params["_runtime_n_components"] = int(n_components)
     except Exception:
         pass
+    # Optional DD-graph random effects (event latents, per phase)
+    try:
+        if bool(params.get("_dd_graph_re_enabled", False)):
+            n_events = int(X_src.shape[0])
+            if n_events <= 0 or II_cpu_np is None or int(II_cpu_np.shape[0]) <= 0:
+                warn("dd_graph_re enabled but no event pairs; disabling.", section="LIKELIHOOD")
+                params["_dd_graph_re_enabled"] = False
+            else:
+                row = np.asarray(II_cpu_np[:, 0], dtype=np.int64)
+                col = np.asarray(II_cpu_np[:, 1], dtype=np.int64)
+                u = np.minimum(row, col)
+                v = np.maximum(row, col)
+                weight_by_count = bool(params.get("_dd_graph_re_weight_by_pair_count", True))
+                if weight_by_count:
+                    pairs = np.stack([u, v], axis=1)
+                    uniq, counts = np.unique(pairs, axis=0, return_counts=True)
+                    u_u = uniq[:, 0]
+                    v_u = uniq[:, 1]
+                    w_u = counts.astype(np.float32)
+                else:
+                    u_u = u
+                    v_u = v
+                    w_u = np.ones_like(u_u, dtype=np.float32)
+                u_t = torch.tensor(u_u, dtype=torch.int64, device=device).contiguous()
+                v_t = torch.tensor(v_u, dtype=torch.int64, device=device).contiguous()
+                w_t = torch.tensor(w_u, dtype=torch.float32, device=device).contiguous()
+                params["_dd_graph_re_u"] = u_t
+                params["_dd_graph_re_v"] = v_t
+                params["_dd_graph_re_w"] = w_t
+                tau_ps = params.get("_dd_graph_re_tau_s", [0.0, 0.0])
+                tau_p = float(tau_ps[0]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+                tau_s = float(tau_ps[1]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+                std_p = float(tau_p) if float(tau_p) > 0.0 else 0.0
+                std_s = float(tau_s) if float(tau_s) > 0.0 else 0.0
+                state.dd_graph_re_b_p = torch.nn.Parameter(torch.randn((n_events,), device=device, dtype=torch.float32) * std_p)
+                state.dd_graph_re_b_s = torch.nn.Parameter(torch.randn((n_events,), device=device, dtype=torch.float32) * std_s)
+                params["_dd_graph_re_b_p"] = state.dd_graph_re_b_p
+                params["_dd_graph_re_b_s"] = state.dd_graph_re_b_s
+                info(
+                    f"Initialized dd_graph_re: events={n_events} edges={int(u_t.numel())} "
+                    f"weight_by_count={bool(weight_by_count)}",
+                    section="LIKELIHOOD",
+                )
+    except Exception as e:
+        warn(f"dd_graph_re init failed: {e}", section="LIKELIHOOD")
+    # Optional explicit slowness_re latents (component + station, per phase).
+    try:
+        if bool(params.get("_slowness_re_explicit_enabled", False)):
+            if int(n_components) <= 0 or int(n_stations) <= 0:
+                warn("slowness_re explicit enabled but n_components or n_stations is zero; disabling.", section="LIKELIHOOD")
+                params["_slowness_re_explicit_enabled"] = False
+            else:
+                tau_ps = params.get("_slowness_re_tau_s", [0.0, 0.0])
+                tau_sta_ps = params.get("_slowness_re_tau_station_s", [0.0, 0.0])
+                tau_p = float(tau_ps[0]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+                tau_s = float(tau_ps[1]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
+                tau_sta_p = float(tau_sta_ps[0]) if isinstance(tau_sta_ps, (list, tuple)) and len(tau_sta_ps) >= 2 else float(tau_sta_ps)
+                tau_sta_s = float(tau_sta_ps[1]) if isinstance(tau_sta_ps, (list, tuple)) and len(tau_sta_ps) >= 2 else float(tau_sta_ps)
+                tau_units = str(params.get("_slowness_re_tau_units", "abs")).strip().lower()
+                if tau_units == "vel_frac":
+                    vp = float(params.get("_slowness_re_vp_km_s", 6.0))
+                    vs = float(params.get("_slowness_re_vs_km_s", 3.5))
+                    tau_p = tau_p / max(vp, 1e-6)
+                    tau_s = tau_s / max(vs, 1e-6)
+                    tau_sta_p = tau_sta_p / max(vp, 1e-6)
+                    tau_sta_s = tau_sta_s / max(vs, 1e-6)
+                std_cp = float(tau_p) if float(tau_p) > 0.0 else 0.0
+                std_cs = float(tau_s) if float(tau_s) > 0.0 else 0.0
+                std_sp = float(tau_sta_p) if float(tau_sta_p) > 0.0 else 0.0
+                std_ss = float(tau_sta_s) if float(tau_sta_s) > 0.0 else 0.0
+                state.slowness_re_comp_p = torch.nn.Parameter(torch.randn((int(n_components),), device=device, dtype=torch.float32) * std_cp)
+                state.slowness_re_comp_s = torch.nn.Parameter(torch.randn((int(n_components),), device=device, dtype=torch.float32) * std_cs)
+                state.slowness_re_station_p = torch.nn.Parameter(torch.randn((int(n_stations),), device=device, dtype=torch.float32) * std_sp)
+                state.slowness_re_station_s = torch.nn.Parameter(torch.randn((int(n_stations),), device=device, dtype=torch.float32) * std_ss)
+                params["_slowness_re_explicit_comp_p"] = state.slowness_re_comp_p
+                params["_slowness_re_explicit_comp_s"] = state.slowness_re_comp_s
+                params["_slowness_re_explicit_station_p"] = state.slowness_re_station_p
+                params["_slowness_re_explicit_station_s"] = state.slowness_re_station_s
+                try:
+                    cp_rms = float(state.slowness_re_comp_p.detach().square().mean().sqrt().item()) if int(n_components) > 0 else 0.0
+                    cs_rms = float(state.slowness_re_comp_s.detach().square().mean().sqrt().item()) if int(n_components) > 0 else 0.0
+                    sp_rms = float(state.slowness_re_station_p.detach().square().mean().sqrt().item()) if int(n_stations) > 0 else 0.0
+                    ss_rms = float(state.slowness_re_station_s.detach().square().mean().sqrt().item()) if int(n_stations) > 0 else 0.0
+                    info(
+                        f"Initialized slowness_re explicit latents: comps={int(n_components)} stations={int(n_stations)} "
+                        f"init_rms_comp_p={cp_rms:.3g} init_rms_comp_s={cs_rms:.3g} "
+                        f"init_rms_sta_p={sp_rms:.3g} init_rms_sta_s={ss_rms:.3g}",
+                        section="LIKELIHOOD",
+                    )
+                except Exception:
+                    info(
+                        f"Initialized slowness_re explicit latents: comps={int(n_components)} stations={int(n_stations)}",
+                        section="LIKELIHOOD",
+                    )
+    except Exception as e:
+        warn(f"slowness_re explicit init failed: {e}", section="LIKELIHOOD")
     _attach_dd_preconditioner_metric(state)
     # Initialize event-centric batching flag (mapping is built lazily when used)
     state.event_batch_enable = bool(params.get("event_batch_enable", False))

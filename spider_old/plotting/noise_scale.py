@@ -9,6 +9,9 @@ import torch
 import json
 import h5py
 
+from spider.core.config_schema import validate_and_materialize_block1
+from spider.core.priors_config import validate_and_materialize_priors
+
 
 def _load_noise_log_scale_series(checkpoint_dir: str) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -133,11 +136,16 @@ def plot_noise_scale_posterior_vs_prior(
             print(f"plot_noise_scale_posterior_vs_prior: failed to read params from '{params}': {e}")
             return False
 
-    # Resolve samples store path from nested io block if needed
-    if isinstance(params, dict) and ("samples_outfile" not in params):
-        io_cfg = params.get("io", None)
-        if isinstance(io_cfg, dict) and ("samples_outfile" in io_cfg):
-            params["samples_outfile"] = io_cfg.get("samples_outfile")
+    # If params is a nested config dict (new schema), materialize legacy flat keys for this plot.
+    # Do NOT attempt to re-validate if the caller already passed a materialized dict (which contains
+    # legacy flat keys and would be rejected by strict validators).
+    if isinstance(params, dict) and ("io" in params) and ("dtime_file" not in params):
+        try:
+            params = validate_and_materialize_block1(params)
+            params = validate_and_materialize_priors(params)
+        except Exception as e:
+            print(f"plot_noise_scale_posterior_vs_prior: invalid params config: {e}")
+            return False
 
     # Import matplotlib lazily so importing spider.plotting works even in environments without a
     # working matplotlib binary (common with NumPy 2.x ABI mismatches).
@@ -161,7 +169,7 @@ def plot_noise_scale_posterior_vs_prior(
         cdir = checkpoint_dir or params.get("checkpoint_dir", "checkpoints/")
         log_scales, epochs = _load_noise_log_scale_series(cdir)
         if log_scales.size == 0:
-            print("plot_noise_scale_posterior_vs_prior: no noise samples found in HDF5 or checkpoints.")
+            print(f"plot_noise_scale_posterior_vs_prior: no noise samples found in HDF5 or checkpoints.")
             return False
 
     # Apply burn-in (drop first burn_in samples)
@@ -213,3 +221,5 @@ def plot_noise_scale_posterior_vs_prior(
     plt.close(fig)
     print(f"Wrote noise scale prior/posterior plot to {out_path}")
     return True
+
+

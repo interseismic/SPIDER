@@ -253,22 +253,23 @@ def validate_and_materialize_block1(params: Dict[str, Any]) -> Dict[str, Any]:
 
 def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Block 2 (hard-break schema): strict nested `inference.phases` + `inference.sampler`.
+    Block 2 (hard-break schema): strict nested `inference.sampler` only.
 
     Required:
-      phases.phase1.epochs (int>=0), phases.phase1.lr (float>0)
-      phases.phase2.epochs, phases.phase3.epochs, phases.phase4.epochs (int>=0)
+      sampler.epochs_per_phase (list[int], length 4, each >=0)
+      sampler.lr (list[float], length 4, each >0)
+        - lr[0] is Phase 1 (MAP), lr[1] Phase 2, lr[2] Phase 3, lr[3] Phase 4
 
-      sampler.backend in {"psgld","sghmc"}
-      sampler.lr (float>0), sampler.temperature (float>=0)
-      sampler.lr_mode (optional str): "absolute" (default) or "per_obs" (psgld/sghmc/adaptive_sghmc helper; see below)
+      sampler.backend in {"psgld","sghmc","adaptive_sghmc","sgnht","adsgld_adam"}
+      sampler.temperature (float>=0)
+      sampler.lr_mode (optional str): "absolute" (default) or "per_obs" (psgld/sghmc/adaptive_sghmc/adsgld_adam helper; see below)
       sampler.preconditioning.enabled (bool)
       sampler.preconditioning.type (string) if enabled
-        - supported (psgld): "rmsprop", "adam", "blockdiag_fisher" (alias: "matrix_ema")
-        - supported (sghmc): "rmsprop", "adam"
+        - supported (psgld): "rmsprop", "blockdiag_fisher" (alias: "matrix_ema"), "monge", "shampoo"
+        - supported (sghmc): "rmsprop"
       sampler.preconditioning.include_gamma (optional bool, default True):
         If true, include the diagonal Γ(θ) correction term in pSGLD when using diagonal
-        preconditioners (rmsprop/adam). This is a low-cost correction from the pSGLD paper.
+        preconditioners (rmsprop). This is a low-cost correction from the pSGLD paper.
       sampler.preconditioning.include_gamma_proxy (optional bool, default False):
         If true and preconditioning.type == "blockdiag_fisher", add a cheap diagonal Γ(θ) proxy
         drift correction even though the preconditioner is matrix-valued. This is NOT the exact
@@ -284,6 +285,8 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
       sampler.sghmc_alpha (>0) iff backend=="sghmc" (no default)
       sampler.dt_lr_mult (optional float>0, default 1.0): multiplier applied to the ΔT gradient (dimension 3)
         to effectively use a different learning rate for the origin-time correction component.
+      sampler.adaptive_drift (required iff backend=="adsgld_adam"):
+        {beta1 (0<=b1<1), beta2 (0<=b2<1), eps (>0), scale (>0)}
     """
     forbidden_present = [k for k in _FORBIDDEN_BLOCK2_TOPLEVEL_KEYS if k in params]
     if forbidden_present:
@@ -294,17 +297,19 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
 
     # Hard break: these blocks moved under `inference.*`.
     if "phases" in params:
-        raise _err("phases", "moved; put this under `inference.phases` (top-level `phases` is no longer supported)")
+        raise _err(
+            "phases",
+            "removed; use `inference.sampler.epochs_per_phase` and `inference.sampler.lr` instead",
+        )
     if "sampler" in params:
         raise _err("sampler", "moved; put this under `inference.sampler` (top-level `sampler` is no longer supported)")
 
     inf = _require_dict(_require(params, "inference", "inference"), "inference")
-
-    phases = _require_dict(_require(inf, "phases", "inference"), "inference.phases")
-    p1 = _require_dict(_require(phases, "phase1", "inference.phases"), "inference.phases.phase1")
-    p2 = _require_dict(_require(phases, "phase2", "inference.phases"), "inference.phases.phase2")
-    p3 = _require_dict(_require(phases, "phase3", "inference.phases"), "inference.phases.phase3")
-    p4 = _require_dict(_require(phases, "phase4", "inference.phases"), "inference.phases.phase4")
+    if "phases" in inf:
+        raise _err(
+            "inference.phases",
+            "removed; use `inference.sampler.epochs_per_phase` and `inference.sampler.lr` instead",
+        )
 
     def _epochs(v: Any, path: str) -> int:
         if not isinstance(v, int):
@@ -313,29 +318,60 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
             raise _err(path, "must be >= 0")
         return int(v)
 
-    phase1_epochs = _epochs(_require(p1, "epochs", "inference.phases.phase1"), "inference.phases.phase1.epochs")
-    lr_warmup = _require_num(_require(p1, "lr", "inference.phases.phase1"), "inference.phases.phase1.lr")
-    if not (lr_warmup > 0.0):
-        raise _err("inference.phases.phase1.lr", "must be > 0")
-    phase2_epochs = _epochs(_require(p2, "epochs", "inference.phases.phase2"), "inference.phases.phase2.epochs")
-    phase3_epochs = _epochs(_require(p3, "epochs", "inference.phases.phase3"), "inference.phases.phase3.epochs")
-    phase4_epochs = _epochs(_require(p4, "epochs", "inference.phases.phase4"), "inference.phases.phase4.epochs")
-
     sampler = _require_dict(_require(inf, "sampler", "inference"), "inference.sampler")
+    epochs_v = _require(sampler, "epochs_per_phase", "inference.sampler")
+    if not isinstance(epochs_v, list):
+        raise _err("inference.sampler.epochs_per_phase", f"expected list, got {type(epochs_v).__name__}")
+    if len(epochs_v) != 4:
+        raise _err("inference.sampler.epochs_per_phase", f"expected list of length 4, got {len(epochs_v)}")
+    epochs_per_phase: List[int] = []
+    for i, xi in enumerate(epochs_v):
+        if not isinstance(xi, int):
+            raise _err(f"inference.sampler.epochs_per_phase[{i}]", f"expected integer, got {type(xi).__name__}")
+        if xi < 0:
+            raise _err(f"inference.sampler.epochs_per_phase[{i}]", "must be >= 0")
+        epochs_per_phase.append(int(xi))
+
+    lr_per_phase = _require_float_list(
+        _require(sampler, "lr", "inference.sampler"),
+        "inference.sampler.lr",
+        length=4,
+    )
+    for i, lr_i in enumerate(lr_per_phase):
+        if not (math.isfinite(lr_i) and lr_i > 0.0):
+            raise _err(f"inference.sampler.lr[{i}]", "must be finite and > 0")
+
+    phase1_epochs = epochs_per_phase[0]
+    phase2_epochs = epochs_per_phase[1]
+    phase3_epochs = epochs_per_phase[2]
+    phase4_epochs = epochs_per_phase[3]
+
+    lr_warmup = float(lr_per_phase[0])
+    lr_phase2 = float(lr_per_phase[1])
+    lr_phase3 = float(lr_per_phase[2])
+    lr_phase4 = float(lr_per_phase[3])
+
+    if not (lr_warmup > 0.0):
+        raise _err("inference.sampler.lr[0]", "must be > 0")
     backend = _require_str(_require(sampler, "backend", "inference.sampler"), "inference.sampler.backend").lower()
-    if backend == "sgnht":
-        raise _err("sampler.backend", "unsupported: 'sgnht' support has been removed; use 'sghmc' or 'psgld'")
-    if backend not in {"psgld", "sghmc", "adaptive_sghmc"}:
-        raise _err("sampler.backend", "supported: 'psgld', 'sghmc', 'adaptive_sghmc'")
-    lr_sampler = _require_num(_require(sampler, "lr", "sampler"), "sampler.lr")
-    if not (lr_sampler > 0.0):
-        raise _err("sampler.lr", "must be > 0")
+    if backend not in {"psgld", "sghmc", "adaptive_sghmc", "sgnht", "adsgld_adam"}:
+        raise _err("sampler.backend", "supported: 'psgld', 'sghmc', 'adaptive_sghmc', 'sgnht', 'adsgld_adam'")
     lr_mode = str(sampler.get("lr_mode", "absolute")).strip().lower()
     if lr_mode not in {"absolute", "per_obs"}:
         raise _err("sampler.lr_mode", "supported: 'absolute', 'per_obs'")
     temperature = _require_num(_require(sampler, "temperature", "sampler"), "sampler.temperature")
     if temperature < 0.0:
         raise _err("sampler.temperature", "must be >= 0")
+
+    # Optional: extra multiplier for injected Langevin noise (Phase 3/4).
+    # This scales the sampler's internal `noise_scale` (not the model noise σ_p/σ_s).
+    # It is useful when you want to keep temperature=1.0 but increase injected noise
+    # to improve mixing / effective temperature for large problems.
+    noise_scale_mult = 1.0
+    if "noise_scale_mult" in sampler and sampler.get("noise_scale_mult", None) is not None:
+        noise_scale_mult = float(_require_num(sampler.get("noise_scale_mult"), "sampler.noise_scale_mult"))
+        if not (noise_scale_mult > 0.0) or (not math.isfinite(noise_scale_mult)):
+            raise _err("sampler.noise_scale_mult", "must be finite and > 0")
 
     # Optional: per-dimension LR multiplier for ΔT (origin time correction).
     # Implemented as a gradient scaler in the epoch runner so it works across Adam/PSGLD/SGHMC.
@@ -344,6 +380,42 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
         dt_lr_mult = float(_require_num(sampler.get("dt_lr_mult"), "sampler.dt_lr_mult"))
         if not (dt_lr_mult > 0.0) or not math.isfinite(dt_lr_mult):
             raise _err("sampler.dt_lr_mult", "must be finite and > 0")
+
+    # Optional: gradient clipping for sampler phases (2/3/4).
+    sampler_grad_clip_norm = 0.0
+    if "grad_clip_norm" in sampler and sampler.get("grad_clip_norm", None) is not None:
+        sampler_grad_clip_norm = float(_require_num(sampler.get("grad_clip_norm"), "sampler.grad_clip_norm"))
+        if not (sampler_grad_clip_norm >= 0.0):
+            raise _err("sampler.grad_clip_norm", "must be >= 0")
+
+    # Adaptive drift (Adam variant) parameters.
+    adaptive_drift_cfg = sampler.get("adaptive_drift", None)
+    if backend == "adsgld_adam":
+        if not isinstance(adaptive_drift_cfg, dict):
+            raise _err("inference.sampler.adaptive_drift", "required when sampler.backend='adsgld_adam'")
+        ad_beta1 = _require_num(_require(adaptive_drift_cfg, "beta1", "inference.sampler.adaptive_drift"), "inference.sampler.adaptive_drift.beta1")
+        ad_beta2 = _require_num(_require(adaptive_drift_cfg, "beta2", "inference.sampler.adaptive_drift"), "inference.sampler.adaptive_drift.beta2")
+        ad_eps = _require_num(_require(adaptive_drift_cfg, "eps", "inference.sampler.adaptive_drift"), "inference.sampler.adaptive_drift.eps")
+        ad_scale = _require_num(_require(adaptive_drift_cfg, "scale", "inference.sampler.adaptive_drift"), "inference.sampler.adaptive_drift.scale")
+    else:
+        if isinstance(adaptive_drift_cfg, dict):
+            ad_beta1 = _require_num(adaptive_drift_cfg.get("beta1", 0.9), "inference.sampler.adaptive_drift.beta1")
+            ad_beta2 = _require_num(adaptive_drift_cfg.get("beta2", 0.999), "inference.sampler.adaptive_drift.beta2")
+            ad_eps = _require_num(adaptive_drift_cfg.get("eps", 1e-8), "inference.sampler.adaptive_drift.eps")
+            ad_scale = _require_num(adaptive_drift_cfg.get("scale", 1.0), "inference.sampler.adaptive_drift.scale")
+        else:
+            ad_beta1 = 0.9
+            ad_beta2 = 0.999
+            ad_eps = 1e-8
+            ad_scale = 1.0
+    if not (0.0 <= ad_beta1 < 1.0):
+        raise _err("inference.sampler.adaptive_drift.beta1", "must satisfy 0 <= beta1 < 1")
+    if not (0.0 <= ad_beta2 < 1.0):
+        raise _err("inference.sampler.adaptive_drift.beta2", "must satisfy 0 <= beta2 < 1")
+    if not (ad_eps > 0.0) or not math.isfinite(float(ad_eps)):
+        raise _err("inference.sampler.adaptive_drift.eps", "must be finite and > 0")
+    if not (ad_scale > 0.0) or not math.isfinite(float(ad_scale)):
+        raise _err("inference.sampler.adaptive_drift.scale", "must be finite and > 0")
 
     precond = _require_dict(_require(sampler, "preconditioning", "sampler"), "sampler.preconditioning")
     precond_enabled = _require_bool(_require(precond, "enabled", "sampler.preconditioning"), "sampler.preconditioning.enabled")
@@ -355,31 +427,64 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     if "include_gamma_proxy" in precond:
         precond_include_gamma_proxy = _require_bool(precond.get("include_gamma_proxy"), "sampler.preconditioning.include_gamma_proxy")
     if precond_enabled:
-        precond_type = _require_str(_require(precond, "type", "sampler.preconditioning"), "sampler.preconditioning.type").lower()
+        precond_type = _require_str(_require(precond, "type", "sampler.preconditioning"), "sampler.preconditioning.type").strip().lower()
         if precond_type == "matrix":
             raise _err(
                 "sampler.preconditioning.type",
                 "preconditioner type 'matrix' has been removed (it triggered the full-dataset FIM workflow). "
-                "Use 'blockdiag_fisher' (alias: 'matrix_ema') for the online 4x4 block preconditioner, or 'rmsprop'/'adam'.",
+                "Use 'blockdiag_fisher' (alias: 'matrix_ema') for the online 4x4 block preconditioner, or 'rmsprop'.",
             )
         # Backwards-compatible alias
         if precond_type == "matrix_ema":
             precond_type = "blockdiag_fisher"
-        if precond_type not in {"rmsprop", "adam", "blockdiag_fisher"}:
-            raise _err("sampler.preconditioning.type", "supported: 'rmsprop','adam','blockdiag_fisher' (alias: 'matrix_ema')")
+        if precond_type not in {"rmsprop", "blockdiag_fisher", "monge", "shampoo"}:
+            raise _err("sampler.preconditioning.type", "supported: 'rmsprop','blockdiag_fisher' (alias: 'matrix_ema'),'monge','shampoo'")
 
         # Backend-specific support
-        if backend in {"sghmc", "adaptive_sghmc"} and precond_type == "blockdiag_fisher":
+        if backend in {"sghmc", "adaptive_sghmc", "sgnht"} and precond_type == "blockdiag_fisher":
             raise _err(
                 "sampler.preconditioning.type",
                 "'blockdiag_fisher' is currently supported for backend='psgld' only. "
-                "For SGHMC/AdaptiveSGHMC use 'rmsprop'/'adam' preconditioning (AdaptiveSGHMC has its own diagonal "
+                "For SGHMC/AdaptiveSGHMC/SGNHT use 'rmsprop' preconditioning (AdaptiveSGHMC has its own diagonal "
                 "preconditioner) unless/until a true preconditioned-SGHMC block-metric implementation is added.",
+            )
+        if backend in {"sghmc", "adaptive_sghmc", "sgnht"} and precond_type in {"monge", "shampoo"}:
+            raise _err(
+                "sampler.preconditioning.type",
+                "'monge' and 'shampoo' preconditioners are currently supported for backend='psgld' only.",
             )
     else:
         # still require key presence, but value can be null/empty
         _require(precond, "type", "sampler.preconditioning")
         precond_type = "none"
+
+    # Optional: monge/shampoo preconditioner knobs (psgld only).
+    monge_alpha = 1.0
+    shampoo_beta = 0.99
+    shampoo_eps = 1e-6
+    shampoo_update_every = 10
+    shampoo_max_dim = 512
+    if isinstance(precond, dict):
+        if "monge_alpha" in precond and precond.get("monge_alpha", None) is not None:
+            monge_alpha = float(_require_num(precond.get("monge_alpha"), "sampler.preconditioning.monge_alpha"))
+        if "shampoo_beta" in precond and precond.get("shampoo_beta", None) is not None:
+            shampoo_beta = float(_require_num(precond.get("shampoo_beta"), "sampler.preconditioning.shampoo_beta"))
+        if "shampoo_eps" in precond and precond.get("shampoo_eps", None) is not None:
+            shampoo_eps = float(_require_num(precond.get("shampoo_eps"), "sampler.preconditioning.shampoo_eps"))
+        if "shampoo_update_every" in precond and precond.get("shampoo_update_every", None) is not None:
+            shampoo_update_every = int(_require_num(precond.get("shampoo_update_every"), "sampler.preconditioning.shampoo_update_every"))
+        if "shampoo_max_dim" in precond and precond.get("shampoo_max_dim", None) is not None:
+            shampoo_max_dim = int(_require_num(precond.get("shampoo_max_dim"), "sampler.preconditioning.shampoo_max_dim"))
+    if not (monge_alpha > 0.0) or not math.isfinite(monge_alpha):
+        raise _err("sampler.preconditioning.monge_alpha", "must be finite and > 0")
+    if not (0.0 <= shampoo_beta < 1.0):
+        raise _err("sampler.preconditioning.shampoo_beta", "must satisfy 0 <= beta < 1")
+    if not (shampoo_eps > 0.0) or not math.isfinite(shampoo_eps):
+        raise _err("sampler.preconditioning.shampoo_eps", "must be finite and > 0")
+    if shampoo_update_every < 1:
+        raise _err("sampler.preconditioning.shampoo_update_every", "must be >= 1")
+    if shampoo_max_dim < 1:
+        raise _err("sampler.preconditioning.shampoo_max_dim", "must be >= 1")
 
     beta = _require_num(_require(sampler, "beta", "sampler"), "sampler.beta")
     if not (0.0 <= beta < 1.0):
@@ -438,12 +543,17 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
         _require(sampler, "sghmc_alpha", "sampler")
         alpha = 0.0
 
-    # SGNHT support removed: fail fast if user still provides SGNHT-specific keys.
-    if ("sgnht_diffusion" in sampler) or ("sgnht_thermostat_mass" in sampler):
-        raise _err(
-            "sampler",
-            "contains SGNHT-specific keys (sgnht_diffusion/sgnht_thermostat_mass) but SGNHT support has been removed",
-        )
+    # Optional SGNHT parameters (used only when backend == 'sgnht').
+    sgnht_diffusion = 0.01
+    if "sgnht_diffusion" in sampler and sampler.get("sgnht_diffusion", None) is not None:
+        sgnht_diffusion = float(_require_num(sampler.get("sgnht_diffusion"), "sampler.sgnht_diffusion"))
+        if not (sgnht_diffusion > 0.0) or (not math.isfinite(sgnht_diffusion)):
+            raise _err("sampler.sgnht_diffusion", "must be finite and > 0")
+    sgnht_thermostat_mass = 1.0
+    if "sgnht_thermostat_mass" in sampler and sampler.get("sgnht_thermostat_mass", None) is not None:
+        sgnht_thermostat_mass = float(_require_num(sampler.get("sgnht_thermostat_mass"), "sampler.sgnht_thermostat_mass"))
+        if not (sgnht_thermostat_mass > 0.0) or (not math.isfinite(sgnht_thermostat_mass)):
+            raise _err("sampler.sgnht_thermostat_mass", "must be finite and > 0")
 
     # ---- materialize legacy flat keys (implementation detail) ----
     params["phase1_epochs"] = phase1_epochs
@@ -452,7 +562,7 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     params["phase4_epochs"] = phase4_epochs
     params["lr_warmup"] = lr_warmup
 
-    params["lr_sampler"] = lr_sampler
+    params["lr_sampler"] = lr_phase2
     # lr_mode='per_obs' is a convenience: when using pSGLD/SGHMC/AdaptiveSGHMC (which use minibatch-mean gradients
     # and internally scale the drift by N via n_obs/scale_grad), we apply lr_eff = lr_sampler / N at runtime.
     # This preserves the true posterior target but makes
@@ -460,17 +570,31 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     params["sampler_lr_mode"] = lr_mode
     params["sampler_backend"] = backend
     params["sampler_temperature"] = temperature
+    params["sampler_noise_scale_mult"] = float(noise_scale_mult)
     params["dt_lr_mult"] = float(dt_lr_mult)
+    params["sampler_grad_clip_norm"] = float(sampler_grad_clip_norm)
     params["sampler_preconditioning"] = bool(precond_enabled)
     params["sampler_preconditioner"] = precond_type if precond_enabled else "none"
     params["sampler_beta"] = beta
     params["sampler_eps"] = eps
     params["freeze_preconditioner_sampling"] = bool(freeze_preconditioner_sampling)
     params["sghmc_alpha"] = alpha
+    params["sgnht_diffusion"] = float(sgnht_diffusion)
+    params["sgnht_thermostat_mass"] = float(sgnht_thermostat_mass)
     params["blockdiag_fisher_max_cluster_size"] = int(blockdiag_fisher_max_cluster_size)
     params["blockdiag_fisher_partition_method"] = str(blockdiag_fisher_partition_method)
     params["sampler_preconditioning_include_gamma"] = bool(precond_include_gamma)
     params["sampler_preconditioning_include_gamma_proxy"] = bool(precond_include_gamma_proxy)
+    params["_sampler_lr_per_phase"] = list(lr_per_phase)
+    params["adaptive_drift_beta1"] = float(ad_beta1)
+    params["adaptive_drift_beta2"] = float(ad_beta2)
+    params["adaptive_drift_eps"] = float(ad_eps)
+    params["adaptive_drift_scale"] = float(ad_scale)
+    params["sampler_preconditioning_monge_alpha"] = float(monge_alpha)
+    params["sampler_preconditioning_shampoo_beta"] = float(shampoo_beta)
+    params["sampler_preconditioning_shampoo_eps"] = float(shampoo_eps)
+    params["sampler_preconditioning_shampoo_update_every"] = int(shampoo_update_every)
+    params["sampler_preconditioning_shampoo_max_dim"] = int(shampoo_max_dim)
 
     # ---- sampler parameter-group overrides (hard-break schema) ----
     # These are inference-only controls. They let high-dimensional latent groups use smaller step/noise.
@@ -499,7 +623,7 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
         for k in ("lr_mult", "temperature_mult", "eps", "freeze_preconditioner_sampling"):
             if k in corr_ov and corr_ov.get(k, None) is not None:
                 corr_overrides_active = True
-                break
+            break
         if "lr_mult" in corr_ov and corr_ov.get("lr_mult", None) is not None:
             corr_lr_mult = float(_require_num(corr_ov.get("lr_mult"), "inference.sampler.overrides.corr_error.lr_mult"))
             if not (corr_lr_mult > 0.0):
@@ -507,7 +631,7 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
         if "temperature_mult" in corr_ov and corr_ov.get("temperature_mult", None) is not None:
             corr_temp_mult = float(
                 _require_num(corr_ov.get("temperature_mult"), "inference.sampler.overrides.corr_error.temperature_mult")
-            )
+        )
             if not (corr_temp_mult > 0.0):
                 raise _err("inference.sampler.overrides.corr_error.temperature_mult", "must be > 0")
         if "eps" in corr_ov and corr_ov.get("eps", None) is not None:
@@ -518,13 +642,67 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
             corr_freeze_precond = _require_bool(
                 corr_ov.get("freeze_preconditioner_sampling"),
                 "inference.sampler.overrides.corr_error.freeze_preconditioner_sampling",
-            )
+        )
 
     params["_corr_error_lr_mult"] = float(corr_lr_mult)
     params["_corr_error_temperature_mult"] = float(corr_temp_mult)
     params["_corr_error_eps"] = float(corr_eps)
     params["_corr_error_freeze_preconditioner_sampling"] = bool(corr_freeze_precond)
     params["_corr_error_sampler_overrides_active"] = bool(corr_overrides_active)
+
+    # Optional: generic overrides for other parameter groups (core, slowness_re, dd_graph_re).
+    # For these groups we only apply keys explicitly provided by the user.
+    group_overrides: Dict[str, Dict[str, Any]] = {}
+    any_group_override_active = False
+
+    if corr_overrides_active:
+        group_overrides["corr_error"] = {
+            "lr_mult": float(corr_lr_mult),
+            "temperature_mult": float(corr_temp_mult),
+            "eps": float(corr_eps),
+            "freeze_preconditioner_sampling": bool(corr_freeze_precond),
+        }
+        any_group_override_active = True
+
+    def _parse_group_override(group_name: str) -> None:
+        nonlocal any_group_override_active
+        ov = overrides.get(group_name, None)
+        if ov is None:
+            return
+        if not isinstance(ov, dict):
+            raise _err(f"inference.sampler.overrides.{group_name}", "expected object/dict or null")
+        out: Dict[str, Any] = {}
+        if "lr_mult" in ov and ov.get("lr_mult", None) is not None:
+            lr_mult = float(_require_num(ov.get("lr_mult"), f"inference.sampler.overrides.{group_name}.lr_mult"))
+            if not (lr_mult > 0.0):
+                raise _err(f"inference.sampler.overrides.{group_name}.lr_mult", "must be > 0")
+            out["lr_mult"] = float(lr_mult)
+        if "temperature_mult" in ov and ov.get("temperature_mult", None) is not None:
+            temp_mult = float(_require_num(ov.get("temperature_mult"), f"inference.sampler.overrides.{group_name}.temperature_mult"))
+            if not (temp_mult > 0.0):
+                raise _err(f"inference.sampler.overrides.{group_name}.temperature_mult", "must be > 0")
+            out["temperature_mult"] = float(temp_mult)
+        if "eps" in ov and ov.get("eps", None) is not None:
+            eps_g = float(_require_num(ov.get("eps"), f"inference.sampler.overrides.{group_name}.eps"))
+            if not (eps_g >= 0.0):
+                raise _err(f"inference.sampler.overrides.{group_name}.eps", "must be >= 0")
+            out["eps"] = float(eps_g)
+        if "freeze_preconditioner_sampling" in ov and ov.get("freeze_preconditioner_sampling", None) is not None:
+            freeze_g = _require_bool(
+                ov.get("freeze_preconditioner_sampling"),
+                f"inference.sampler.overrides.{group_name}.freeze_preconditioner_sampling",
+            )
+            out["freeze_preconditioner_sampling"] = bool(freeze_g)
+        if out:
+            group_overrides[group_name] = out
+            any_group_override_active = True
+
+    _parse_group_override("core")
+    _parse_group_override("slowness_re")
+    _parse_group_override("dd_graph_re")
+
+    params["_sampler_group_overrides"] = dict(group_overrides)
+    params["_sampler_group_overrides_active"] = bool(any_group_override_active)
 
     return params
 
@@ -585,10 +763,16 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     # Accept common aliases; `compute_likelihood_loss` handles the mapping.
     if lk_type in {"student-t", "studentt"}:
         lk_type = "student_t"
+    # Convenience alias for the collapsed correlated likelihood (shared_event_re).
+    lk_correlated = False
+    if lk_type in {"correlated", "correlated_gaussian"}:
+        lk_correlated = True
+        lk_type = "gaussian"
     if lk_type not in {"huber", "l2", "gaussian", "laplace", "l1", "mae", "mse", "student_t"}:
         raise _err(
             "model.likelihood.type",
-            "supported: 'huber', 'l2'/'gaussian' (aliases: 'mse'), 'laplace' (aliases: 'l1','mae'), 'student_t'",
+            "supported: 'huber', 'l2'/'gaussian' (aliases: 'mse'), 'laplace' (aliases: 'l1','mae'), 'student_t', "
+            "'correlated'/'correlated_gaussian'",
         )
     phase_unc = _require_float_list(_require(lk, "phase_unc", "model.likelihood"), "model.likelihood.phase_unc", length=2)
     # We keep only the fixed scalar phase uncertainty (phase_unc). Noise learning is removed.
@@ -618,6 +802,52 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
         if ("nu" not in student_t_cfg) or (student_t_cfg.get("nu", None) is None):
             raise _err("model.likelihood.student_t.nu", "required when model.likelihood.type='student_t'")
 
+    # Optional: Student-t scale-mixture (per-row lambda) for robust likelihoods.
+    student_t_scale_cfg = lk.get("student_t_scale", None)
+    student_t_scale_enabled = False
+    student_t_scale_nu = float(student_t_nu)
+    student_t_scale_update_every = 1
+    student_t_scale_batch_size = 200_000
+    student_t_scale_init = "ones"
+    student_t_scale_min_lambda = 1e-6
+    student_t_scale_max_lambda = 1e6
+    if student_t_scale_cfg is not None:
+        if not isinstance(student_t_scale_cfg, dict):
+            raise _err("model.likelihood.student_t_scale", "expected object/dict or null")
+        if "enabled" in student_t_scale_cfg and student_t_scale_cfg.get("enabled", None) is not None:
+            student_t_scale_enabled = _require_bool(student_t_scale_cfg.get("enabled"), "model.likelihood.student_t_scale.enabled")
+        if "nu" in student_t_scale_cfg and student_t_scale_cfg.get("nu", None) is not None:
+            student_t_scale_nu = float(_require_num(student_t_scale_cfg.get("nu"), "model.likelihood.student_t_scale.nu"))
+        if "update_every_epochs" in student_t_scale_cfg and student_t_scale_cfg.get("update_every_epochs", None) is not None:
+            student_t_scale_update_every = int(_require_num(student_t_scale_cfg.get("update_every_epochs"), "model.likelihood.student_t_scale.update_every_epochs"))
+        if "batch_size" in student_t_scale_cfg and student_t_scale_cfg.get("batch_size", None) is not None:
+            student_t_scale_batch_size = int(_require_num(student_t_scale_cfg.get("batch_size"), "model.likelihood.student_t_scale.batch_size"))
+        if "init" in student_t_scale_cfg and student_t_scale_cfg.get("init", None) is not None:
+            student_t_scale_init = _require_str(student_t_scale_cfg.get("init"), "model.likelihood.student_t_scale.init")
+        if "min_lambda" in student_t_scale_cfg and student_t_scale_cfg.get("min_lambda", None) is not None:
+            student_t_scale_min_lambda = float(_require_num(student_t_scale_cfg.get("min_lambda"), "model.likelihood.student_t_scale.min_lambda"))
+        if "max_lambda" in student_t_scale_cfg and student_t_scale_cfg.get("max_lambda", None) is not None:
+            student_t_scale_max_lambda = float(_require_num(student_t_scale_cfg.get("max_lambda"), "model.likelihood.student_t_scale.max_lambda"))
+    if student_t_scale_enabled:
+        if lk_type not in {"gaussian", "l2", "mse"}:
+            raise _err(
+                "model.likelihood.type",
+                "must be 'gaussian'/'l2'/'mse' when model.likelihood.student_t_scale.enabled=true "
+                "(scale-mixture is applied on top of Gaussian noise)",
+            )
+        if (not math.isfinite(student_t_scale_nu)) or (not (student_t_scale_nu > 0.0)):
+            raise _err("model.likelihood.student_t_scale.nu", "must be finite and > 0")
+        if student_t_scale_update_every < 0:
+            raise _err("model.likelihood.student_t_scale.update_every_epochs", "must be >= 0")
+        if student_t_scale_batch_size <= 0:
+            raise _err("model.likelihood.student_t_scale.batch_size", "must be > 0")
+        if (not math.isfinite(student_t_scale_min_lambda)) or (student_t_scale_min_lambda <= 0.0):
+            raise _err("model.likelihood.student_t_scale.min_lambda", "must be finite and > 0")
+        if (not math.isfinite(student_t_scale_max_lambda)) or (student_t_scale_max_lambda <= 0.0):
+            raise _err("model.likelihood.student_t_scale.max_lambda", "must be finite and > 0")
+        if student_t_scale_max_lambda < student_t_scale_min_lambda:
+            raise _err("model.likelihood.student_t_scale.max_lambda", "must be >= min_lambda")
+
     # Tempering removed (start fresh; keep core residual distributions only).
     if "tempering" in lk:
         raise _err("model.likelihood.tempering", "removed; delete this block from your config")
@@ -633,14 +863,11 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     # Structured likelihood components removed (start fresh).
     if "shared_event_latent" in lk:
         raise _err("model.likelihood.shared_event_latent", "removed; delete this block from your config")
-    if "shared_event_re" in lk:
-        raise _err("model.likelihood.shared_event_re", "removed; delete this block from your config")
-    if "slowness_re" in lk:
-        raise _err("model.likelihood.slowness_re", "removed; delete this block from your config")
+    # slowness_re is supported (scalar slowness random effects).
     if "latent_field" in lk:
         raise _err("model.likelihood.latent_field", "removed; delete this block from your config")
 
-    # Optional: correlated forward-model error latent (low-rank station basis × event-graph GMRF).
+    # Optional: correlated forward-model error latent (low-rank station basis × radius-subsampled GMRF).
     #
     # Models residual correlations as:
     #   r_e = (w_s · (b_j - b_i)) + eps
@@ -650,15 +877,55 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     corr_r = 0
     corr_tau_ps = [0.0, 0.0]  # seconds
     corr_rho_ps = 0.0
+    # Optional: hierarchical Gibbs update for tau (P/S covariance).
+    hier_tau_enabled = False
+    hier_tau_dof = 10.0
+    hier_tau_scale_ps = [0.01, 0.01]  # prior std in seconds
+    hier_tau_update_every = 5
+    hier_tau_damping = 0.2
+    hier_tau_start_after = 0
+    hier_tau_min_ps = None
+    hier_tau_max_ps = None
     # Station basis (fixed, from station geometry)
     corr_sta_ell_km = 0.0
     corr_sta_jitter = 1e-6
     corr_sta_method = "eigh_rbf"
-    # Event graph (fixed, from MAP event geometry)
-    corr_knn = 16
-    corr_event_ell_km = 0.0
+    corr_sta_basis_enabled = True
+    # Event graph (radius-r with capped-k uniform neighbor sampling; refreshed periodically)
+    corr_graph_source = "geometry"  # 'geometry' (default) or 'dtimes'
+    corr_graph_enabled = True
+    corr_radius_km = 0.0
+    corr_k = 16
+    corr_refresh_every = 10
+    corr_symmetrize = True
+    corr_cell_size_km = None  # default: radius_km
+    corr_cell_hops = 2
+    corr_max_tries_per_neighbor = 64
     corr_q_diag = 1e-3
-    corr_max_edges_per_step = 0  # 0 => use full edge set each step
+    # Optional edge-weighting scheme for the Laplacian smoothness term.
+    # Default preserves historical behavior: per-node uniform weights (random-walk normalization).
+    corr_weighting = "uniform_degree"  # 'uniform_degree' | 'rbf' | 'inv_dist'
+    corr_weight_ell_km = None          # required for 'rbf'
+    corr_weight_eps_km = 1e-3          # used for 'inv_dist'
+    corr_weight_normalize = True       # normalize outgoing weights to sum to 1 per node
+    # Optional: enable corr_error during Phase-1 MAP (locate-map).
+    # Default False for backward compatibility.
+    corr_enable_in_phase1 = False
+    # Optional: LR multiplier for corr_error_b when optimized with Adam in Phase 1.
+    corr_phase1_lr_mult = 0.1
+    # Optional: exact elliptical slice sampling (ESS) updates for corr_error_b (blocked sampler step).
+    # This is intended for robust likelihoods (Huber/Student/Laplace) where b|ΔX is not Gaussian,
+    # but b has a Gaussian prior.
+    corr_ess_enabled = False
+    corr_ess_update_every = 1
+    corr_ess_start_after = 0
+    corr_ess_sweeps = 1
+    corr_ess_batch_size = 50_000
+    corr_ess_max_bracket_steps = 64
+    corr_ess_block_by_station = True
+    corr_ess_top_k_stations = 0  # 0 => all
+    corr_ess_seed = 0
+    corr_ess_freeze_sampler_group = True
     if isinstance(corr_cfg, dict):
         corr_enabled = bool(corr_cfg.get("enabled", False))
         if "r" in corr_cfg and corr_cfg.get("r", None) is not None:
@@ -685,43 +952,223 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
         if corr_enabled and (not isinstance(sta, dict)):
             raise _err("model.likelihood.corr_error.station_basis", "required when corr_error.enabled=true (expected object/dict)")
         if isinstance(sta, dict):
-            corr_sta_ell_km = float(_require_num(_require(sta, "ell_km", "model.likelihood.corr_error.station_basis"), "model.likelihood.corr_error.station_basis.ell_km"))
-            if not (math.isfinite(corr_sta_ell_km) and corr_sta_ell_km > 0.0):
-                raise _err("model.likelihood.corr_error.station_basis.ell_km", "must be finite and > 0")
-            if "jitter" in sta and sta.get("jitter", None) is not None:
-                corr_sta_jitter = float(_require_num(sta.get("jitter"), "model.likelihood.corr_error.station_basis.jitter"))
-                if not (math.isfinite(corr_sta_jitter) and corr_sta_jitter >= 0.0):
-                    raise _err("model.likelihood.corr_error.station_basis.jitter", "must be finite and >= 0")
-            if "method" in sta and sta.get("method", None) is not None:
-                corr_sta_method = str(sta.get("method", "eigh_rbf")).strip().lower()
-            if corr_sta_method not in {"eigh_rbf"}:
-                raise _err("model.likelihood.corr_error.station_basis.method", "supported: 'eigh_rbf'")
+            if "enabled" in sta and sta.get("enabled", None) is not None:
+                corr_sta_basis_enabled = bool(_require_bool(sta.get("enabled"), "model.likelihood.corr_error.station_basis.enabled"))
+            if corr_sta_basis_enabled:
+                corr_sta_ell_km = float(_require_num(_require(sta, "ell_km", "model.likelihood.corr_error.station_basis"), "model.likelihood.corr_error.station_basis.ell_km"))
+                if not (math.isfinite(corr_sta_ell_km) and corr_sta_ell_km > 0.0):
+                    raise _err("model.likelihood.corr_error.station_basis.ell_km", "must be finite and > 0")
+                if "jitter" in sta and sta.get("jitter", None) is not None:
+                    corr_sta_jitter = float(_require_num(sta.get("jitter"), "model.likelihood.corr_error.station_basis.jitter"))
+                    if not (math.isfinite(corr_sta_jitter) and corr_sta_jitter >= 0.0):
+                        raise _err("model.likelihood.corr_error.station_basis.jitter", "must be finite and >= 0")
+                if "method" in sta and sta.get("method", None) is not None:
+                    corr_sta_method = str(sta.get("method", "eigh_rbf")).strip().lower()
+                if corr_sta_method not in {"eigh_rbf"}:
+                    raise _err("model.likelihood.corr_error.station_basis.method", "supported: 'eigh_rbf'")
+            else:
+                # Per-station coefficients mode: no geometry basis. The runtime will require corr_error.r == n_stations.
+                corr_sta_ell_km = 0.0
+                corr_sta_jitter = 0.0
+                corr_sta_method = "none"
 
         eg = corr_cfg.get("event_graph", None)
         if corr_enabled and (not isinstance(eg, dict)):
             raise _err("model.likelihood.corr_error.event_graph", "required when corr_error.enabled=true (expected object/dict)")
         if isinstance(eg, dict):
-            if "knn" in eg and eg.get("knn", None) is not None:
-                corr_knn = int(_require_num(eg.get("knn"), "model.likelihood.corr_error.event_graph.knn"))
-                if corr_knn < 1:
-                    raise _err("model.likelihood.corr_error.event_graph.knn", "must be >= 1")
-            corr_event_ell_km = float(_require_num(_require(eg, "ell_km", "model.likelihood.corr_error.event_graph"), "model.likelihood.corr_error.event_graph.ell_km"))
-            if not (math.isfinite(corr_event_ell_km) and corr_event_ell_km > 0.0):
-                raise _err("model.likelihood.corr_error.event_graph.ell_km", "must be finite and > 0")
-            if "q_diag" in eg and eg.get("q_diag", None) is not None:
-                corr_q_diag = float(_require_num(eg.get("q_diag"), "model.likelihood.corr_error.event_graph.q_diag"))
-                if not (math.isfinite(corr_q_diag) and corr_q_diag >= 0.0):
-                    raise _err("model.likelihood.corr_error.event_graph.q_diag", "must be finite and >= 0")
-            if "max_edges_per_step" in eg and eg.get("max_edges_per_step", None) is not None:
-                corr_max_edges_per_step = int(_require_num(eg.get("max_edges_per_step"), "model.likelihood.corr_error.event_graph.max_edges_per_step"))
-                if corr_max_edges_per_step < 0:
-                    raise _err("model.likelihood.corr_error.event_graph.max_edges_per_step", "must be >= 0")
+            # Allow disabling the event graph entirely (IID Gaussian prior on b).
+            # When disabled, we skip graph parameter requirements and use Q = I in the corr_error prior,
+            # so tau_s is interpretable as the per-(event,basis,phase) std in seconds.
+            if "enabled" in eg and eg.get("enabled", None) is not None:
+                corr_graph_enabled = bool(_require_bool(eg.get("enabled"), "model.likelihood.corr_error.event_graph.enabled"))
+
+            # Hard break: old kNN-weighted graph keys are removed (no backward compatibility).
+            if "knn" in eg:
+                raise _err("model.likelihood.corr_error.event_graph.knn", "removed; use radius_km + k")
+            if "ell_km" in eg:
+                raise _err("model.likelihood.corr_error.event_graph.ell_km", "removed; use radius_km (neighbors are uniform-in-radius with unity weights)")
+            if "max_edges_per_step" in eg:
+                raise _err("model.likelihood.corr_error.event_graph.max_edges_per_step", "removed; use refresh_every_epochs to control stochastic graph updates")
+
+            if corr_graph_enabled:
+                if "source" in eg and eg.get("source", None) is not None:
+                    corr_graph_source = str(eg.get("source")).strip().lower()
+                    if corr_graph_source not in {"geometry", "dtimes"}:
+                        raise _err("model.likelihood.corr_error.event_graph.source", "supported: 'geometry', 'dtimes'")
+
+                # radius_km is required for the geometry graph; for dtimes graphs it is optional
+                # (if provided, it is used as an optional distance filter when coordinates are available).
+                if corr_graph_source != "dtimes":
+                    corr_radius_km = float(_require_num(_require(eg, "radius_km", "model.likelihood.corr_error.event_graph"), "model.likelihood.corr_error.event_graph.radius_km"))
+                    if not (math.isfinite(corr_radius_km) and corr_radius_km > 0.0):
+                        raise _err("model.likelihood.corr_error.event_graph.radius_km", "must be finite and > 0")
+                else:
+                    if "radius_km" in eg and eg.get("radius_km", None) is not None:
+                        corr_radius_km = float(_require_num(eg.get("radius_km"), "model.likelihood.corr_error.event_graph.radius_km"))
+                        if not math.isfinite(corr_radius_km):
+                            raise _err("model.likelihood.corr_error.event_graph.radius_km", "must be finite when provided")
+                    else:
+                        corr_radius_km = 0.0
+
+                corr_k = int(_require_num(_require(eg, "k", "model.likelihood.corr_error.event_graph"), "model.likelihood.corr_error.event_graph.k"))
+                if corr_k < 1:
+                    raise _err("model.likelihood.corr_error.event_graph.k", "must be >= 1")
+                if "refresh_every_epochs" in eg and eg.get("refresh_every_epochs", None) is not None:
+                    corr_refresh_every = int(_require_num(eg.get("refresh_every_epochs"), "model.likelihood.corr_error.event_graph.refresh_every_epochs"))
+                    if corr_refresh_every < 0:
+                        raise _err("model.likelihood.corr_error.event_graph.refresh_every_epochs", "must be >= 0 (0 disables refresh)")
+                if "symmetrize" in eg and eg.get("symmetrize", None) is not None:
+                    corr_symmetrize = bool(_require_bool(eg.get("symmetrize"), "model.likelihood.corr_error.event_graph.symmetrize"))
+                if "cell_size_km" in eg and eg.get("cell_size_km", None) is not None:
+                    corr_cell_size_km = float(_require_num(eg.get("cell_size_km"), "model.likelihood.corr_error.event_graph.cell_size_km"))
+                    if not (math.isfinite(corr_cell_size_km) and corr_cell_size_km > 0.0):
+                        raise _err("model.likelihood.corr_error.event_graph.cell_size_km", "must be finite and > 0")
+                if "cell_hops" in eg and eg.get("cell_hops", None) is not None:
+                    corr_cell_hops = int(_require_num(eg.get("cell_hops"), "model.likelihood.corr_error.event_graph.cell_hops"))
+                    if corr_cell_hops < 1:
+                        raise _err("model.likelihood.corr_error.event_graph.cell_hops", "must be >= 1")
+                if "max_tries_per_neighbor" in eg and eg.get("max_tries_per_neighbor", None) is not None:
+                    corr_max_tries_per_neighbor = int(_require_num(eg.get("max_tries_per_neighbor"), "model.likelihood.corr_error.event_graph.max_tries_per_neighbor"))
+                    if corr_max_tries_per_neighbor < 1:
+                        raise _err("model.likelihood.corr_error.event_graph.max_tries_per_neighbor", "must be >= 1")
+                if "q_diag" in eg and eg.get("q_diag", None) is not None:
+                    corr_q_diag = float(_require_num(eg.get("q_diag"), "model.likelihood.corr_error.event_graph.q_diag"))
+                    if not (math.isfinite(corr_q_diag) and corr_q_diag >= 0.0):
+                        raise _err("model.likelihood.corr_error.event_graph.q_diag", "must be finite and >= 0")
+                if "weighting" in eg and eg.get("weighting", None) is not None:
+                    corr_weighting = str(eg.get("weighting")).strip().lower()
+                    if corr_weighting in {"degree", "deg", "uniform"}:
+                        corr_weighting = "uniform_degree"
+                    if corr_weighting not in {"uniform_degree", "rbf", "inv_dist"}:
+                        raise _err("model.likelihood.corr_error.event_graph.weighting", "supported: 'uniform_degree', 'rbf', 'inv_dist'")
+                if "weight_ell_km" in eg and eg.get("weight_ell_km", None) is not None:
+                    corr_weight_ell_km = float(_require_num(eg.get("weight_ell_km"), "model.likelihood.corr_error.event_graph.weight_ell_km"))
+                    if not (math.isfinite(corr_weight_ell_km) and corr_weight_ell_km > 0.0):
+                        raise _err("model.likelihood.corr_error.event_graph.weight_ell_km", "must be finite and > 0")
+                if "weight_eps_km" in eg and eg.get("weight_eps_km", None) is not None:
+                    corr_weight_eps_km = float(_require_num(eg.get("weight_eps_km"), "model.likelihood.corr_error.event_graph.weight_eps_km"))
+                    if not (math.isfinite(corr_weight_eps_km) and corr_weight_eps_km > 0.0):
+                        raise _err("model.likelihood.corr_error.event_graph.weight_eps_km", "must be finite and > 0")
+                if "weight_normalize" in eg and eg.get("weight_normalize", None) is not None:
+                    corr_weight_normalize = bool(_require_bool(eg.get("weight_normalize"), "model.likelihood.corr_error.event_graph.weight_normalize"))
+            else:
+                # IID mode: set dummy graph params (not used), and use Q = I in the prior.
+                corr_graph_source = "none"
+                corr_radius_km = 0.0
+                corr_k = 0
+                corr_refresh_every = 0
+                corr_symmetrize = True
+                corr_cell_size_km = None
+                corr_cell_hops = 1
+                corr_max_tries_per_neighbor = 1
+                corr_q_diag = 1.0
+                corr_weighting = "uniform_degree"
+                corr_weight_ell_km = None
+                corr_weight_eps_km = 1e-3
+                corr_weight_normalize = True
 
         if corr_enabled:
             if corr_r <= 0:
                 raise _err("model.likelihood.corr_error.r", "required and must be >= 1 when corr_error.enabled=true")
-            if not (corr_event_ell_km > 0.0):
-                raise _err("model.likelihood.corr_error.event_graph.ell_km", "required and must be > 0 when corr_error.enabled=true")
+            if corr_graph_enabled and (corr_graph_source != "dtimes"):
+                if not (corr_radius_km > 0.0):
+                    raise _err("model.likelihood.corr_error.event_graph.radius_km", "required and must be > 0 when corr_error.enabled=true")
+
+        if "enable_in_phase1" in corr_cfg and corr_cfg.get("enable_in_phase1", None) is not None:
+            corr_enable_in_phase1 = _require_bool(corr_cfg.get("enable_in_phase1"), "model.likelihood.corr_error.enable_in_phase1")
+        if "phase1_lr_mult" in corr_cfg and corr_cfg.get("phase1_lr_mult", None) is not None:
+            corr_phase1_lr_mult = float(_require_num(corr_cfg.get("phase1_lr_mult"), "model.likelihood.corr_error.phase1_lr_mult"))
+            if not (math.isfinite(corr_phase1_lr_mult) and corr_phase1_lr_mult > 0.0):
+                raise _err("model.likelihood.corr_error.phase1_lr_mult", "must be finite and > 0")
+
+        # Optional: hierarchical Gibbs update for tau (P/S covariance).
+        hier_tau_cfg = corr_cfg.get("hierarchical", None)
+        if isinstance(hier_tau_cfg, dict):
+            hier_tau_enabled = bool(hier_tau_cfg.get("enabled", False))
+            if "tau_prior_dof" in hier_tau_cfg and hier_tau_cfg.get("tau_prior_dof", None) is not None:
+                hier_tau_dof = float(_require_num(hier_tau_cfg.get("tau_prior_dof"), "model.likelihood.corr_error.hierarchical.tau_prior_dof"))
+                if not (hier_tau_dof > 1.0):
+                    raise _err("model.likelihood.corr_error.hierarchical.tau_prior_dof", "must be > 1.0")
+            if "tau_prior_scale" in hier_tau_cfg and hier_tau_cfg.get("tau_prior_scale", None) is not None:
+                v = hier_tau_cfg.get("tau_prior_scale")
+                if isinstance(v, (int, float)):
+                    f = float(v)
+                    hier_tau_scale_ps = [f, f]
+                elif isinstance(v, list):
+                    hier_tau_scale_ps = _require_float_list(v, "model.likelihood.corr_error.hierarchical.tau_prior_scale", length=2)
+                else:
+                    raise _err("model.likelihood.corr_error.hierarchical.tau_prior_scale", f"expected number or [P,S] list, got {type(v).__name__}")
+            if "update_every_epochs" in hier_tau_cfg and hier_tau_cfg.get("update_every_epochs", None) is not None:
+                hier_tau_update_every = int(_require_num(hier_tau_cfg.get("update_every_epochs"), "model.likelihood.corr_error.hierarchical.update_every_epochs"))
+                if hier_tau_update_every < 1:
+                    raise _err("model.likelihood.corr_error.hierarchical.update_every_epochs", "must be >= 1")
+            if "damping" in hier_tau_cfg and hier_tau_cfg.get("damping", None) is not None:
+                hier_tau_damping = float(_require_num(hier_tau_cfg.get("damping"), "model.likelihood.corr_error.hierarchical.damping"))
+                if not (math.isfinite(hier_tau_damping) and (0.0 < hier_tau_damping <= 1.0)):
+                    raise _err("model.likelihood.corr_error.hierarchical.damping", "must satisfy 0 < damping <= 1")
+            if "start_after_epochs" in hier_tau_cfg and hier_tau_cfg.get("start_after_epochs", None) is not None:
+                hier_tau_start_after = int(_require_num(hier_tau_cfg.get("start_after_epochs"), "model.likelihood.corr_error.hierarchical.start_after_epochs"))
+                if hier_tau_start_after < 0:
+                    raise _err("model.likelihood.corr_error.hierarchical.start_after_epochs", "must be >= 0")
+            # Optional safety clamps for the learned tau (seconds).
+            if "min_tau_s" in hier_tau_cfg and hier_tau_cfg.get("min_tau_s", None) is not None:
+                v = hier_tau_cfg.get("min_tau_s")
+                if isinstance(v, (int, float)):
+                    f = float(v)
+                    hier_tau_min_ps = [f, f]
+                elif isinstance(v, list):
+                    hier_tau_min_ps = _require_float_list(v, "model.likelihood.corr_error.hierarchical.min_tau_s", length=2)
+                else:
+                    raise _err("model.likelihood.corr_error.hierarchical.min_tau_s", f"expected number or [P,S] list, got {type(v).__name__}")
+                if not (hier_tau_min_ps[0] >= 0.0 and hier_tau_min_ps[1] >= 0.0):
+                    raise _err("model.likelihood.corr_error.hierarchical.min_tau_s", "must be >= 0")
+            if "max_tau_s" in hier_tau_cfg and hier_tau_cfg.get("max_tau_s", None) is not None:
+                v = hier_tau_cfg.get("max_tau_s")
+                if isinstance(v, (int, float)):
+                    f = float(v)
+                    hier_tau_max_ps = [f, f]
+                elif isinstance(v, list):
+                    hier_tau_max_ps = _require_float_list(v, "model.likelihood.corr_error.hierarchical.max_tau_s", length=2)
+                else:
+                    raise _err("model.likelihood.corr_error.hierarchical.max_tau_s", f"expected number or [P,S] list, got {type(v).__name__}")
+                if not (hier_tau_max_ps[0] > 0.0 and hier_tau_max_ps[1] > 0.0):
+                    raise _err("model.likelihood.corr_error.hierarchical.max_tau_s", "must be > 0")
+
+        # Optional: ESS updates for corr_error_b (blocked sampler step).
+        ess_cfg = corr_cfg.get("ess", None)
+        if isinstance(ess_cfg, dict):
+            if "enabled" in ess_cfg and ess_cfg.get("enabled", None) is not None:
+                corr_ess_enabled = bool(_require_bool(ess_cfg.get("enabled"), "model.likelihood.corr_error.ess.enabled"))
+            if "update_every_epochs" in ess_cfg and ess_cfg.get("update_every_epochs", None) is not None:
+                corr_ess_update_every = int(_require_num(ess_cfg.get("update_every_epochs"), "model.likelihood.corr_error.ess.update_every_epochs"))
+                if corr_ess_update_every < 1:
+                    raise _err("model.likelihood.corr_error.ess.update_every_epochs", "must be >= 1")
+            if "start_after_epochs" in ess_cfg and ess_cfg.get("start_after_epochs", None) is not None:
+                corr_ess_start_after = int(_require_num(ess_cfg.get("start_after_epochs"), "model.likelihood.corr_error.ess.start_after_epochs"))
+                if corr_ess_start_after < 0:
+                    raise _err("model.likelihood.corr_error.ess.start_after_epochs", "must be >= 0")
+            if "sweeps_per_update" in ess_cfg and ess_cfg.get("sweeps_per_update", None) is not None:
+                corr_ess_sweeps = int(_require_num(ess_cfg.get("sweeps_per_update"), "model.likelihood.corr_error.ess.sweeps_per_update"))
+                if corr_ess_sweeps < 1:
+                    raise _err("model.likelihood.corr_error.ess.sweeps_per_update", "must be >= 1")
+            if "batch_size" in ess_cfg and ess_cfg.get("batch_size", None) is not None:
+                corr_ess_batch_size = int(_require_num(ess_cfg.get("batch_size"), "model.likelihood.corr_error.ess.batch_size"))
+                if corr_ess_batch_size < 1:
+                    raise _err("model.likelihood.corr_error.ess.batch_size", "must be >= 1")
+            if "max_bracket_steps" in ess_cfg and ess_cfg.get("max_bracket_steps", None) is not None:
+                corr_ess_max_bracket_steps = int(_require_num(ess_cfg.get("max_bracket_steps"), "model.likelihood.corr_error.ess.max_bracket_steps"))
+                if corr_ess_max_bracket_steps < 8:
+                    raise _err("model.likelihood.corr_error.ess.max_bracket_steps", "must be >= 8")
+            if "block_by_station" in ess_cfg and ess_cfg.get("block_by_station", None) is not None:
+                corr_ess_block_by_station = bool(_require_bool(ess_cfg.get("block_by_station"), "model.likelihood.corr_error.ess.block_by_station"))
+            if "top_k_stations" in ess_cfg and ess_cfg.get("top_k_stations", None) is not None:
+                corr_ess_top_k_stations = int(_require_num(ess_cfg.get("top_k_stations"), "model.likelihood.corr_error.ess.top_k_stations"))
+                if corr_ess_top_k_stations < 0:
+                    raise _err("model.likelihood.corr_error.ess.top_k_stations", "must be >= 0")
+            if "seed" in ess_cfg and ess_cfg.get("seed", None) is not None:
+                corr_ess_seed = int(_require_num(ess_cfg.get("seed"), "model.likelihood.corr_error.ess.seed"))
+            if "freeze_sampler_group" in ess_cfg and ess_cfg.get("freeze_sampler_group", None) is not None:
+                corr_ess_freeze_sampler_group = bool(_require_bool(ess_cfg.get("freeze_sampler_group"), "model.likelihood.corr_error.ess.freeze_sampler_group"))
 
     # Optional: collapsed shared-event random-effects likelihood (Gaussian, marginalized; no latent state).
     # This is intended to address "broken independence" from shared-event correlations while targeting
@@ -735,7 +1182,13 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     se_cfg = lk.get("shared_event_re", None)
     se_enabled = False
     se_grouping = "phase"  # 'phase' or 'station_phase'
+    se_cluster_mode = "none"  # 'none' or 'dd_khop' or 'component'
+    se_cluster_k = 1
     se_tau_ps = [0.0, 0.0]  # std in seconds for [P,S]; 0 disables (iid)
+    # Optional: hierarchical (cluster + event) random effects
+    se_hier_enabled = False
+    se_tau_event_ps = [0.0, 0.0]
+    se_tau_cluster_ps = [0.0, 0.0]
     se_joint_ps = False
     se_rho_ps = 0.0
     se_max_nodes_per_group = 512
@@ -746,6 +1199,36 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     # Optional: internal runtime controls for station_phase caching/debugging
     se_cache_max_entries = 4096
     se_cache_log_every = 0
+    # Optional: GPU path controls (shared_event_re GPU batched PCG prototype)
+    se_gpu_enable = None
+    se_gpu_max_groups_per_batch = 64
+    se_gpu_profile = False
+    se_gpu_debug_max_groups = 0
+    se_gpu_max_edges_per_batch = 0
+    se_gpu_reuse_pcg_init = False
+    # Optional: whitening operator for shared_event_re (static covariance).
+    se_whiten_enabled = False
+    se_whiten_edge_weighting = "uniform"
+    se_whiten_edge_weight_ell_km = 1.0
+    se_whiten_edge_weight_eps_km = 1e-3
+    se_whiten_edge_weight_power = 1.0
+    se_whiten_edge_weight_scale_km = 1.0
+    se_whiten_edge_weight_global_scale = 1.0
+    se_whiten_edge_weight_normalize = False
+    se_whiten_cache_max_entries = 8
+    se_whiten_solver = "pcg"
+    se_whiten_pcg_max_iters = 200
+    se_whiten_pcg_tol = 1e-6
+    se_whiten_pcg_min_iters = 0
+    se_whiten_precompute = False
+    se_whiten_precompute_device = "gpu"
+    se_whiten_pcg_batched = False
+    se_whiten_pcg_bucket_nodes = [512, 1024, 2048, 4096, 8192, 16384, 32768]
+    # Optional: auto-tune caps if fallbacks occur
+    se_auto_tune_nodes_cap = False
+    se_auto_tune_nodes_max = 20000
+    se_auto_tune_rows_cap = False
+    se_auto_tune_rows_max = 2000000
     # Optional: solver selection for shared_event_re
     # Phase A implements `pcg_sparse` (quadratic-only; logdet dropped). A dense/exact solver may be
     # added later for small groups (Phase B/C work).
@@ -759,6 +1242,11 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     se_diag_max_rows_per_group = 2048
     se_diag_max_nodes = 1024
     se_diag_seed = 0
+    # Optional: console stats logging cadence for shared_event_re
+    se_stats_log_every_epochs = 0
+    # Optional: collapsed station-phase random effects (additive)
+    se_sp_enabled = False
+    se_sp_tau_ps = [0.0, 0.0]
     if isinstance(se_cfg, dict):
         se_enabled = bool(se_cfg.get("enabled", False))
         if "grouping" in se_cfg and se_cfg["grouping"] is not None:
@@ -767,6 +1255,18 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             se_grouping = "station_phase"
         if se_grouping not in {"phase", "station_phase"}:
             raise _err("model.likelihood.shared_event_re.grouping", "supported: 'phase', 'station_phase'")
+        if "cluster_mode" in se_cfg and se_cfg["cluster_mode"] is not None:
+            se_cluster_mode = str(se_cfg.get("cluster_mode", se_cluster_mode)).strip().lower()
+        if se_cluster_mode in {"dd_khop", "dd-khop", "khop"}:
+            se_cluster_mode = "dd_khop"
+        if se_cluster_mode in {"component", "connected_component", "connected-components", "connectedcomponents"}:
+            se_cluster_mode = "component"
+        if se_cluster_mode not in {"none", "dd_khop", "component"}:
+            raise _err("model.likelihood.shared_event_re.cluster_mode", "supported: 'none', 'dd_khop', 'component'")
+        if "cluster_k" in se_cfg and se_cfg["cluster_k"] is not None:
+            se_cluster_k = int(_require_num(se_cfg.get("cluster_k"), "model.likelihood.shared_event_re.cluster_k"))
+            if se_cluster_k < 0:
+                raise _err("model.likelihood.shared_event_re.cluster_k", "must be >= 0")
 
         if "tau_s" in se_cfg and se_cfg["tau_s"] is not None:
             v = se_cfg["tau_s"]
@@ -779,6 +1279,65 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
                 raise _err("model.likelihood.shared_event_re.tau_s", f"expected number or [P,S] list, got {type(v).__name__}")
         if not (se_tau_ps[0] >= 0.0 and se_tau_ps[1] >= 0.0):
             raise _err("model.likelihood.shared_event_re.tau_s", "must be >= 0")
+
+        if "hierarchical" in se_cfg and se_cfg["hierarchical"] is not None:
+            se_hier_enabled = bool(_require_bool(se_cfg.get("hierarchical"), "model.likelihood.shared_event_re.hierarchical"))
+        if "tau_event_s" in se_cfg and se_cfg["tau_event_s"] is not None:
+            v = se_cfg["tau_event_s"]
+            if isinstance(v, (int, float)):
+                f = float(v)
+                se_tau_event_ps = [f, f]
+            elif isinstance(v, list):
+                se_tau_event_ps = _require_float_list(v, "likelihood.shared_event_re.tau_event_s", length=2)
+            else:
+                raise _err("model.likelihood.shared_event_re.tau_event_s", f"expected number or [P,S] list, got {type(v).__name__}")
+        if "tau_cluster_s" in se_cfg and se_cfg["tau_cluster_s"] is not None:
+            v = se_cfg["tau_cluster_s"]
+            if isinstance(v, (int, float)):
+                f = float(v)
+                se_tau_cluster_ps = [f, f]
+            elif isinstance(v, list):
+                se_tau_cluster_ps = _require_float_list(v, "likelihood.shared_event_re.tau_cluster_s", length=2)
+            else:
+                raise _err("model.likelihood.shared_event_re.tau_cluster_s", f"expected number or [P,S] list, got {type(v).__name__}")
+        if se_hier_enabled:
+            if not (se_tau_event_ps[0] >= 0.0 and se_tau_event_ps[1] >= 0.0):
+                raise _err("model.likelihood.shared_event_re.tau_event_s", "must be >= 0")
+            if not (se_tau_cluster_ps[0] >= 0.0 and se_tau_cluster_ps[1] >= 0.0):
+                raise _err("model.likelihood.shared_event_re.tau_cluster_s", "must be >= 0")
+
+        # Optional: station-phase random effects (collapsed)
+        sp_cfg = se_cfg.get("station_phase_re", None)
+        if isinstance(sp_cfg, dict):
+            se_sp_enabled = bool(sp_cfg.get("enabled", False))
+            if "tau_s" in sp_cfg and sp_cfg.get("tau_s", None) is not None:
+                v = sp_cfg.get("tau_s")
+                if isinstance(v, (int, float)):
+                    f = float(v)
+                    se_sp_tau_ps = [f, f]
+                elif isinstance(v, list):
+                    se_sp_tau_ps = _require_float_list(v, "likelihood.shared_event_re.station_phase_re.tau_s", length=2)
+                else:
+                    raise _err(
+                        "model.likelihood.shared_event_re.station_phase_re.tau_s",
+                        f"expected number or [P,S] list, got {type(v).__name__}",
+                    )
+            if se_sp_enabled and (not (se_sp_tau_ps[0] >= 0.0 and se_sp_tau_ps[1] >= 0.0)):
+                raise _err("model.likelihood.shared_event_re.station_phase_re.tau_s", "must be >= 0")
+
+    if lk_correlated:
+        if not isinstance(se_cfg, dict):
+            raise _err(
+                "model.likelihood.shared_event_re",
+                "required when model.likelihood.type is 'correlated'/'correlated_gaussian'",
+            )
+        if not se_enabled:
+            raise _err(
+                "model.likelihood.shared_event_re.enabled",
+                "must be true when model.likelihood.type is 'correlated'/'correlated_gaussian'",
+            )
+        if (not isinstance(se_cfg, dict)) or ("grouping" not in se_cfg):
+            se_grouping = "station_phase"
 
         if "joint_ps" in se_cfg and se_cfg["joint_ps"] is not None:
             se_joint_ps = bool(se_cfg.get("joint_ps", False))
@@ -816,6 +1375,153 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             se_cache_log_every = int(_require_num(se_cfg["cache_log_every"], "model.likelihood.shared_event_re.cache_log_every"))
             if se_cache_log_every < 0:
                 raise _err("model.likelihood.shared_event_re.cache_log_every", "must be >= 0")
+
+        if "gpu_enable" in se_cfg and se_cfg["gpu_enable"] is not None:
+            se_gpu_enable = bool(_require_bool(se_cfg.get("gpu_enable"), "model.likelihood.shared_event_re.gpu_enable"))
+        if "gpu_max_groups_per_batch" in se_cfg and se_cfg["gpu_max_groups_per_batch"] is not None:
+            se_gpu_max_groups_per_batch = int(
+                _require_num(se_cfg.get("gpu_max_groups_per_batch"), "model.likelihood.shared_event_re.gpu_max_groups_per_batch")
+            )
+            if se_gpu_max_groups_per_batch < 1:
+                raise _err("model.likelihood.shared_event_re.gpu_max_groups_per_batch", "must be >= 1")
+        if "gpu_profile" in se_cfg and se_cfg["gpu_profile"] is not None:
+            se_gpu_profile = bool(_require_bool(se_cfg.get("gpu_profile"), "model.likelihood.shared_event_re.gpu_profile"))
+        if "gpu_debug_max_groups" in se_cfg and se_cfg["gpu_debug_max_groups"] is not None:
+            se_gpu_debug_max_groups = int(
+                _require_num(se_cfg.get("gpu_debug_max_groups"), "model.likelihood.shared_event_re.gpu_debug_max_groups")
+            )
+            if se_gpu_debug_max_groups < 0:
+                raise _err("model.likelihood.shared_event_re.gpu_debug_max_groups", "must be >= 0")
+        if "gpu_max_edges_per_batch" in se_cfg and se_cfg["gpu_max_edges_per_batch"] is not None:
+            se_gpu_max_edges_per_batch = int(
+                _require_num(se_cfg.get("gpu_max_edges_per_batch"), "model.likelihood.shared_event_re.gpu_max_edges_per_batch")
+            )
+            if se_gpu_max_edges_per_batch < 0:
+                raise _err("model.likelihood.shared_event_re.gpu_max_edges_per_batch", "must be >= 0")
+        if "gpu_reuse_pcg_init" in se_cfg and se_cfg["gpu_reuse_pcg_init"] is not None:
+            se_gpu_reuse_pcg_init = bool(_require_bool(se_cfg.get("gpu_reuse_pcg_init"), "model.likelihood.shared_event_re.gpu_reuse_pcg_init"))
+        if "stats_log_every_epochs" in se_cfg and se_cfg["stats_log_every_epochs"] is not None:
+            se_stats_log_every_epochs = int(
+                _require_num(se_cfg.get("stats_log_every_epochs"), "model.likelihood.shared_event_re.stats_log_every_epochs")
+            )
+            if se_stats_log_every_epochs < 0:
+                raise _err("model.likelihood.shared_event_re.stats_log_every_epochs", "must be >= 0")
+        whiten_cfg = se_cfg.get("whitening", None)
+        if isinstance(whiten_cfg, dict):
+            if "enabled" in whiten_cfg and whiten_cfg.get("enabled", None) is not None:
+                se_whiten_enabled = bool(_require_bool(whiten_cfg.get("enabled"), "model.likelihood.shared_event_re.whitening.enabled"))
+            if "solver" in whiten_cfg and whiten_cfg.get("solver", None) is not None:
+                se_whiten_solver = str(whiten_cfg.get("solver", se_whiten_solver)).strip().lower()
+                if se_whiten_solver not in {"chol", "pcg"}:
+                    raise _err(
+                        "model.likelihood.shared_event_re.whitening.solver",
+                        "supported: 'chol', 'pcg'",
+                    )
+            if "edge_weighting" in whiten_cfg and whiten_cfg.get("edge_weighting", None) is not None:
+                se_whiten_edge_weighting = str(whiten_cfg.get("edge_weighting", se_whiten_edge_weighting)).strip().lower()
+            if se_whiten_edge_weighting not in {"uniform", "distance_rbf", "distance_linear", "distance_power"}:
+                raise _err(
+                    "model.likelihood.shared_event_re.whitening.edge_weighting",
+                    "supported: 'uniform', 'distance_rbf', 'distance_linear', 'distance_power'",
+                )
+            if "edge_weight_ell_km" in whiten_cfg and whiten_cfg.get("edge_weight_ell_km", None) is not None:
+                se_whiten_edge_weight_ell_km = float(
+                    _require_num(whiten_cfg.get("edge_weight_ell_km"), "model.likelihood.shared_event_re.whitening.edge_weight_ell_km")
+                )
+                if not (se_whiten_edge_weight_ell_km > 0.0):
+                    raise _err("model.likelihood.shared_event_re.whitening.edge_weight_ell_km", "must be > 0")
+            if "edge_weight_eps_km" in whiten_cfg and whiten_cfg.get("edge_weight_eps_km", None) is not None:
+                se_whiten_edge_weight_eps_km = float(
+                    _require_num(whiten_cfg.get("edge_weight_eps_km"), "model.likelihood.shared_event_re.whitening.edge_weight_eps_km")
+                )
+                if not (se_whiten_edge_weight_eps_km >= 0.0):
+                    raise _err("model.likelihood.shared_event_re.whitening.edge_weight_eps_km", "must be >= 0")
+            if "edge_weight_power" in whiten_cfg and whiten_cfg.get("edge_weight_power", None) is not None:
+                se_whiten_edge_weight_power = float(
+                    _require_num(whiten_cfg.get("edge_weight_power"), "model.likelihood.shared_event_re.whitening.edge_weight_power")
+                )
+                if not (se_whiten_edge_weight_power > 0.0):
+                    raise _err("model.likelihood.shared_event_re.whitening.edge_weight_power", "must be > 0")
+            if "edge_weight_scale_km" in whiten_cfg and whiten_cfg.get("edge_weight_scale_km", None) is not None:
+                se_whiten_edge_weight_scale_km = float(
+                    _require_num(whiten_cfg.get("edge_weight_scale_km"), "model.likelihood.shared_event_re.whitening.edge_weight_scale_km")
+                )
+                if not (se_whiten_edge_weight_scale_km > 0.0):
+                    raise _err("model.likelihood.shared_event_re.whitening.edge_weight_scale_km", "must be > 0")
+            if "edge_weight_global_scale" in whiten_cfg and whiten_cfg.get("edge_weight_global_scale", None) is not None:
+                se_whiten_edge_weight_global_scale = float(
+                    _require_num(whiten_cfg.get("edge_weight_global_scale"), "model.likelihood.shared_event_re.whitening.edge_weight_global_scale")
+                )
+                if not (se_whiten_edge_weight_global_scale > 0.0):
+                    raise _err("model.likelihood.shared_event_re.whitening.edge_weight_global_scale", "must be > 0")
+            if "edge_weight_normalize" in whiten_cfg and whiten_cfg.get("edge_weight_normalize", None) is not None:
+                se_whiten_edge_weight_normalize = bool(
+                    _require_bool(whiten_cfg.get("edge_weight_normalize"), "model.likelihood.shared_event_re.whitening.edge_weight_normalize")
+                )
+            if "cache_max_entries" in whiten_cfg and whiten_cfg.get("cache_max_entries", None) is not None:
+                se_whiten_cache_max_entries = int(
+                    _require_num(whiten_cfg.get("cache_max_entries"), "model.likelihood.shared_event_re.whitening.cache_max_entries")
+                )
+                if se_whiten_cache_max_entries < 0:
+                    raise _err("model.likelihood.shared_event_re.whitening.cache_max_entries", "must be >= 0")
+            if "precompute" in whiten_cfg and whiten_cfg.get("precompute", None) is not None:
+                se_whiten_precompute = bool(
+                    _require_bool(whiten_cfg.get("precompute"), "model.likelihood.shared_event_re.whitening.precompute")
+                )
+            if "precompute_device" in whiten_cfg and whiten_cfg.get("precompute_device", None) is not None:
+                se_whiten_precompute_device = str(
+                    whiten_cfg.get("precompute_device", se_whiten_precompute_device)
+                ).strip().lower()
+                if se_whiten_precompute_device not in {"gpu", "cpu"}:
+                    raise _err("model.likelihood.shared_event_re.whitening.precompute_device", "must be 'gpu' or 'cpu'")
+            if "pcg_max_iters" in whiten_cfg and whiten_cfg.get("pcg_max_iters", None) is not None:
+                se_whiten_pcg_max_iters = int(
+                    _require_num(whiten_cfg.get("pcg_max_iters"), "model.likelihood.shared_event_re.whitening.pcg_max_iters")
+                )
+                if se_whiten_pcg_max_iters <= 0:
+                    raise _err("model.likelihood.shared_event_re.whitening.pcg_max_iters", "must be > 0")
+            if "pcg_tol" in whiten_cfg and whiten_cfg.get("pcg_tol", None) is not None:
+                se_whiten_pcg_tol = float(
+                    _require_num(whiten_cfg.get("pcg_tol"), "model.likelihood.shared_event_re.whitening.pcg_tol")
+                )
+                if not (se_whiten_pcg_tol > 0.0):
+                    raise _err("model.likelihood.shared_event_re.whitening.pcg_tol", "must be > 0")
+            if "pcg_min_iters" in whiten_cfg and whiten_cfg.get("pcg_min_iters", None) is not None:
+                se_whiten_pcg_min_iters = int(
+                    _require_num(whiten_cfg.get("pcg_min_iters"), "model.likelihood.shared_event_re.whitening.pcg_min_iters")
+                )
+                if se_whiten_pcg_min_iters < 0:
+                    raise _err("model.likelihood.shared_event_re.whitening.pcg_min_iters", "must be >= 0")
+            if "pcg_batched" in whiten_cfg and whiten_cfg.get("pcg_batched", None) is not None:
+                se_whiten_pcg_batched = bool(
+                    _require_bool(whiten_cfg.get("pcg_batched"), "model.likelihood.shared_event_re.whitening.pcg_batched")
+                )
+            if "pcg_bucket_nodes" in whiten_cfg and whiten_cfg.get("pcg_bucket_nodes", None) is not None:
+                v = whiten_cfg.get("pcg_bucket_nodes")
+                if not isinstance(v, (list, tuple)) or not v:
+                    raise _err("model.likelihood.shared_event_re.whitening.pcg_bucket_nodes", "must be a non-empty list of ints")
+                try:
+                    se_whiten_pcg_bucket_nodes = [int(x) for x in v]
+                except Exception:
+                    raise _err("model.likelihood.shared_event_re.whitening.pcg_bucket_nodes", "must be a list of ints")
+                if any(x <= 0 for x in se_whiten_pcg_bucket_nodes):
+                    raise _err("model.likelihood.shared_event_re.whitening.pcg_bucket_nodes", "all values must be > 0")
+        if "auto_tune_nodes_cap" in se_cfg and se_cfg["auto_tune_nodes_cap"] is not None:
+            se_auto_tune_nodes_cap = bool(_require_bool(se_cfg.get("auto_tune_nodes_cap"), "model.likelihood.shared_event_re.auto_tune_nodes_cap"))
+        if "auto_tune_nodes_max" in se_cfg and se_cfg["auto_tune_nodes_max"] is not None:
+            se_auto_tune_nodes_max = int(
+                _require_num(se_cfg.get("auto_tune_nodes_max"), "model.likelihood.shared_event_re.auto_tune_nodes_max")
+            )
+            if se_auto_tune_nodes_max < 1:
+                raise _err("model.likelihood.shared_event_re.auto_tune_nodes_max", "must be >= 1")
+        if "auto_tune_rows_cap" in se_cfg and se_cfg["auto_tune_rows_cap"] is not None:
+            se_auto_tune_rows_cap = bool(_require_bool(se_cfg.get("auto_tune_rows_cap"), "model.likelihood.shared_event_re.auto_tune_rows_cap"))
+        if "auto_tune_rows_max" in se_cfg and se_cfg["auto_tune_rows_max"] is not None:
+            se_auto_tune_rows_max = int(
+                _require_num(se_cfg.get("auto_tune_rows_max"), "model.likelihood.shared_event_re.auto_tune_rows_max")
+            )
+            if se_auto_tune_rows_max < 1:
+                raise _err("model.likelihood.shared_event_re.auto_tune_rows_max", "must be >= 1")
 
         if "solver" in se_cfg and se_cfg["solver"] is not None:
             se_solver = str(se_cfg.get("solver", se_solver)).strip().lower()
@@ -897,9 +1603,11 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     # Phase-A implementation (to be implemented in code): quadratic-only (drop logdet).
     sl_cfg = lk.get("slowness_re", None)
     sl_enabled = False
+    sl_mode = "scalar_sep"  # 'scalar_sep' (event-separation slowness RE)
     sl_grouping = "station_phase"  # 'phase' | 'station_phase'
     sl_ell_km = 0.0
     sl_tau_ps = [0.0, 0.0]
+    sl_tau_station_ps = [0.0, 0.0]
     sl_tau_units = "abs"  # 'abs' (s/km) | 'vel_frac' (dimensionless)
     sl_max_rows_per_group = 200000
     sl_max_nodes_per_group = 2048
@@ -936,8 +1644,49 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     sl_pcg_check_every = 0
     sl_pcg_min_inducing = 128
     sl_pcg_min_rows = 2000
+    sl_sep_cap_km = 0.0
+    sl_jitter0 = 1e-8
+    sl_vp_km_s = 6.0
+    sl_vs_km_s = 3.5
+    # Optional ESS for explicit slowness_re latents
+    sl_ess_enabled = False
+    sl_ess_update_every = 1
+    sl_ess_start_after = 0
+    sl_ess_sweeps = 1
+    sl_ess_batch_size = 50_000
+    sl_ess_max_bracket_steps = 64
+    sl_ess_seed = 0
+    sl_ess_freeze_sampler_group = True
+    # Optional: DD-graph random effects (explicit event latents with Laplacian prior).
+    dd_re_enabled = False
+    dd_re_tau_ps = [0.0, 0.0]
+    dd_re_q_diag = 1e-3
+    dd_re_weight_by_pair_count = True
+    dd_re_ess_enabled = False
+    dd_re_ess_update_every = 1
+    dd_re_ess_start_after = 0
+    dd_re_ess_sweeps = 1
+    dd_re_ess_max_bracket_steps = 64
+    dd_re_ess_seed = 0
+    dd_re_ess_freeze_sampler_group = True
+    sl_gpu_enable = None
+    sl_gpu_max_groups_per_batch = 64
+    sl_gpu_max_edges_per_batch = 0
+    sl_gpu_profile = False
+    sl_gpu_debug_max_groups = 0
+    sl_freeze_g_at_map = False
     if isinstance(sl_cfg, dict):
         sl_enabled = bool(sl_cfg.get("enabled", False))
+        if "mode" in sl_cfg and sl_cfg.get("mode", None) is not None:
+            sl_mode = str(sl_cfg.get("mode", sl_mode)).strip().lower()
+        if sl_mode in {"scalar", "scalar_sep", "scalar_separation", "event_sep"}:
+            sl_mode = "scalar_sep"
+        if sl_mode in {"component_station_slowness", "component_station_shared", "component_station_re"}:
+            sl_mode = "component_station"
+        if sl_mode in {"component_station_explicit", "component_station_uncollapsed"}:
+            sl_mode = "component_station_explicit"
+        if sl_mode not in {"scalar_sep", "component_station", "component_station_explicit"}:
+            raise _err("model.likelihood.slowness_re.mode", "supported: 'scalar_sep', 'component_station', 'component_station_explicit'")
         if "grouping" in sl_cfg and sl_cfg.get("grouping", None) is not None:
             sl_grouping = str(sl_cfg.get("grouping", sl_grouping)).strip().lower()
         if sl_grouping in {"stationphase", "station-phase"}:
@@ -947,7 +1696,11 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
 
         if "ell_km" in sl_cfg and sl_cfg.get("ell_km", None) is not None:
             sl_ell_km = float(_require_num(sl_cfg.get("ell_km"), "model.likelihood.slowness_re.ell_km"))
-        if sl_enabled:
+        if "tau_units" in sl_cfg and sl_cfg.get("tau_units", None) is not None:
+            sl_tau_units = str(sl_cfg.get("tau_units", sl_tau_units)).strip().lower()
+            if sl_tau_units not in {"abs", "vel_frac"}:
+                raise _err("model.likelihood.slowness_re.tau_units", "supported: 'abs', 'vel_frac'")
+        if sl_enabled and sl_mode not in {"scalar_sep", "component_station", "component_station_explicit"}:
             if not math.isfinite(sl_ell_km) or not (sl_ell_km > 0.0):
                 raise _err("model.likelihood.slowness_re.ell_km", "must be finite and > 0 when enabled")
 
@@ -969,14 +1722,41 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             elif isinstance(tv, (int, float)):
                 f = float(tv)
                 sl_tau_ps = [f, f]
-                sl_tau_units = "abs"
             elif isinstance(tv, list):
                 sl_tau_ps = _require_float_list(tv, "model.likelihood.slowness_re.tau_s", length=2)
-                sl_tau_units = "abs"
             else:
                 raise _err("model.likelihood.slowness_re.tau_s", f"expected number, [P,S] list, or object, got {type(tv).__name__}")
+        if "tau_station_s" in sl_cfg and sl_cfg.get("tau_station_s", None) is not None:
+            tv = sl_cfg.get("tau_station_s", None)
+            if isinstance(tv, dict):
+                if "vel_frac" not in tv or tv.get("vel_frac", None) is None:
+                    raise _err("model.likelihood.slowness_re.tau_station_s.vel_frac", "required when tau_station_s is an object")
+                vv = tv.get("vel_frac", None)
+                if isinstance(vv, (int, float)):
+                    f = float(vv)
+                    sl_tau_station_ps = [f, f]
+                elif isinstance(vv, list):
+                    sl_tau_station_ps = _require_float_list(vv, "model.likelihood.slowness_re.tau_station_s.vel_frac", length=2)
+                else:
+                    raise _err(
+                        "model.likelihood.slowness_re.tau_station_s.vel_frac",
+                        f"expected number or [P,S] list, got {type(vv).__name__}",
+                    )
+                sl_tau_units = "vel_frac"
+            elif isinstance(tv, (int, float)):
+                f = float(tv)
+                sl_tau_station_ps = [f, f]
+            elif isinstance(tv, list):
+                sl_tau_station_ps = _require_float_list(tv, "model.likelihood.slowness_re.tau_station_s", length=2)
+            else:
+                raise _err(
+                    "model.likelihood.slowness_re.tau_station_s",
+                    f"expected number, [P,S] list, or object, got {type(tv).__name__}",
+                )
         if sl_enabled and (not (sl_tau_ps[0] >= 0.0 and sl_tau_ps[1] >= 0.0)):
             raise _err("model.likelihood.slowness_re.tau_s", "must be >= 0")
+        if sl_enabled and (not (sl_tau_station_ps[0] >= 0.0 and sl_tau_station_ps[1] >= 0.0)):
+            raise _err("model.likelihood.slowness_re.tau_station_s", "must be >= 0")
 
         if "max_rows_per_group" in sl_cfg and sl_cfg.get("max_rows_per_group", None) is not None:
             sl_max_rows_per_group = int(_require_num(sl_cfg.get("max_rows_per_group"), "model.likelihood.slowness_re.max_rows_per_group"))
@@ -986,6 +1766,46 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             sl_max_nodes_per_group = int(_require_num(sl_cfg.get("max_nodes_per_group"), "model.likelihood.slowness_re.max_nodes_per_group"))
             if sl_max_nodes_per_group < 2:
                 raise _err("model.likelihood.slowness_re.max_nodes_per_group", "must be >= 2")
+        if "sep_cap_km" in sl_cfg and sl_cfg.get("sep_cap_km", None) is not None:
+            sl_sep_cap_km = float(_require_num(sl_cfg.get("sep_cap_km"), "model.likelihood.slowness_re.sep_cap_km"))
+            if sl_sep_cap_km < 0.0:
+                raise _err("model.likelihood.slowness_re.sep_cap_km", "must be >= 0")
+        if "jitter0" in sl_cfg and sl_cfg.get("jitter0", None) is not None:
+            sl_jitter0 = float(_require_num(sl_cfg.get("jitter0"), "model.likelihood.slowness_re.jitter0"))
+            if sl_jitter0 <= 0.0:
+                raise _err("model.likelihood.slowness_re.jitter0", "must be > 0")
+        if "vp_km_s" in sl_cfg and sl_cfg.get("vp_km_s", None) is not None:
+            sl_vp_km_s = float(_require_num(sl_cfg.get("vp_km_s"), "model.likelihood.slowness_re.vp_km_s"))
+            if not (math.isfinite(sl_vp_km_s) and sl_vp_km_s > 0.0):
+                raise _err("model.likelihood.slowness_re.vp_km_s", "must be finite and > 0")
+        if "vs_km_s" in sl_cfg and sl_cfg.get("vs_km_s", None) is not None:
+            sl_vs_km_s = float(_require_num(sl_cfg.get("vs_km_s"), "model.likelihood.slowness_re.vs_km_s"))
+            if not (math.isfinite(sl_vs_km_s) and sl_vs_km_s > 0.0):
+                raise _err("model.likelihood.slowness_re.vs_km_s", "must be finite and > 0")
+        if "gpu_enable" in sl_cfg and sl_cfg.get("gpu_enable", None) is not None:
+            sl_gpu_enable = bool(_require_bool(sl_cfg.get("gpu_enable"), "model.likelihood.slowness_re.gpu_enable"))
+        if "gpu_max_groups_per_batch" in sl_cfg and sl_cfg.get("gpu_max_groups_per_batch", None) is not None:
+            sl_gpu_max_groups_per_batch = int(
+                _require_num(sl_cfg.get("gpu_max_groups_per_batch"), "model.likelihood.slowness_re.gpu_max_groups_per_batch")
+            )
+            if sl_gpu_max_groups_per_batch < 1:
+                raise _err("model.likelihood.slowness_re.gpu_max_groups_per_batch", "must be >= 1")
+        if "gpu_max_edges_per_batch" in sl_cfg and sl_cfg.get("gpu_max_edges_per_batch", None) is not None:
+            sl_gpu_max_edges_per_batch = int(
+                _require_num(sl_cfg.get("gpu_max_edges_per_batch"), "model.likelihood.slowness_re.gpu_max_edges_per_batch")
+            )
+            if sl_gpu_max_edges_per_batch < 0:
+                raise _err("model.likelihood.slowness_re.gpu_max_edges_per_batch", "must be >= 0")
+        if "gpu_profile" in sl_cfg and sl_cfg.get("gpu_profile", None) is not None:
+            sl_gpu_profile = bool(_require_bool(sl_cfg.get("gpu_profile"), "model.likelihood.slowness_re.gpu_profile"))
+        if "gpu_debug_max_groups" in sl_cfg and sl_cfg.get("gpu_debug_max_groups", None) is not None:
+            sl_gpu_debug_max_groups = int(
+                _require_num(sl_cfg.get("gpu_debug_max_groups"), "model.likelihood.slowness_re.gpu_debug_max_groups")
+            )
+            if sl_gpu_debug_max_groups < 0:
+                raise _err("model.likelihood.slowness_re.gpu_debug_max_groups", "must be >= 0")
+        if "freeze_g_at_map" in sl_cfg and sl_cfg.get("freeze_g_at_map", None) is not None:
+            sl_freeze_g_at_map = bool(_require_bool(sl_cfg.get("freeze_g_at_map"), "model.likelihood.slowness_re.freeze_g_at_map"))
         if "fallback_to_diag" in sl_cfg and sl_cfg.get("fallback_to_diag", None) is not None:
             sl_fallback_to_diag = bool(sl_cfg.get("fallback_to_diag", True))
         if "drop_logdet" in sl_cfg and sl_cfg.get("drop_logdet", None) is not None:
@@ -1041,6 +1861,41 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
                 sl_pcg_min_rows = int(_require_num(pcg.get("min_rows"), "model.likelihood.slowness_re.pcg.min_rows"))
                 if sl_pcg_min_rows < 1:
                     raise _err("model.likelihood.slowness_re.pcg.min_rows", "must be >= 1")
+
+        if sl_enabled and sl_mode in {"scalar_sep", "component_station", "component_station_explicit"}:
+            sl_plan_enabled = False
+            sl_plan_interpolation_enabled = False
+            sl_fitc_enabled = False
+            sl_sta_basis_enabled = False
+            sl_drop_logdet = True
+        ess_cfg = sl_cfg.get("ess", None)
+        if isinstance(ess_cfg, dict):
+            if "enabled" in ess_cfg and ess_cfg.get("enabled", None) is not None:
+                sl_ess_enabled = bool(_require_bool(ess_cfg.get("enabled"), "model.likelihood.slowness_re.ess.enabled"))
+            if "update_every_epochs" in ess_cfg and ess_cfg.get("update_every_epochs", None) is not None:
+                sl_ess_update_every = int(_require_num(ess_cfg.get("update_every_epochs"), "model.likelihood.slowness_re.ess.update_every_epochs"))
+                if sl_ess_update_every < 1:
+                    raise _err("model.likelihood.slowness_re.ess.update_every_epochs", "must be >= 1")
+            if "start_after_epochs" in ess_cfg and ess_cfg.get("start_after_epochs", None) is not None:
+                sl_ess_start_after = int(_require_num(ess_cfg.get("start_after_epochs"), "model.likelihood.slowness_re.ess.start_after_epochs"))
+                if sl_ess_start_after < 0:
+                    raise _err("model.likelihood.slowness_re.ess.start_after_epochs", "must be >= 0")
+            if "sweeps_per_update" in ess_cfg and ess_cfg.get("sweeps_per_update", None) is not None:
+                sl_ess_sweeps = int(_require_num(ess_cfg.get("sweeps_per_update"), "model.likelihood.slowness_re.ess.sweeps_per_update"))
+                if sl_ess_sweeps < 1:
+                    raise _err("model.likelihood.slowness_re.ess.sweeps_per_update", "must be >= 1")
+            if "batch_size" in ess_cfg and ess_cfg.get("batch_size", None) is not None:
+                sl_ess_batch_size = int(_require_num(ess_cfg.get("batch_size"), "model.likelihood.slowness_re.ess.batch_size"))
+                if sl_ess_batch_size < 1:
+                    raise _err("model.likelihood.slowness_re.ess.batch_size", "must be >= 1")
+            if "max_bracket_steps" in ess_cfg and ess_cfg.get("max_bracket_steps", None) is not None:
+                sl_ess_max_bracket_steps = int(_require_num(ess_cfg.get("max_bracket_steps"), "model.likelihood.slowness_re.ess.max_bracket_steps"))
+                if sl_ess_max_bracket_steps < 8:
+                    raise _err("model.likelihood.slowness_re.ess.max_bracket_steps", "must be >= 8")
+            if "seed" in ess_cfg and ess_cfg.get("seed", None) is not None:
+                sl_ess_seed = int(_require_num(ess_cfg.get("seed"), "model.likelihood.slowness_re.ess.seed"))
+            if "freeze_sampler_group" in ess_cfg and ess_cfg.get("freeze_sampler_group", None) is not None:
+                sl_ess_freeze_sampler_group = bool(_require_bool(ess_cfg.get("freeze_sampler_group"), "model.likelihood.slowness_re.ess.freeze_sampler_group"))
 
         plan = sl_cfg.get("inducing_plan", None)
         if isinstance(plan, dict):
@@ -1443,6 +2298,9 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     if bool(sl_enabled) and bool(se_enabled):
         se_enabled = False
 
+    # sigma_inflation block was removed; keep an explicit flag for downstream guards.
+    sigma_infl_enabled = False
+
     # sigma_inflation is currently incompatible with shared_event_re (pcg_sparse) because that code path
     # assumes a homoscedastic diagonal (no per-row variance).
     if bool(se_enabled) and bool(sigma_infl_enabled):
@@ -1768,19 +2626,207 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["likelihood"] = lk_type
     params["phase_unc"] = phase_unc
     params["_student_t_nu"] = float(student_t_nu)
+    params["_student_t_scale_enabled"] = bool(student_t_scale_enabled)
+    params["_student_t_scale_nu"] = float(student_t_scale_nu)
+    params["_student_t_scale_update_every_epochs"] = int(student_t_scale_update_every)
+    params["_student_t_scale_batch_size"] = int(student_t_scale_batch_size)
+    params["_student_t_scale_init"] = str(student_t_scale_init)
+    params["_student_t_scale_min_lambda"] = float(student_t_scale_min_lambda)
+    params["_student_t_scale_max_lambda"] = float(student_t_scale_max_lambda)
 
     # Correlated forward-model error latent (optional)
     params["_corr_error_enabled"] = bool(corr_enabled)
     params["_corr_error_r"] = int(corr_r)
     params["_corr_error_tau_s"] = [float(corr_tau_ps[0]), float(corr_tau_ps[1])]
     params["_corr_error_rho_ps"] = float(corr_rho_ps)
+    params["_corr_error_station_basis_enabled"] = bool(corr_sta_basis_enabled)
     params["_corr_error_station_basis_ell_km"] = float(corr_sta_ell_km)
     params["_corr_error_station_basis_jitter"] = float(corr_sta_jitter)
     params["_corr_error_station_basis_method"] = str(corr_sta_method)
-    params["_corr_error_event_graph_knn"] = int(corr_knn)
-    params["_corr_error_event_graph_ell_km"] = float(corr_event_ell_km)
+    params["_corr_error_event_graph_enabled"] = bool(corr_graph_enabled)
+    params["_corr_error_event_graph_source"] = str(corr_graph_source)
+    params["_corr_error_event_graph_radius_km"] = float(corr_radius_km)
+    params["_corr_error_event_graph_k"] = int(corr_k)
+    params["_corr_error_event_graph_refresh_every_epochs"] = int(corr_refresh_every)
+    params["_corr_error_event_graph_symmetrize"] = bool(corr_symmetrize)
+    params["_corr_error_event_graph_cell_size_km"] = (float(corr_cell_size_km) if corr_cell_size_km is not None else None)
+    params["_corr_error_event_graph_cell_hops"] = int(corr_cell_hops)
+    params["_corr_error_event_graph_max_tries_per_neighbor"] = int(corr_max_tries_per_neighbor)
     params["_corr_error_event_graph_q_diag"] = float(corr_q_diag)
-    params["_corr_error_event_graph_max_edges_per_step"] = int(corr_max_edges_per_step)
+    params["_corr_error_event_graph_weighting"] = str(corr_weighting)
+    params["_corr_error_event_graph_weight_ell_km"] = (float(corr_weight_ell_km) if corr_weight_ell_km is not None else None)
+    params["_corr_error_event_graph_weight_eps_km"] = float(corr_weight_eps_km)
+    params["_corr_error_event_graph_weight_normalize"] = bool(corr_weight_normalize)
+    params["_corr_error_enable_in_phase1"] = bool(corr_enable_in_phase1)
+    params["_corr_error_phase1_lr_mult"] = float(corr_phase1_lr_mult)
+    params["_corr_error_hierarchical_tau_enabled"] = bool(hier_tau_enabled)
+    params["_corr_error_hierarchical_tau_dof"] = float(hier_tau_dof)
+    params["_corr_error_hierarchical_tau_scale_ps"] = [float(hier_tau_scale_ps[0]), float(hier_tau_scale_ps[1])]
+    params["_corr_error_hierarchical_tau_update_every"] = int(hier_tau_update_every)
+    params["_corr_error_hierarchical_tau_damping"] = float(hier_tau_damping)
+    params["_corr_error_hierarchical_tau_start_after_epochs"] = int(hier_tau_start_after)
+    params["_corr_error_hierarchical_tau_min_tau_s"] = (
+        [float(hier_tau_min_ps[0]), float(hier_tau_min_ps[1])] if hier_tau_min_ps is not None else None
+    )
+    params["_corr_error_hierarchical_tau_max_tau_s"] = (
+        [float(hier_tau_max_ps[0]), float(hier_tau_max_ps[1])] if hier_tau_max_ps is not None else None
+    )
+    # corr_error ESS (optional)
+    params["_corr_error_ess_enabled"] = bool(corr_ess_enabled)
+    params["_corr_error_ess_update_every"] = int(corr_ess_update_every)
+    params["_corr_error_ess_start_after_epochs"] = int(corr_ess_start_after)
+    params["_corr_error_ess_sweeps_per_update"] = int(corr_ess_sweeps)
+    params["_corr_error_ess_batch_size"] = int(corr_ess_batch_size)
+    params["_corr_error_ess_max_bracket_steps"] = int(corr_ess_max_bracket_steps)
+    params["_corr_error_ess_block_by_station"] = bool(corr_ess_block_by_station)
+    params["_corr_error_ess_top_k_stations"] = int(corr_ess_top_k_stations)
+    params["_corr_error_ess_seed"] = int(corr_ess_seed)
+    params["_corr_error_ess_freeze_sampler_group"] = bool(corr_ess_freeze_sampler_group)
+
+    # Collapsed shared-event random effects (optional)
+    params["_shared_event_re_enabled"] = bool(se_enabled)
+    params["_shared_event_re_grouping"] = str(se_grouping)
+    params["_shared_event_re_cluster_mode"] = str(se_cluster_mode)
+    params["_shared_event_re_cluster_k"] = int(se_cluster_k)
+    params["_shared_event_re_tau_s"] = [float(se_tau_ps[0]), float(se_tau_ps[1])]
+    params["_shared_event_re_hierarchical"] = bool(se_hier_enabled)
+    params["_shared_event_re_tau_event_s"] = [float(se_tau_event_ps[0]), float(se_tau_event_ps[1])]
+    params["_shared_event_re_tau_cluster_s"] = [float(se_tau_cluster_ps[0]), float(se_tau_cluster_ps[1])]
+    params["_shared_event_re_rho_ps"] = float(se_rho_ps)
+    params["_shared_event_re_joint_ps"] = bool(se_joint_ps)
+    params["_shared_event_re_max_nodes_per_group"] = int(se_max_nodes_per_group)
+    params["_shared_event_re_max_rows_per_group"] = int(se_max_rows_per_group)
+    params["_shared_event_re_fallback_to_diag"] = bool(se_fallback_to_diag)
+    params["_shared_event_re_jitter0"] = float(se_jitter0)
+    params["_shared_event_re_jitter_max"] = float(se_jitter_max)
+    params["_shared_event_re_cache_max_entries"] = int(se_cache_max_entries)
+    params["_shared_event_re_cache_log_every"] = int(se_cache_log_every)
+    if se_gpu_enable is not None:
+        params["_shared_event_re_gpu_enable"] = bool(se_gpu_enable)
+    params["_shared_event_re_gpu_max_groups_per_batch"] = int(se_gpu_max_groups_per_batch)
+    params["_shared_event_re_gpu_profile"] = bool(se_gpu_profile)
+    params["_shared_event_re_gpu_debug_max_groups"] = int(se_gpu_debug_max_groups)
+    params["_shared_event_re_gpu_max_edges_per_batch"] = int(se_gpu_max_edges_per_batch)
+    params["_shared_event_re_gpu_reuse_pcg_init"] = bool(se_gpu_reuse_pcg_init)
+    params["_shared_event_re_whitening_enabled"] = bool(se_whiten_enabled)
+    params["_shared_event_re_whitening_edge_weighting"] = str(se_whiten_edge_weighting)
+    params["_shared_event_re_whitening_edge_weight_ell_km"] = float(se_whiten_edge_weight_ell_km)
+    params["_shared_event_re_whitening_edge_weight_eps_km"] = float(se_whiten_edge_weight_eps_km)
+    params["_shared_event_re_whitening_edge_weight_power"] = float(se_whiten_edge_weight_power)
+    params["_shared_event_re_whitening_edge_weight_scale_km"] = float(se_whiten_edge_weight_scale_km)
+    params["_shared_event_re_whitening_edge_weight_global_scale"] = float(se_whiten_edge_weight_global_scale)
+    params["_shared_event_re_whitening_edge_weight_normalize"] = bool(se_whiten_edge_weight_normalize)
+    params["_shared_event_re_whitening_cache_max_entries"] = int(se_whiten_cache_max_entries)
+    params["_shared_event_re_whitening_solver"] = str(se_whiten_solver)
+    params["_shared_event_re_whitening_pcg_max_iters"] = int(se_whiten_pcg_max_iters)
+    params["_shared_event_re_whitening_pcg_tol"] = float(se_whiten_pcg_tol)
+    params["_shared_event_re_whitening_pcg_min_iters"] = int(se_whiten_pcg_min_iters)
+    params["_shared_event_re_whitening_precompute"] = bool(se_whiten_precompute)
+    params["_shared_event_re_whitening_precompute_device"] = str(se_whiten_precompute_device)
+    params["_shared_event_re_whitening_pcg_batched"] = bool(se_whiten_pcg_batched)
+    params["_shared_event_re_whitening_pcg_bucket_nodes"] = list(se_whiten_pcg_bucket_nodes)
+    params["_shared_event_re_stats_log_every_epochs"] = int(se_stats_log_every_epochs)
+    params["_shared_event_re_auto_tune_nodes_cap"] = bool(se_auto_tune_nodes_cap)
+    params["_shared_event_re_auto_tune_nodes_max"] = int(se_auto_tune_nodes_max)
+    params["_shared_event_re_auto_tune_rows_cap"] = bool(se_auto_tune_rows_cap)
+    params["_shared_event_re_auto_tune_rows_max"] = int(se_auto_tune_rows_max)
+    params["_shared_event_re_solver"] = str(se_solver)
+    params["_shared_event_re_drop_logdet"] = bool(se_drop_logdet)
+    params["_shared_event_re_pcg_max_iters"] = int(se_pcg_max_iters)
+    params["_shared_event_re_pcg_tol"] = float(se_pcg_tol)
+    params["_shared_event_re_diag_log_every_epochs"] = int(se_diag_log_every_epochs)
+    params["_shared_event_re_diag_max_groups"] = int(se_diag_max_groups)
+    params["_shared_event_re_diag_max_rows_per_group"] = int(se_diag_max_rows_per_group)
+    params["_shared_event_re_diag_max_nodes"] = int(se_diag_max_nodes)
+    params["_shared_event_re_diag_seed"] = int(se_diag_seed)
+    params["_shared_event_re_station_phase_enabled"] = bool(se_sp_enabled)
+    params["_shared_event_re_station_phase_tau_s"] = [float(se_sp_tau_ps[0]), float(se_sp_tau_ps[1])]
+
+    # Slowness random effects (scalar separation mode)
+    params["_slowness_re_enabled"] = bool(sl_enabled)
+    params["_slowness_re_mode"] = str(sl_mode)
+    params["_slowness_re_grouping"] = str(sl_grouping)
+    params["_slowness_re_tau_s"] = [float(sl_tau_ps[0]), float(sl_tau_ps[1])]
+    params["_slowness_re_tau_station_s"] = [float(sl_tau_station_ps[0]), float(sl_tau_station_ps[1])]
+    params["_slowness_re_tau_units"] = str(sl_tau_units)
+    params["_slowness_re_max_rows_per_group"] = int(sl_max_rows_per_group)
+    params["_slowness_re_max_nodes_per_group"] = int(sl_max_nodes_per_group)
+    params["_slowness_re_fallback_to_diag"] = bool(sl_fallback_to_diag)
+    params["_slowness_re_pcg_max_iters"] = int(sl_pcg_max_iters)
+    params["_slowness_re_pcg_tol"] = float(sl_pcg_tol)
+    params["_slowness_re_sep_cap_km"] = float(sl_sep_cap_km)
+    params["_slowness_re_jitter0"] = float(sl_jitter0)
+    params["_slowness_re_freeze_g_at_map"] = bool(sl_freeze_g_at_map)
+    params["_slowness_re_vp_km_s"] = float(sl_vp_km_s)
+    params["_slowness_re_vs_km_s"] = float(sl_vs_km_s)
+    params["_slowness_re_explicit_enabled"] = bool(sl_enabled and (sl_mode == "component_station_explicit"))
+    params["_slowness_re_ess_enabled"] = bool(sl_ess_enabled)
+    params["_slowness_re_ess_update_every"] = int(sl_ess_update_every)
+    params["_slowness_re_ess_start_after"] = int(sl_ess_start_after)
+    params["_slowness_re_ess_sweeps_per_update"] = int(sl_ess_sweeps)
+    params["_slowness_re_ess_batch_size"] = int(sl_ess_batch_size)
+    params["_slowness_re_ess_max_bracket_steps"] = int(sl_ess_max_bracket_steps)
+    params["_slowness_re_ess_seed"] = int(sl_ess_seed)
+    params["_slowness_re_ess_freeze_sampler_group"] = bool(sl_ess_freeze_sampler_group)
+    if sl_gpu_enable is not None:
+        params["_slowness_re_gpu_enable"] = bool(sl_gpu_enable)
+    params["_slowness_re_gpu_max_groups_per_batch"] = int(sl_gpu_max_groups_per_batch)
+    params["_slowness_re_gpu_max_edges_per_batch"] = int(sl_gpu_max_edges_per_batch)
+    params["_slowness_re_gpu_profile"] = bool(sl_gpu_profile)
+    params["_slowness_re_gpu_debug_max_groups"] = int(sl_gpu_debug_max_groups)
+    params["_slowness_re_inducing_plan_enable"] = bool(sl_plan_enabled)
+
+    # Optional: DD-graph random effects (explicit event latents)
+    dd_cfg = lk.get("dd_graph_re", None)
+    if isinstance(dd_cfg, dict):
+        if "enabled" in dd_cfg and dd_cfg.get("enabled", None) is not None:
+            dd_re_enabled = bool(_require_bool(dd_cfg.get("enabled"), "model.likelihood.dd_graph_re.enabled"))
+        if "tau_s" in dd_cfg and dd_cfg.get("tau_s", None) is not None:
+            dd_re_tau_ps = _require_float_list(dd_cfg.get("tau_s"), "model.likelihood.dd_graph_re.tau_s", length=2)
+        if "q_diag" in dd_cfg and dd_cfg.get("q_diag", None) is not None:
+            dd_re_q_diag = float(_require_num(dd_cfg.get("q_diag"), "model.likelihood.dd_graph_re.q_diag"))
+        if "weight_by_pair_count" in dd_cfg and dd_cfg.get("weight_by_pair_count", None) is not None:
+            dd_re_weight_by_pair_count = bool(_require_bool(dd_cfg.get("weight_by_pair_count"), "model.likelihood.dd_graph_re.weight_by_pair_count"))
+        ess_cfg = dd_cfg.get("ess", None)
+        if isinstance(ess_cfg, dict):
+            if "enabled" in ess_cfg and ess_cfg.get("enabled", None) is not None:
+                dd_re_ess_enabled = bool(_require_bool(ess_cfg.get("enabled"), "model.likelihood.dd_graph_re.ess.enabled"))
+            if "update_every_epochs" in ess_cfg and ess_cfg.get("update_every_epochs", None) is not None:
+                dd_re_ess_update_every = int(_require_num(ess_cfg.get("update_every_epochs"), "model.likelihood.dd_graph_re.ess.update_every_epochs"))
+                if dd_re_ess_update_every < 1:
+                    raise _err("model.likelihood.dd_graph_re.ess.update_every_epochs", "must be >= 1")
+            if "start_after_epochs" in ess_cfg and ess_cfg.get("start_after_epochs", None) is not None:
+                dd_re_ess_start_after = int(_require_num(ess_cfg.get("start_after_epochs"), "model.likelihood.dd_graph_re.ess.start_after_epochs"))
+                if dd_re_ess_start_after < 0:
+                    raise _err("model.likelihood.dd_graph_re.ess.start_after_epochs", "must be >= 0")
+            if "sweeps_per_update" in ess_cfg and ess_cfg.get("sweeps_per_update", None) is not None:
+                dd_re_ess_sweeps = int(_require_num(ess_cfg.get("sweeps_per_update"), "model.likelihood.dd_graph_re.ess.sweeps_per_update"))
+                if dd_re_ess_sweeps < 1:
+                    raise _err("model.likelihood.dd_graph_re.ess.sweeps_per_update", "must be >= 1")
+            if "max_bracket_steps" in ess_cfg and ess_cfg.get("max_bracket_steps", None) is not None:
+                dd_re_ess_max_bracket_steps = int(_require_num(ess_cfg.get("max_bracket_steps"), "model.likelihood.dd_graph_re.ess.max_bracket_steps"))
+                if dd_re_ess_max_bracket_steps < 8:
+                    raise _err("model.likelihood.dd_graph_re.ess.max_bracket_steps", "must be >= 8")
+            if "seed" in ess_cfg and ess_cfg.get("seed", None) is not None:
+                dd_re_ess_seed = int(_require_num(ess_cfg.get("seed"), "model.likelihood.dd_graph_re.ess.seed"))
+            if "freeze_sampler_group" in ess_cfg and ess_cfg.get("freeze_sampler_group", None) is not None:
+                dd_re_ess_freeze_sampler_group = bool(_require_bool(ess_cfg.get("freeze_sampler_group"), "model.likelihood.dd_graph_re.ess.freeze_sampler_group"))
+    if dd_re_enabled:
+        if dd_re_tau_ps[0] < 0.0 or dd_re_tau_ps[1] < 0.0:
+            raise _err("model.likelihood.dd_graph_re.tau_s", "must be >= 0")
+        if not math.isfinite(dd_re_q_diag) or dd_re_q_diag < 0.0:
+            raise _err("model.likelihood.dd_graph_re.q_diag", "must be finite and >= 0")
+    params["_dd_graph_re_enabled"] = bool(dd_re_enabled)
+    params["_dd_graph_re_tau_s"] = [float(dd_re_tau_ps[0]), float(dd_re_tau_ps[1])]
+    params["_dd_graph_re_q_diag"] = float(dd_re_q_diag)
+    params["_dd_graph_re_weight_by_pair_count"] = bool(dd_re_weight_by_pair_count)
+    params["_dd_graph_re_ess_enabled"] = bool(dd_re_ess_enabled)
+    params["_dd_graph_re_ess_update_every"] = int(dd_re_ess_update_every)
+    params["_dd_graph_re_ess_start_after"] = int(dd_re_ess_start_after)
+    params["_dd_graph_re_ess_sweeps_per_update"] = int(dd_re_ess_sweeps)
+    params["_dd_graph_re_ess_max_bracket_steps"] = int(dd_re_ess_max_bracket_steps)
+    params["_dd_graph_re_ess_seed"] = int(dd_re_ess_seed)
+    params["_dd_graph_re_ess_freeze_sampler_group"] = bool(dd_re_ess_freeze_sampler_group)
 
     # Latent field (NNGP + ESS) materialized keys (optional)
     params["_latent_field_enabled"] = bool(lf_enabled)
@@ -1923,8 +2969,9 @@ def validate_and_materialize_block4(params: Dict[str, Any]) -> Dict[str, Any]:
             raise _err("diagnostics.wandb.groups", "expected dict[str,bool] or list[str] or null")
 
     # Optional: online ESS/IACT diagnostics during sampling (Phase 4).
-    ess_online = _require_dict(_require(dg, "ess_online", "diagnostics"), "diagnostics.ess_online")
-    ess_online_enabled = _require_bool(_require(ess_online, "enabled", "diagnostics.ess_online"), "diagnostics.ess_online.enabled")
+    ess_online = dg.get("ess_online", None)
+    ess_online = _require_dict(ess_online, "diagnostics.ess_online") if isinstance(ess_online, dict) else None
+    ess_online_enabled = bool(ess_online.get("enabled", False)) if isinstance(ess_online, dict) else False
     if ess_online_enabled:
         ess_every = int(_require_num(_require(ess_online, "every_n_samples", "diagnostics.ess_online"), "diagnostics.ess_online.every_n_samples"))
         if ess_every < 1:
@@ -1988,7 +3035,7 @@ def validate_and_materialize_block4(params: Dict[str, Any]) -> Dict[str, Any]:
         runtime_seed = 0
 
     # Optional: gauge projection (remove translation mode by projecting out mean gradient/noise).
-    # This is an alternative to the centroid prior: it imposes a hard constraint on the mean update.
+    # This imposes a hard constraint on the mean update.
     gp_enable = False
     gp_mode = "global"  # or "cluster" (per connected component) when cluster ids are available
     gp_dims = [0, 1, 2]  # default: spatial only; include 3 to also constrain origin-time mean
