@@ -264,30 +264,30 @@ def build_catalog_posterior_mean(samples_data: Union[dict, Any]):
     sigma_z = 0.5*(np.percentile(event_samples["Z"], 99.5) - np.percentile(event_samples["Z"], 0.5))
     import polars as pl
     catalog = pl.DataFrame(data={"latitude": lats, "longitude": lons, "depth": deps, "X": X, "Y": Y, "Z": Z,
-                          "sigma_x": sigma_x, "sigma_y": sigma_y, "sigma_z": sigma_z})
+                           "sigma_x": sigma_x, "sigma_y": sigma_y, "sigma_z": sigma_z})
     return catalog
 
 
 def plot_event_chains(samples_data: Union[dict, Any],
-                     n_rows=2,
-                     n_cols=2,
-                     coords=("X", "Y", "Z"),
-                     event_indices=None,
-                     event_ids=None,
-                     random_select=False,
-                     burn_in=0,
-                     thin=1,
-                     units="meters",
-                     figsize=(14, 8),
-                     sharex=True,
-                     sharey=False,
-                     xlim=None,
-                     ylim=None,
-                     alpha=0.9,
-                     linewidth=1.0,
-                     show_mean=True,
-                     mean_style=None,
-                     title=None):
+                      n_rows=2,
+                      n_cols=2,
+                      coords=("X", "Y", "Z"),
+                      event_indices=None,
+                      event_ids=None,
+                      random_select=False,
+                      burn_in=0,
+                      thin=1,
+                      units="meters",
+                      figsize=(14, 8),
+                      sharex=True,
+                      sharey=False,
+                      xlim=None,
+                      ylim=None,
+                      alpha=0.9,
+                      linewidth=1.0,
+                      show_mean=True,
+                      mean_style=None,
+                      title=None):
     """Plot MCMC chains (sample index vs value) for selected events.
 
     Args:
@@ -456,6 +456,33 @@ def plot_uncertainty_histograms(
 ):
     """
     Plot cumulative histograms for selected dataframe columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Dataframe containing the data.
+    columns : list of str
+        Column names to plot.
+    labels : list of str, optional
+        Labels for legend; defaults to column names.
+    colors : list of str, optional
+        Colors for each histogram; defaults to matplotlib's cycle.
+    scale : float, optional
+        Multiply values by this scale before plotting.
+    xlim : tuple, optional
+        X-axis limits.
+    xlabel, ylabel : str, optional
+        Axis labels.
+    cumulative : bool, optional
+        Whether to plot cumulative histograms.
+    density : bool, optional
+        Whether to normalize histograms.
+    bins : int or sequence, optional
+        Bins for histogram; defaults to range(len(data)).
+    output_path : str, optional
+        Path to save figure; if None, figure is not saved.
+    legend_loc : str, optional
+        Location for the legend.
     """
     plt = _lazy_import_plt()
     if labels is None:
@@ -515,6 +542,28 @@ def plot_event_marginal_hist2d(samples_data: Union[dict, Any],
 
     Top row: 1D histograms for coords[0], coords[1], coords[2]
     Bottom row: 2D histograms with contours for (coords[0], coords[1]), (coords[0], coords[2]), (coords[1], coords[2])
+
+    Args:
+        samples_data: dict from `spider.io.samples.read_all_samples` with fields including coords and 'event_ids'.
+        event_index: integer index of the event to plot.
+        event_id: optional event id string to locate index (overrides event_index if provided and found).
+        coords: tuple of three coordinate names present in samples_data (default ("X","Y","Z")).
+        burn_in: number of initial samples to discard.
+        units: 'km' (no scaling) or 'meters' (scales values by 1000).
+        xlim: tuple (min, max) range for histogram axes in the chosen units.
+        bins: optional numpy array of bin edges; if None, uses bin_width across xlim.
+        bin_width: used when bins is None to create np.arange(xlim[0], xlim[1], bin_width).
+        figsize, constrained_layout, height_ratios, sharex, sharey: matplotlib layout options.
+        cmap: colormap for 2D hist imshow.
+        density: if True, 1D hist uses density=True.
+        top_row_ylim: optional y-limit for top-row histograms.
+        n_contours: number of contour levels (excluding min).
+        equal_aspect: if True, set equal aspect for bottom row plots.
+        title: optional suptitle for the figure.
+        center_data: if True, subtract the mean from each coordinate before plotting.
+
+    Returns:
+        (fig, axes): matplotlib figure and axes array of shape (2, 3).
     """
     # Validate coords
     if len(coords) != 3:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from spider.utils.console import info, warn
 
 import os
 import glob
@@ -9,6 +10,19 @@ import torch
 import json
 import h5py
 
+from spider.core.config_schema import validate_and_materialize_block1
+from spider.core.priors_config import validate_and_materialize_priors
+
+
+
+# Standardized stdout helper
+def _log(*parts, section: str = "PLOT", **_kwargs) -> None:
+    msg = " ".join(str(p) for p in parts)
+    low = msg.strip().lower()
+    if low.startswith("warning") or low.startswith("error"):
+        warn(msg, section=section)
+    else:
+        info(msg, section=section)
 
 def _load_noise_log_scale_series(checkpoint_dir: str) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -84,7 +98,7 @@ def _load_noise_from_hdf5(samples_outfile: str, thin: int = 1) -> np.ndarray:
                 return np.empty((0, 2), dtype=np.float32)
             return np.concatenate(rows, axis=0)
     except Exception as e:
-        print(f"_load_noise_from_hdf5: failed to read '{samples_outfile}': {e}")
+        _log(f"_load_noise_from_hdf5: failed to read '{samples_outfile}': {e}")
         return np.empty((0, 2), dtype=np.float32)
 
 
@@ -130,14 +144,19 @@ def plot_noise_scale_posterior_vs_prior(
             with open(params, "r") as f:
                 params = json.load(f)
         except Exception as e:
-            print(f"plot_noise_scale_posterior_vs_prior: failed to read params from '{params}': {e}")
+            _log(f"plot_noise_scale_posterior_vs_prior: failed to read params from '{params}': {e}")
             return False
 
-    # Resolve samples store path from nested io block if needed
-    if isinstance(params, dict) and ("samples_outfile" not in params):
-        io_cfg = params.get("io", None)
-        if isinstance(io_cfg, dict) and ("samples_outfile" in io_cfg):
-            params["samples_outfile"] = io_cfg.get("samples_outfile")
+    # If params is a nested config dict (new schema), materialize legacy flat keys for this plot.
+    # Do NOT attempt to re-validate if the caller already passed a materialized dict (which contains
+    # legacy flat keys and would be rejected by strict validators).
+    if isinstance(params, dict) and ("io" in params) and ("dtime_file" not in params):
+        try:
+            params = validate_and_materialize_block1(params)
+            params = validate_and_materialize_priors(params)
+        except Exception as e:
+            _log(f"plot_noise_scale_posterior_vs_prior: invalid params config: {e}")
+            return False
 
     # Import matplotlib lazily so importing spider.plotting works even in environments without a
     # working matplotlib binary (common with NumPy 2.x ABI mismatches).
@@ -161,7 +180,7 @@ def plot_noise_scale_posterior_vs_prior(
         cdir = checkpoint_dir or params.get("checkpoint_dir", "checkpoints/")
         log_scales, epochs = _load_noise_log_scale_series(cdir)
         if log_scales.size == 0:
-            print("plot_noise_scale_posterior_vs_prior: no noise samples found in HDF5 or checkpoints.")
+            _log(f"plot_noise_scale_posterior_vs_prior: no noise samples found in HDF5 or checkpoints.")
             return False
 
     # Apply burn-in (drop first burn_in samples)
@@ -211,5 +230,7 @@ def plot_noise_scale_posterior_vs_prior(
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    print(f"Wrote noise scale prior/posterior plot to {out_path}")
+    _log(f"Wrote noise scale prior/posterior plot to {out_path}")
     return True
+
+
