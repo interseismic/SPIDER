@@ -414,37 +414,9 @@ def _set_backend_noise(optimizer: torch.optim.Optimizer, *, enabled: bool, scale
     """Set noise flags consistently for any sampler backend."""
     if not hasattr(optimizer, "param_groups"):
         return
-    # AdaptiveSGHMC uses a BOHAMIANN-style update which *can* inject noise, but in SPIDER we
-    # still want consistent Phase semantics:
-    # - Phase 2: noise_scale_factor=0 => effectively deterministic drift (no injected noise)
-    # - Phase 3: ramp noise_scale_factor up
-    # - Phase 4: full sampling noise
-    #
-    # We detect AdaptiveSGHMC via the param-group preconditioner tag set by the backend factory.
-    force_on = False
-    try:
-        if len(optimizer.param_groups) > 0:  # type: ignore[attr-defined]
-            p0 = optimizer.param_groups[0]  # type: ignore[index]
-            if str(p0.get("preconditioner", "")).strip().lower() == "adaptive_sghmc":
-                force_on = True
-    except Exception:
-        force_on = False
-
     for g in optimizer.param_groups:  # type: ignore[attr-defined]
-        if force_on:
-            g["add_noise"] = True
-            # For AdaptiveSGHMC, keep `add_noise=True` but allow `noise_scale` to be 0.0 to
-            # match Phase 2 (deterministic) behavior.
-            try:
-                s = float(scale)
-                if not math.isfinite(s) or s < 0.0:
-                    s = 0.0
-            except Exception:
-                s = 0.0
-            g["noise_scale"] = s
-        else:
-            g["add_noise"] = bool(enabled and (scale > 0.0))
-            g["noise_scale"] = float(scale if enabled else 0.0)
+        g["add_noise"] = bool(enabled and (scale > 0.0))
+        g["noise_scale"] = float(scale if enabled else 0.0)
 
 def _run_epoch(
     state: LocateState,
@@ -608,17 +580,6 @@ def _run_epoch(
     # Noise setup (generic sampler backend)
     # If noise_scale_factor > 0, enable noise; else disable (e.g., Phase 2). Phase 3 ramps it.
     _set_backend_noise(optimizer, enabled=(noise_scale_factor > 0.0), scale=float(noise_scale_factor))
-    # For AdaptiveSGHMC we want burn-in driven by *epochs* (Phase 3) rather than optimizer step counts.
-    # Expose this via `param_group['is_burnin']`, which the optimizer reads.
-    try:
-        if hasattr(optimizer, "param_groups") and len(optimizer.param_groups) > 0:
-            p0 = optimizer.param_groups[0]
-            if str(p0.get("preconditioner", "")).strip().lower() == "adaptive_sghmc":
-                for g in optimizer.param_groups:
-                    g["is_burnin"] = bool(int(phase_id) == 3)
-    except Exception:
-        pass
-
     # SVRG Snapshot Update (only if SVRG enabled and we are sampling)
     svrg_enabled = state.svrg_enable and is_sampling
     if ddp_enabled and svrg_enabled:

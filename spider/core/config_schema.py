@@ -58,8 +58,6 @@ _FORBIDDEN_BLOCK2_TOPLEVEL_KEYS: Tuple[str, ...] = (
     "freeze_preconditioner_sampling",
     "sghmc_alpha",
     # SGNHT (removed)
-    "sgnht_diffusion",
-    "sgnht_thermostat_mass",
 )
 
 _FORBIDDEN_BLOCK3_TOPLEVEL_KEYS: Tuple[str, ...] = (
@@ -260,7 +258,7 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
       sampler.lr (list[float], length 4, each >0)
         - lr[0] is Phase 1 (MAP), lr[1] Phase 2, lr[2] Phase 3, lr[3] Phase 4
 
-      sampler.backend in {"psgld","sghmc","adaptive_sghmc","sgnht","adsgld_adam"}
+      sampler.backend in {"psgld","sghmc"}
       sampler.temperature (float>=0)
       sampler.preconditioning.enabled (bool)
       sampler.preconditioning.type (string) if enabled
@@ -284,8 +282,6 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
       sampler.sghmc_alpha (>0) iff backend=="sghmc" (no default)
       sampler.dt_lr_mult (optional float>0, default 1.0): multiplier applied to the ΔT gradient (dimension 3)
         to effectively use a different learning rate for the origin-time correction component.
-      sampler.adaptive_drift (required iff backend=="adsgld_adam"):
-        {beta1 (0<=b1<1), beta2 (0<=b2<1), eps (>0), scale (>0)}
     """
     forbidden_present = [k for k in _FORBIDDEN_BLOCK2_TOPLEVEL_KEYS if k in params]
     if forbidden_present:
@@ -353,8 +349,8 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     if not (lr_warmup > 0.0):
         raise _err("inference.sampler.lr[0]", "must be > 0")
     backend = _require_str(_require(sampler, "backend", "inference.sampler"), "inference.sampler.backend").lower()
-    if backend not in {"psgld", "sghmc", "adaptive_sghmc", "sgnht", "adsgld_adam"}:
-        raise _err("sampler.backend", "supported: 'psgld', 'sghmc', 'adaptive_sghmc', 'sgnht', 'adsgld_adam'")
+    if backend not in {"psgld", "sghmc"}:
+        raise _err("sampler.backend", "supported: 'psgld', 'sghmc'")
     if "lr_mode" in sampler:
         raise _err("sampler.lr_mode", "removed; lr_mode is fixed to 'per_obs'")
     temperature = _require_num(_require(sampler, "temperature", "sampler"), "sampler.temperature")
@@ -386,34 +382,7 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
         if not (sampler_grad_clip_norm >= 0.0):
             raise _err("sampler.grad_clip_norm", "must be >= 0")
 
-    # Adaptive drift (Adam variant) parameters.
-    adaptive_drift_cfg = sampler.get("adaptive_drift", None)
-    if backend == "adsgld_adam":
-        if not isinstance(adaptive_drift_cfg, dict):
-            raise _err("inference.sampler.adaptive_drift", "required when sampler.backend='adsgld_adam'")
-        ad_beta1 = _require_num(_require(adaptive_drift_cfg, "beta1", "inference.sampler.adaptive_drift"), "inference.sampler.adaptive_drift.beta1")
-        ad_beta2 = _require_num(_require(adaptive_drift_cfg, "beta2", "inference.sampler.adaptive_drift"), "inference.sampler.adaptive_drift.beta2")
-        ad_eps = _require_num(_require(adaptive_drift_cfg, "eps", "inference.sampler.adaptive_drift"), "inference.sampler.adaptive_drift.eps")
-        ad_scale = _require_num(_require(adaptive_drift_cfg, "scale", "inference.sampler.adaptive_drift"), "inference.sampler.adaptive_drift.scale")
-    else:
-        if isinstance(adaptive_drift_cfg, dict):
-            ad_beta1 = _require_num(adaptive_drift_cfg.get("beta1", 0.9), "inference.sampler.adaptive_drift.beta1")
-            ad_beta2 = _require_num(adaptive_drift_cfg.get("beta2", 0.999), "inference.sampler.adaptive_drift.beta2")
-            ad_eps = _require_num(adaptive_drift_cfg.get("eps", 1e-8), "inference.sampler.adaptive_drift.eps")
-            ad_scale = _require_num(adaptive_drift_cfg.get("scale", 1.0), "inference.sampler.adaptive_drift.scale")
-        else:
-            ad_beta1 = 0.9
-            ad_beta2 = 0.999
-            ad_eps = 1e-8
-            ad_scale = 1.0
-    if not (0.0 <= ad_beta1 < 1.0):
-        raise _err("inference.sampler.adaptive_drift.beta1", "must satisfy 0 <= beta1 < 1")
-    if not (0.0 <= ad_beta2 < 1.0):
-        raise _err("inference.sampler.adaptive_drift.beta2", "must satisfy 0 <= beta2 < 1")
-    if not (ad_eps > 0.0) or not math.isfinite(float(ad_eps)):
-        raise _err("inference.sampler.adaptive_drift.eps", "must be finite and > 0")
-    if not (ad_scale > 0.0) or not math.isfinite(float(ad_scale)):
-        raise _err("inference.sampler.adaptive_drift.scale", "must be finite and > 0")
+    # Adaptive drift removed; only pSGLD/SGHMC are supported.
 
     precond = _require_dict(_require(sampler, "preconditioning", "sampler"), "sampler.preconditioning")
     precond_enabled = _require_bool(_require(precond, "enabled", "sampler.preconditioning"), "sampler.preconditioning.enabled")
@@ -439,14 +408,14 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
             raise _err("sampler.preconditioning.type", "supported: 'rmsprop','blockdiag_fisher' (alias: 'matrix_ema'),'monge','shampoo'")
 
         # Backend-specific support
-        if backend in {"sghmc", "adaptive_sghmc", "sgnht"} and precond_type == "blockdiag_fisher":
+        if backend == "sghmc" and precond_type == "blockdiag_fisher":
             raise _err(
                 "sampler.preconditioning.type",
                 "'blockdiag_fisher' is currently supported for backend='psgld' only. "
-                "For SGHMC/AdaptiveSGHMC/SGNHT use 'rmsprop' preconditioning (AdaptiveSGHMC has its own diagonal "
-                "preconditioner) unless/until a true preconditioned-SGHMC block-metric implementation is added.",
+                "For SGHMC use 'rmsprop' preconditioning unless/until a true preconditioned-SGHMC block-metric "
+                "implementation is added.",
             )
-        if backend in {"sghmc", "adaptive_sghmc", "sgnht"} and precond_type in {"monge", "shampoo"}:
+        if backend == "sghmc" and precond_type in {"monge", "shampoo"}:
             raise _err(
                 "sampler.preconditioning.type",
                 "'monge' and 'shampoo' preconditioners are currently supported for backend='psgld' only.",
@@ -530,9 +499,8 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             raise _err("sampler.preconditioning.blockdiag_fisher", f"invalid: {e}")
 
-    # sghmc_alpha is required for SGHMC, and we also reuse it as the friction/mdecay knob
-    # for adaptive_sghmc (BOHAMIANN-style) to avoid introducing a separate required field.
-    if backend in {"sghmc", "adaptive_sghmc"}:
+    # sghmc_alpha is required for SGHMC.
+    if backend == "sghmc":
         alpha = _require_num(_require(sampler, "sghmc_alpha", "sampler"), "sampler.sghmc_alpha")
         if not (alpha > 0.0):
             raise _err("sampler.sghmc_alpha", "must be > 0")
@@ -541,17 +509,6 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
         _require(sampler, "sghmc_alpha", "sampler")
         alpha = 0.0
 
-    # Optional SGNHT parameters (used only when backend == 'sgnht').
-    sgnht_diffusion = 0.01
-    if "sgnht_diffusion" in sampler and sampler.get("sgnht_diffusion", None) is not None:
-        sgnht_diffusion = float(_require_num(sampler.get("sgnht_diffusion"), "sampler.sgnht_diffusion"))
-        if not (sgnht_diffusion > 0.0) or (not math.isfinite(sgnht_diffusion)):
-            raise _err("sampler.sgnht_diffusion", "must be finite and > 0")
-    sgnht_thermostat_mass = 1.0
-    if "sgnht_thermostat_mass" in sampler and sampler.get("sgnht_thermostat_mass", None) is not None:
-        sgnht_thermostat_mass = float(_require_num(sampler.get("sgnht_thermostat_mass"), "sampler.sgnht_thermostat_mass"))
-        if not (sgnht_thermostat_mass > 0.0) or (not math.isfinite(sgnht_thermostat_mass)):
-            raise _err("sampler.sgnht_thermostat_mass", "must be finite and > 0")
 
     # ---- materialize legacy flat keys (implementation detail) ----
     params["phase1_epochs"] = phase1_epochs
@@ -574,8 +531,6 @@ def validate_and_materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     params["sampler_eps"] = eps
     params["freeze_preconditioner_sampling"] = bool(freeze_preconditioner_sampling)
     params["sghmc_alpha"] = alpha
-    params["sgnht_diffusion"] = float(sgnht_diffusion)
-    params["sgnht_thermostat_mass"] = float(sgnht_thermostat_mass)
     params["blockdiag_fisher_max_cluster_size"] = int(blockdiag_fisher_max_cluster_size)
     params["blockdiag_fisher_partition_method"] = str(blockdiag_fisher_partition_method)
     params["sampler_preconditioning_include_gamma"] = bool(precond_include_gamma)

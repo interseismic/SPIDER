@@ -186,54 +186,6 @@ def _sampler_extra_metrics(optimizer: Optional[torch.optim.Optimizer]) -> Dict[s
     return metrics
 
 
-def _sampler_sgnht_metrics(optimizer: Optional[torch.optim.Optimizer]) -> Dict[str, float]:
-    """Optional SGNHT-specific diagnostics for W&B."""
-    metrics: Dict[str, float] = {}
-    if optimizer is None:
-        return metrics
-    try:
-        if hasattr(optimizer, "sgnht_stats"):
-            s = optimizer.sgnht_stats()  # type: ignore[attr-defined]
-            if isinstance(s, dict):
-                xi_mean = float(s.get("xi_mean", float("nan")))
-                xi_med = float(s.get("xi_median", float("nan")))
-                kin_gm = float(s.get("kinetic_gm_over_target", float("nan")))
-                kin_med = float(s.get("kinetic_median_over_target", float("nan")))
-                if xi_mean == xi_mean:
-                    metrics["sgnht/xi_mean"] = xi_mean
-                if xi_med == xi_med:
-                    metrics["sgnht/xi_median"] = xi_med
-                if kin_gm == kin_gm:
-                    metrics["sgnht/kinetic_gm_over_target"] = kin_gm
-                if kin_med == kin_med:
-                    metrics["sgnht/kinetic_median_over_target"] = kin_med
-    except Exception:
-        pass
-    return metrics
-
-
-def _apply_sgnht_per_obs_scaling(state: LocateState, sampler: Optional[torch.optim.Optimizer]) -> None:
-    """Scale SGNHT diffusion and thermostat_mass to preserve per-obs dynamics."""
-    try:
-        if sampler is None or not hasattr(sampler, "param_groups"):
-            return
-        backend = str(state.params.get("sampler_backend", "")).strip().lower()
-        if backend != "sgnht":
-            return
-        n_obs = int(max(1, int(state.N)))
-        base_diff = float(state.params.get("sgnht_diffusion", 0.01))
-        base_mass = float(state.params.get("sgnht_thermostat_mass", 1.0))
-        diff_eff = base_diff * float(n_obs)
-        mass_eff = base_mass / float(n_obs)
-        if (not math.isfinite(diff_eff)) or (diff_eff <= 0.0):
-            diff_eff = float(base_diff)
-        if (not math.isfinite(mass_eff)) or (mass_eff <= 0.0):
-            mass_eff = float(base_mass)
-        for g in sampler.param_groups:
-            g["diffusion"] = float(diff_eff)
-            g["thermostat_mass"] = float(mass_eff)
-    except Exception:
-        return
 
 
 def _compute_phase_mads(
@@ -1120,15 +1072,8 @@ def _setup_sampler(state: LocateState) -> torch.optim.Optimizer:
             precond_type_json = "none"
         if sampler is not None and hasattr(sampler, "param_groups"):
             for g in sampler.param_groups:
-                if backend_name == "adaptive_sghmc":
-                    g["preconditioning"] = True
-                    g["preconditioner"] = "adaptive_sghmc"
-                elif backend_name == "adsgld_adam":
-                    g["preconditioning"] = False
-                    g["preconditioner"] = "none"
-                else:
-                    g["preconditioning"] = precond_json
-                    g["preconditioner"] = precond_type_json
+                g["preconditioning"] = precond_json
+                g["preconditioner"] = precond_type_json
         # One-time debug log to confirm resolved preconditioning settings.
         try:
             if sampler is not None and hasattr(sampler, "param_groups") and len(sampler.param_groups) > 0:
@@ -1311,22 +1256,6 @@ def _phase2_preconditioner(
         if 'noise_scale' in g:
             g['noise_scale'] = 0.0
 
-        # AdaptiveSGHMC has its own internal preconditioner (v_hat) and burn-in adaptation.
-        # Do NOT clobber its identity/flags with the generic Phase-2 logic.
-        if sampler_backend == "adaptive_sghmc":
-            g["preconditioner"] = "adaptive_sghmc"
-            g["preconditioning"] = True
-            g["freeze_preconditioner"] = False
-            g["is_burnin"] = True
-            continue
-        # Adaptive-drift SGLD (Adam variant) does not use preconditioning.
-        if sampler_backend == "adsgld_adam":
-            g["preconditioner"] = "none"
-            g["preconditioning"] = False
-            g["freeze_preconditioner"] = True
-            g["is_burnin"] = True
-            continue
-            
         # include blockdiag_fisher (alias: matrix_ema) and non-diagonal metrics as valid Phase 2 preconditioners
         if user_preconditioning and user_precond_type in {"rmsprop", "blockdiag_fisher", "matrix_ema", "monge", "shampoo"}:
             g['preconditioner'] = user_precond_type
@@ -1396,8 +1325,6 @@ def _phase2_preconditioner(
                 })
                 if sampler_extra:
                     wandb_metrics.update(sampler_extra)
-            if _want_wandb_group(state.params, "sgnht"):
-                wandb_metrics.update(_sampler_sgnht_metrics(sampler))
             wandb_logger.log_phase2_metrics(epoch, wandb_metrics, global_step=state.global_step_count)
 
         # Report current posterior noise scales instead of MADs (rank0 only under torchrun)
@@ -1639,46 +1566,23 @@ def _phase3_noise_ramp(
     # Set constant learning rate (per-observation scaling).
     lr_user = _lr_for_phase(state.params, "phase3")
     sampler_backend = str(state.params["sampler_backend"]).lower()
-    if sampler_backend in {"psgld", "sghmc", "adaptive_sghmc", "sgnht", "adsgld_adam"}:
+    if sampler_backend in {"psgld", "sghmc"}:
         base_lr = lr_user / float(max(1, int(state.N)))
     else:
         base_lr = lr_user
     sampler.set_lr(base_lr)
-    _apply_sgnht_per_obs_scaling(state, sampler)
     _apply_sampler_group_overrides(state, sampler)
     
     for g in sampler.param_groups:
-        # Phase 3 is burn-in / noise-ramp. We intentionally allow the preconditioner to adapt here
-        # for *all* backends (including pSGLD/SGHMC). Freezing the preconditioner too early can
-        # lock in poorly-initialized statistics (e.g., v≈0 for RMSProp), which effectively makes
-        # G≈1/eps and can cause catastrophic step/noise amplification once Phase 3 injects noise.
-        #
-        # The user-facing config key is `sampler.freeze_preconditioner_sampling`, and we apply it
-        # in Phase 4 (sampling) only.
-        if sampler_backend == "adaptive_sghmc":
-            g["freeze_preconditioner"] = False
-            g["preconditioner"] = "adaptive_sghmc"
-            g["preconditioning"] = True
-        else:
-            g["freeze_preconditioner"] = False
-        # Scale-adapted SGHMC needs to adapt its statistics during the burn-in phase
-        # regardless of whether the preconditioning is frozen for sampling.
-        g['is_burnin'] = True
-    if sampler_backend == "adaptive_sghmc":
-        ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
-        if ddp_main:
-            _log(f"Phase 3: burn-in | {_format_sampler_status(sampler)}")
-    else:
-        ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
-        if ddp_main:
-            _log(f"Phase 3: noise ramp | {_format_sampler_status(sampler)}")
+        # Phase 3 is burn-in / noise-ramp. Allow the preconditioner to adapt here.
+        g["freeze_preconditioner"] = False
+        g["is_burnin"] = True
+    ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
+    if ddp_main:
+        _log(f"Phase 3: noise ramp | {_format_sampler_status(sampler)}")
 
     for t in range(start_epoch, ramp_len):
-        # Noise scale ramp: skip for adaptive samplers because they expect full noise during burn-in/adaptation.
-        if sampler_backend == "adaptive_sghmc":
-            progress = 1.0
-        else:
-            progress = float(min(1.0, (t + 1) / float(ramp_len)))
+        progress = float(min(1.0, (t + 1) / float(ramp_len)))
 
         # Optional extra noise multiplier (applied in both Phase 3 and Phase 4).
         try:
@@ -1747,8 +1651,6 @@ def _phase3_noise_ramp(
                 _wb_add_if_finite(wandb_metrics, "tau_mean", tau_mean)
                 _wb_add_if_finite(wandb_metrics, "tau_med", tau_med)
                 wandb_metrics.update(_sampler_extra_metrics(sampler))
-            if _want_wandb_group(state.params, "sgnht"):
-                wandb_metrics.update(_sampler_sgnht_metrics(sampler))
             wandb_logger.log_phase3_metrics(t, wandb_metrics, global_step=state.global_step_count)
 
         # Report current posterior noise scales instead of MADs (rank0 only under torchrun)
@@ -1819,7 +1721,7 @@ def _phase4_sampling(
     try:
         lr_user = _lr_for_phase(state.params, "phase4")
         backend = str(state.params["sampler_backend"]).strip().lower()
-        if backend in {"psgld", "sghmc", "adaptive_sghmc", "sgnht", "adsgld_adam"}:
+        if backend in {"psgld", "sghmc"}:
             base_lr = lr_user / float(max(1, int(state.N)))
         else:
             base_lr = lr_user
@@ -1828,7 +1730,6 @@ def _phase4_sampling(
         else:
             for g in sampler.param_groups:
                 g['lr'] = base_lr
-        _apply_sgnht_per_obs_scaling(state, sampler)
     except Exception:
         pass
 
@@ -2067,8 +1968,6 @@ def _phase4_sampling(
                 # Drift diagnostics (subset + rolling epoch-level batch-means test)
                 if drift_metrics:
                     wandb_metrics.update(drift_metrics)
-            if _want_wandb_group(state.params, "sgnht"):
-                wandb_metrics.update(_sampler_sgnht_metrics(sampler))
             wandb_logger.log_phase4_metrics(epoch, wandb_metrics, global_step=state.global_step_count)
 
         # Compact console line (rank0 only under torchrun)
@@ -4429,7 +4328,7 @@ def locate_all(
             # Enforce required param-group keys expected by our current samplers.
             lr_user = _lr_for_phase(state.params, phase)
             backend = str(state.params["sampler_backend"]).strip().lower()
-            if backend in {"psgld", "sghmc", "adaptive_sghmc", "sgnht", "adsgld_adam"}:
+            if backend in {"psgld", "sghmc"}:
                 lr_json = lr_user / float(max(1, int(state.N)))
             else:
                 lr_json = lr_user
@@ -4449,15 +4348,8 @@ def locate_all(
                 g.setdefault("eps", eps_json)
                 g.setdefault("temperature", temp_json)
                 # Always honor current JSON preconditioning flags on resume.
-                if backend == "adaptive_sghmc":
-                    g["preconditioning"] = True
-                    g["preconditioner"] = "adaptive_sghmc"
-                elif backend == "adsgld_adam":
-                    g["preconditioning"] = False
-                    g["preconditioner"] = "none"
-                else:
-                    g["preconditioning"] = precond_json
-                    g["preconditioner"] = precond_type_json
+                g["preconditioning"] = precond_json
+                g["preconditioner"] = precond_type_json
                 if 'add_noise' not in g:
                     ns = float(g.get('noise_scale', 0.0))
                     g['add_noise'] = bool(ns > 0.0)
@@ -4472,7 +4364,6 @@ def locate_all(
             else:
                 for g in sampler.param_groups:
                     g['lr'] = lr_json
-            _apply_sgnht_per_obs_scaling(state, sampler)
             # Also take temperature from JSON on restart (override)
             for g in sampler.param_groups:
                 g["temperature"] = temp_json

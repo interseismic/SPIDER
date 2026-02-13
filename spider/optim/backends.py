@@ -3,10 +3,8 @@
 import torch
 from typing import Tuple, List
 
-from .sgld import pSGLD, AdaptiveDriftSGLDAdam  # default backend
+from .sgld import pSGLD  # default backend
 from .sghmc import SGHMC
-from .adaptive_sghmc import AdaptiveSGHMC
-from .sgnht import SGNHT
 
 
 def _attach_set_lr(opt: torch.optim.Optimizer) -> None:
@@ -53,11 +51,7 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
 
     Supported backends:
       - 'psgld' (default)
-      - 'adsgld_adam' (adaptive-drift SGLD, Adam variant)
       - 'sghmc'
-      - 'adaptive_sghmc'
-      - 'sgnht'
-      - 'sgld_simple' (plain SGD, mostly for debugging)
 
     Legacy aliases are no longer supported; use the canonical backend names above.
     """
@@ -123,28 +117,6 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         _maybe_attach_gauge_projection(opt, params=params, state=state)
         return "psgld", opt
 
-    if backend == "adsgld_adam":
-        # Algorithm 1 uses step size epsilon directly (no per-obs scaling).
-        lr_eff = lr
-        base_group = {"params": base_params_list, "group_name": "core"}
-        param_groups = [base_group]
-        opt = AdaptiveDriftSGLDAdam(
-            params=param_groups,
-            n_obs=state.N,
-            lr=lr_eff,
-            beta1=float(params.get("adaptive_drift_beta1", 0.9)),
-            beta2=float(params.get("adaptive_drift_beta2", 0.999)),
-            eps_adam=float(params.get("adaptive_drift_eps", 1e-8)),
-            drift_scale=float(params.get("adaptive_drift_scale", 1.0)),
-            add_noise=False,
-        )
-        _ensure_common_group_keys(opt, params=params, n_obs=state.N)
-        for g in opt.param_groups:
-            g["preconditioning"] = False
-            g["preconditioner"] = "none"
-        _maybe_attach_gauge_projection(opt, params=params, state=state)
-        return "adsgld_adam", opt
-
     if backend == "sghmc":
         # SGHMC drift uses n_obs * (minibatch-mean grad) internally; scale lr down by n_obs.
         lr_eff = lr / float(n_obs)
@@ -175,84 +147,8 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         _maybe_attach_gauge_projection(opt, params=params, state=state)
         return "sghmc", opt
 
-    if backend == "adaptive_sghmc":
-        # BOHAMIANN-style adaptive (scale-adapted) SGHMC.
-        # Uses burn-in to adapt diagonal preconditioning statistics.
-        mdecay = float(params.get("adaptive_sghmc_mdecay", params.get("sghmc_alpha", 0.05)))
-        # Use the standard sampler epsilon (sampler.eps in nested config), materialized as `sampler_eps`.
-        # This keeps the epsilon knob consistent across samplers and avoids a separate adaptive_sghmc-specific epsilon.
-        eps = float(params["sampler_eps"])
-        # AdaptiveSGHMC's update uses lr^2 in the drift term. SPIDER uses "sum-loglik" convention
-        # by scaling drift gradients by n_obs (scale_grad).
-        # Choose lr_eff so that (lr_eff^2) * n_obs ≈ lr_sampler.
-        lr_eff = float(lr / float(n_obs))
-        lr_eff = float(max(lr_eff, 0.0)) ** 0.5
-        base_group = {"params": base_params_list, "group_name": "core"}
-        param_groups = [base_group]
-        opt = AdaptiveSGHMC(
-            params=param_groups,
-            lr=lr_eff,
-            # In SPIDER, default burn-in length is controlled by Phase 3 (epochs),
-            # unless explicitly overridden via adaptive_sghmc_burnin_steps.
-            num_burn_in_steps=int(params.get("adaptive_sghmc_burnin_steps", params.get("phase3_epochs", 0))),
-            epsilon=eps,
-            # BOHAMIANN uses mdecay as the (constant) friction term.
-            mdecay=mdecay,
-            scale_grad=float(state.N),
-            # BOHAMIANN always injects noise; SPIDER will still manage noise_scale/temperature,
-            # but we force add_noise on in the epoch runner for this backend.
-            add_noise=True,
-        )
-        _ensure_common_group_keys(opt, params=params, n_obs=state.N)
-        # Identify the preconditioner for logging
-        for g in opt.param_groups:
-            g["preconditioner"] = "adaptive_sghmc"
-            g["preconditioning"] = True
-            g["n_obs"] = int(state.N)
-            g["scale_grad"] = float(state.N)
-        _maybe_attach_gauge_projection(opt, params=params, state=state)
-        return "adaptive_sghmc", opt
-
-    if backend == "sgnht":
-        lr_eff = lr / float(n_obs)
-        diffusion = float(params.get("sgnht_diffusion", 0.01))
-        thermostat_mass = float(params.get("sgnht_thermostat_mass", 1.0))
-        # Keep SGNHT dynamics comparable by scaling diffusion and thermostat mass.
-        diffusion = diffusion * float(n_obs)
-        thermostat_mass = thermostat_mass / float(max(1, int(n_obs)))
-        base_group = {"params": base_params_list, "group_name": "core"}
-        param_groups = [base_group]
-        opt = SGNHT(
-            params=param_groups,
-            n_obs=state.N,
-            lr=lr_eff,
-            beta=float(params["sampler_beta"]),
-            eps=float(params["sampler_eps"]),
-            diffusion=diffusion,
-            thermostat_mass=thermostat_mass,
-            preconditioning=bool(params["sampler_preconditioning"]),
-            add_noise=False,
-        )
-        _ensure_common_group_keys(opt, params=params, n_obs=state.N)
-        precond = str(params["sampler_preconditioner"]).strip().lower()
-        for g in opt.param_groups:
-            g["preconditioner"] = precond
-            g["preconditioning"] = bool(params["sampler_preconditioning"])
-        _maybe_attach_gauge_projection(opt, params=params, state=state)
-        _attach_set_lr(opt)
-        return "sgnht", opt
-
-    if backend == "sgld_simple":
-        # Simple SGD-based backend with no preconditioning; acts as placeholder
-        base_group = {"params": base_params_list, "group_name": "core"}
-        param_groups = [base_group]
-        opt = torch.optim.SGD(param_groups, lr=lr)
-        _attach_set_lr(opt)
-        _ensure_common_group_keys(opt, params=params, n_obs=state.N)
-        return "sgld_simple", opt
-
     raise ValueError(
-        f"Unknown sampler backend '{backend}'. Supported: psgld, sghmc, adaptive_sghmc, sgnht, sgld_simple."
+        f"Unknown sampler backend '{backend}'. Supported: psgld, sghmc."
     )
 
 

@@ -263,9 +263,6 @@ Important options:
 
 - `psgld`
 - `sghmc`
-- `adaptive_sghmc`
-- `sgnht`
-- `adsgld_adam`
 
 Common settings:
 
