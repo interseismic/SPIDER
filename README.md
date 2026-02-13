@@ -9,6 +9,7 @@ SPIDER is a Python toolkit for probabilistic earthquake relocation using differe
 
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [EikoNet training](#eikonet-training)
 - [Input data formats](#input-data-formats)
 - [Configuration](#configuration)
 - [CLI workflow](#cli-workflow)
@@ -53,6 +54,47 @@ python -m spider sample my_params.json --device 0
 
 ```bash
 python -m spider sample-multi my_params.json --devices 0,1,2,3
+```
+
+## EikoNet training
+
+SPIDER expects a trained EikoNet travel‑time model (`model.model_file`). Train it once for your velocity model and spatial domain.
+
+Example `eikonet.json`:
+
+```json
+{
+  "velmod_file": "/path/to/velmod.csv",
+  "lon_min": -117.5,
+  "lat_min": 33.0,
+  "z_min": -5.0,
+  "z_max": 80.0,
+  "scale": 400.0,
+  "model_file": "/path/to/model_state_dict.pt",
+  "train_batch_size": 512,
+  "val_batch_size": 10000,
+  "n_train": 1000000,
+  "n_test": 2000000,
+  "n_epochs": 1000,
+  "lr": 1e-3
+}
+```
+
+Train (script in repo root):
+
+```bash
+python eikonet_train_1D.py eikonet.json
+```
+
+Velocity model CSV format:
+
+```csv
+depth,vs,vp
+-5.0,3.3,6.0
+0.0,3.3,6.0
+5.0,3.4,6.1
+10.0,3.5,6.2
+...
 ```
 
 ## Input data formats
