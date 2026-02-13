@@ -108,6 +108,134 @@ Paths and output settings:
 - `batching`: batch sizes and optional event‑batching
 - `diagnostics`: logging and post‑hoc diagnostics
 
+## Example configuration (from `yifan_redo`)
+
+This is a real, working nested config from `yifan_redo/SPIDER_yifan.json` with paths shortened for readability:
+
+```json
+{
+  "io": {
+    "dtime_file": "/path/to/dtimes.csv",
+    "station_file": "/path/to/stations.csv",
+    "catalog_infile": "/path/to/events.csv",
+    "catalog_outfile": "/path/to/SPIDER_out.cat",
+    "samples_outfile": "/path/to/SPIDER_samples.h5",
+    "checkpoint_dir": "/path/to/checkpoints/",
+    "checkpoint_interval": 100,
+    "save_every_n": 10,
+    "write_samples": true
+  },
+  "wandb": {
+    "enabled": true,
+    "project_name": "spider_paper",
+    "run_name": "yifan_redo"
+  },
+  "model": {
+    "model_file": "/path/to/model_state_dict.pt",
+    "domain": {
+      "lon_min": -119.6127,
+      "lat_min": 33.8856,
+      "z_min": -2.0,
+      "z_max": 30.0,
+      "scale": 400.0
+    },
+    "priors": {
+      "event": {
+        "enabled": true,
+        "type": "gaussian",
+        "params": { "std": [0.5, 0.5, 0.5, 0.2] }
+      },
+      "centroid": {
+        "enabled": true,
+        "type": "gaussian",
+        "params": { "std": [0.01, 0.01, 0.01, 0.01] }
+      }
+    },
+    "likelihood": {
+      "type": "correlated_gaussian",
+      "phase_unc": [0.02, 0.03],
+      "shared_event_re": {
+        "enabled": true,
+        "grouping": "station_phase",
+        "tau_s": [0.033, 0.06],
+        "max_nodes_per_group": 25000,
+        "max_rows_per_group": 1500000,
+        "solver": "pcg_sparse",
+        "pcg_max_iters": 20,
+        "pcg_tol": 5e-3,
+        "gpu_max_groups_per_batch": 128,
+        "gpu_max_edges_per_batch": 1500000,
+        "gpu_reuse_pcg_init": true,
+        "whitening": {
+          "enabled": true,
+          "solver": "pcg",
+          "pcg_batched": true,
+          "pcg_bucket_nodes": [4096, 16384, 25000],
+          "pcg_max_iters": 100,
+          "pcg_tol": 3e-4,
+          "pcg_min_iters": 2,
+          "precompute": true,
+          "precompute_device": "gpu",
+          "edge_weighting": "distance_power",
+          "edge_weight_power": 0.25,
+          "edge_weight_scale_km": 40.0,
+          "edge_weight_global_scale": 1.0,
+          "edge_weight_normalize": true,
+          "edge_weight_eps_km": 1e-3
+        }
+      }
+    },
+    "filters": {
+      "dtimes": {
+        "remove_duplicates": true,
+        "max_abs_input_dt": 99999,
+        "dtime_thin_frac": 1.0,
+        "flip_dt_sign": false,
+        "cc_min": 0.0
+      },
+      "events": {
+        "min_dtimes": 1,
+        "min_unique_phase_per_event": 8,
+        "min_dtimes_per_pair": 1,
+        "min_event_degree": 3,
+        "min_events_per_cluster": 0,
+        "ratio_filter_phase": "before"
+      },
+      "residual": {
+        "enabled": false,
+        "method": "mad",
+        "mad_sigma": 3.0,
+        "abs_max": 99999
+      }
+    }
+  },
+  "inference": {
+    "compute": { "devices": [1, 3] },
+    "sampler": {
+      "backend": "psgld",
+      "epochs_per_phase": [1000, 100, 100, 100000],
+      "lr": [1e-3, 1e-2, 1e-2, 1e-2],
+      "dt_lr_mult": 0.2,
+      "temperature": 1.0,
+      "eps": 1e-5,
+      "preconditioning": { "enabled": true, "type": "rmsprop" },
+      "beta": 0.99
+    },
+    "batching": {
+      "standard": { "warmup": 1000000, "sgld": 1000000, "shuffle": false },
+      "event_batches": { "enabled": false, "events_per_batch": 50, "max_edges_per_batch": 200000 }
+    },
+    "diagnostics": {
+      "pair_count_stats_enable": true,
+      "display_precond_every": 50,
+      "wandb": { "enabled": true }
+    }
+  }
+}
+```
+
+See the full file for all diagnostics and runtime options: `yifan_redo/SPIDER_yifan.json`.
+
 ## CLI workflow
 
 The CLI entrypoint is `python -m spider`:
@@ -241,10 +369,14 @@ Useful modules:
 If you use SPIDER in your research, please cite:
 
 ```bibtex
-@software{spider2026,
+@misc{ross2026spiderscalableprobabilisticinference,
   title={SPIDER: Scalable Probabilistic Inference for Differential Earthquake Relocation},
+  author={Zachary E. Ross and John D. Wilding and Kamyar Azizzadenesheli and Aitaro Kato},
   year={2026},
-  url={https://github.com/interseismic/SPIDER}
+  eprint={2508.12117},
+  archivePrefix={arXiv},
+  primaryClass={physics.geo-ph},
+  url={https://arxiv.org/abs/2508.12117}
 }
 ```
 ## SPIDER
