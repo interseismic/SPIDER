@@ -12,6 +12,7 @@ SPIDER is a Python toolkit for probabilistic earthquake relocation using differe
 - [EikoNet training](#eikonet-training)
 - [Input data formats](#input-data-formats)
 - [Configuration](#configuration)
+- [Additional configuration blocks](#additional-configuration-blocks)
 - [CLI workflow](#cli-workflow)
 - [Likelihoods and correlated residuals](#likelihoods-and-correlated-residuals)
 - [Samplers](#samplers)
@@ -153,6 +154,44 @@ Paths and output settings:
 - `batching`: batch sizes and optional event‑batching
 - `diagnostics`: logging and post‑hoc diagnostics
 
+## Additional configuration blocks
+
+These are commonly used in real configs but not exhaustively listed above:
+
+### Likelihood extras
+
+- `model.likelihood.sigma_distance_linear`: distance‑dependent sigma (linear in separation)
+- `model.likelihood.shared_event_re.whitening`: PCG whitening preconditioner options
+- `model.likelihood.shared_event_re.edge_weighting`: distance‑based weights (`distance_power`)
+
+### Filters
+
+- `model.filters.dtimes`: duplicate removal, thinning, sign flips, cc thresholds
+- `model.filters.events`: min counts, degree filters, pair‑station ratio filters
+- `model.filters.events.linearization_error`: linearization error filter (optional)
+- `model.filters.residual`: residual outlier filter (usually Phase‑2 only)
+
+### Sampler details
+
+- `inference.sampler.epochs_per_phase`: per‑phase epochs
+- `inference.sampler.dt_lr_mult`: learning‑rate scale for dt parameters
+- `inference.sampler.eps`, `beta`, `sghmc_alpha`
+- `inference.sampler.preconditioning`: RMSProp config
+
+### Diagnostics
+
+- `inference.diagnostics.wandb.groups`: metric group switches
+- `inference.diagnostics.shared_event_legcorr2d`: correlated‑residual diagnostics
+- `inference.diagnostics.resid_distribution`: residual histograms/QQ
+- `inference.diagnostics.shared_event_re_tau`: tau grid search
+- `inference.diagnostics.resid_scalar_metrics`: binned residual metrics
+- `inference.diagnostics.truth_catalog`: optional truth catalog for eval
+
+### Runtime and safety
+
+- `inference.runtime`: logging cadence, cache clearing, checkpoint behavior
+- `inference.safety.max_abs_dX`: clamp on hypocenter step sizes
+
 ## CLI workflow
 
 The CLI entrypoint is `python -m spider`:
@@ -224,6 +263,9 @@ Important options:
 
 - `psgld`
 - `sghmc`
+- `adaptive_sghmc`
+- `sgnht`
+- `adsgld_adam`
 
 Common settings:
 
