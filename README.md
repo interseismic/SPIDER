@@ -108,9 +108,9 @@ Paths and output settings:
 - `batching`: batch sizes and optional event‑batching
 - `diagnostics`: logging and post‑hoc diagnostics
 
-## Example configuration (from `yifan_redo`)
+## Example configuration
 
-This is a real, working nested config from `yifan_redo/SPIDER_yifan.json` with paths shortened for readability:
+This is a real, working nested config with paths shortened for readability:
 
 ```json
 {
@@ -128,7 +128,7 @@ This is a real, working nested config from `yifan_redo/SPIDER_yifan.json` with p
   "wandb": {
     "enabled": true,
     "project_name": "spider_paper",
-    "run_name": "yifan_redo"
+    "run_name": "run_001"
   },
   "model": {
     "model_file": "/path/to/model_state_dict.pt",
@@ -234,7 +234,7 @@ This is a real, working nested config from `yifan_redo/SPIDER_yifan.json` with p
 }
 ```
 
-See the full file for all diagnostics and runtime options: `yifan_redo/SPIDER_yifan.json`.
+See the full file for all diagnostics and runtime options:
 
 ## CLI workflow
 
@@ -406,7 +406,7 @@ pip install -e '.[wandb]'
 1) Copy a nested config and edit paths:
 
 - `spider/examples/params_template.json`
-- or a project config (e.g., `yifan_redo/SPIDER_yifan.json`)
+- or a project config (e.g., `project/SPIDER.json`)
 
 2) Run the full pipeline on one GPU:
 
