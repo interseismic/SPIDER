@@ -17,7 +17,7 @@ SPIDER is a Python toolkit for probabilistic earthquake relocation using differe
 - [Samplers](#samplers)
 - [Batching and performance](#batching-and-performance)
 - [Diagnostics](#diagnostics)
-- [W\&B outputs](#wandb-outputs)
+- [WandB outputs](#wandb-outputs)
 - [Learning rate tuning (variance ratio)](#learning-rate-tuning-variance-ratio)
 - [Python API](#python-api)
 - [Example configuration](#example-configuration)
@@ -262,7 +262,7 @@ Optional event‑level batching:
 - Shared‑event correlation diagnostics (`shared_event_legcorr2d`)
 - Online ESS (optional)
 
-## W&B outputs
+## WandB outputs
 
 Enable W&B with:
 
