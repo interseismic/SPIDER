@@ -16,7 +16,10 @@ SPIDER is a Python toolkit for probabilistic earthquake relocation using differe
 - [Samplers](#samplers)
 - [Batching and performance](#batching-and-performance)
 - [Diagnostics](#diagnostics)
+- [W\&B outputs](#wandb-outputs)
+- [Learning rate tuning (variance ratio)](#learning-rate-tuning-variance-ratio)
 - [Python API](#python-api)
+- [Example configuration](#example-configuration)
 - [Citation](#citation)
 
 ## Installation
@@ -107,6 +110,171 @@ Paths and output settings:
 - `sampler`: backend and hyperparameters
 - `batching`: batch sizes and optional event‑batching
 - `diagnostics`: logging and post‑hoc diagnostics
+
+## CLI workflow
+
+The CLI entrypoint is `python -m spider`:
+
+```bash
+python -m spider --help
+```
+
+Core commands:
+
+```bash
+# Phase 1 (MAP) -> writes <checkpoint_dir>/phase2_bundle.pth
+python -m spider locate-map my_params.json --device 0
+
+# Phase 2–4 (sampling) from the Phase‑2 bundle
+python -m spider sample my_params.json --device 0
+
+# Full pipeline (Phase 1–4)
+python -m spider locate-full my_params.json --device 0
+
+# Multi‑GPU independent chains
+python -m spider sample-multi my_params.json --devices 0,1,2,3
+```
+
+## Likelihoods and correlated residuals
+
+`model.likelihood.type` supports:
+
+- `gaussian` / `l2` (alias: `mse`)
+- `laplace` / `l1` / `mae`
+- `huber`
+- `student_t` (requires `model.likelihood.student_t.nu`)
+- `correlated` / `correlated_gaussian`
+
+Key fields:
+
+- `phase_unc`: per‑phase noise standard deviation `[P, S]`
+- `sigma_distance_linear`: optional distance‑dependent sigma
+
+### Shared‑event correlated residuals
+
+Enable the collapsed shared‑event random‑effects model:
+
+```json
+"model": {
+  "likelihood": {
+    "type": "correlated_gaussian",
+    "shared_event_re": {
+      "enabled": true,
+      "grouping": "station_phase",
+      "tau_s": [0.03, 0.04],
+      "solver": "pcg_sparse"
+    }
+  }
+}
+```
+
+Important options:
+
+- `grouping`: `station_phase`
+- `tau_s`: per‑phase shared‑event scale
+- `solver`: PCG‑based solvers (`pcg_sparse`)
+- `whitening`: optional PCG whitening preconditioner
+- `edge_weighting`: distance‑based edge weights (`distance_power`)
+
+## Samplers
+
+`inference.sampler.backend` supports:
+
+- `psgld`
+- `sghmc`
+
+Common settings:
+
+- `lr`: per‑phase learning rates
+- `temperature`: target temperature
+- `preconditioning`: RMSProp‑style preconditioning
+
+## Batching and performance
+
+`inference.batching.standard` controls Phase‑2/4 batch sizes:
+
+- `warmup`: batch size for Phase‑2 drift
+- `sgld`: batch size for Phase‑4 sampling
+- `shuffle`: shuffle rows per epoch
+
+Optional event‑level batching:
+
+```json
+"inference": {
+  "batching": {
+    "event_batches": {
+      "enabled": true,
+      "events_per_batch": 100,
+      "max_edges_per_batch": 1000000
+    }
+  }
+}
+```
+
+## Diagnostics
+
+`inference.diagnostics` controls:
+
+- W&B logging groups
+- Residual distribution diagnostics
+- Shared‑event correlation diagnostics (`shared_event_legcorr2d`)
+- Online ESS (optional)
+
+## W&B outputs
+
+Enable W&B with:
+
+```json
+"wandb": {
+  "enabled": true,
+  "project_name": "spider_runs",
+  "run_name": "my_run"
+}
+```
+
+Metric groups are controlled by `inference.diagnostics.wandb.groups`. Common groups:
+
+- `core`: total loss, likelihood, priors
+- `noise`: phase noise and variance‑related metrics
+- `sampler`: sampler diagnostics (e.g., drift/noise ratios)
+- `precond`: preconditioner stats (RMSProp moments)
+- `resid_rms`: residual RMS by phase
+- `corr_error`: correlated‑residual diagnostics (shared‑event RE)
+
+If you do not see a group, check `inference.diagnostics.wandb.groups` in your config.
+
+## Learning rate tuning (variance ratio)
+
+For SGHMC‑style samplers, SPIDER logs a variance‑ratio diagnostic:
+
+- `grad_noise_to_langevin_*`: ratio of minibatch‑gradient noise variance to injected Langevin noise variance.
+
+Target range for stable sampling is typically **~0.1–1.0**. Use this heuristic:
+
+- **Ratio > 1.0**: reduce `inference.sampler.lr` (Phase‑4) by 2–5×.
+- **Ratio < 0.1**: increase `inference.sampler.lr` by 2–5×.
+
+Keep batch size, temperature, and preconditioning fixed while tuning `lr`. Once the
+ratio is in range, you can fine‑tune for mixing speed.
+
+## Python API
+
+Common analysis helpers:
+
+```python
+from spider.io.samples import read_all_samples
+from spider.analysis import compute_cat_dd_and_xyz
+
+samples = read_all_samples(params, thin=5)
+summary = compute_cat_dd_and_xyz(samples, burn_in=100)
+```
+
+Useful modules:
+
+- `spider.io`: reading/writing, samples, checkpoints
+- `spider.analysis`: diagnostics and calibration
+- `spider.plotting`: visualization helpers
+- `spider.core`: inference pipeline and likelihoods
 
 ## Example configuration
 
@@ -234,135 +402,7 @@ This is a real, working nested config with paths shortened for readability:
 }
 ```
 
-See the full file for all diagnostics and runtime options:
-
-## CLI workflow
-
-The CLI entrypoint is `python -m spider`:
-
-```bash
-python -m spider --help
-```
-
-Core commands:
-
-```bash
-# Phase 1 (MAP) -> writes <checkpoint_dir>/phase2_bundle.pth
-python -m spider locate-map my_params.json --device 0
-
-# Phase 2–4 (sampling) from the Phase‑2 bundle
-python -m spider sample my_params.json --device 0
-
-# Full pipeline (Phase 1–4)
-python -m spider locate-full my_params.json --device 0
-
-# Multi‑GPU independent chains
-python -m spider sample-multi my_params.json --devices 0,1,2,3
-```
-
-## Likelihoods and correlated residuals
-
-`model.likelihood.type` supports:
-
-- `gaussian` / `l2` (alias: `mse`)
-- `laplace` / `l1` / `mae`
-- `huber`
-- `student_t` (requires `model.likelihood.student_t.nu`)
-- `correlated` / `correlated_gaussian`
-
-Key fields:
-
-- `phase_unc`: per‑phase noise standard deviation `[P, S]`
-- `sigma_distance_linear`: optional distance‑dependent sigma
-
-### Shared‑event correlated residuals
-
-Enable the collapsed shared‑event random‑effects model:
-
-```json
-"model": {
-  "likelihood": {
-    "type": "correlated_gaussian",
-    "shared_event_re": {
-      "enabled": true,
-      "grouping": "station_phase",
-      "tau_s": [0.03, 0.04],
-      "solver": "pcg_sparse"
-    }
-  }
-}
-```
-
-Important options:
-
-- `grouping`: `station_phase`
-- `tau_s`: per‑phase shared‑event scale
-- `solver`: PCG‑based solvers (`pcg_sparse`)
-- `whitening`: optional PCG whitening preconditioner
-- `edge_weighting`: distance‑based edge weights (`distance_power`)
-
-## Samplers
-
-`inference.sampler.backend` supports:
-
-- `psgld`
-- `sghmc`
-
-Common settings:
-
-- `lr`: per‑phase learning rates
-- `temperature`: target temperature
-- `preconditioning`: RMSProp‑style preconditioning
-
-## Batching and performance
-
-`inference.batching.standard` controls Phase‑2/4 batch sizes:
-
-- `warmup`: batch size for Phase‑2 drift
-- `sgld`: batch size for Phase‑4 sampling
-- `shuffle`: shuffle rows per epoch
-
-Optional event‑level batching:
-
-```json
-"inference": {
-  "batching": {
-    "event_batches": {
-      "enabled": true,
-      "events_per_batch": 100,
-      "max_edges_per_batch": 1000000
-    }
-  }
-}
-```
-
-## Diagnostics
-
-`inference.diagnostics` controls:
-
-- W&B logging groups
-- Residual distribution diagnostics
-- Shared‑event correlation diagnostics (`shared_event_legcorr2d`)
-- Online ESS (optional)
-
-## Python API
-
-Common analysis helpers:
-
-```python
-from spider.io.samples import read_all_samples
-from spider.analysis import compute_cat_dd_and_xyz
-
-samples = read_all_samples(params, thin=5)
-summary = compute_cat_dd_and_xyz(samples, burn_in=100)
-```
-
-Useful modules:
-
-- `spider.io`: reading/writing, samples, checkpoints
-- `spider.analysis`: diagnostics and calibration
-- `spider.plotting`: visualization helpers
-- `spider.core`: inference pipeline and likelihoods
+See the full file for all diagnostics and runtime options: `yifan_redo/SPIDER_yifan.json`.
 
 ## Citation
 
@@ -379,201 +419,3 @@ If you use SPIDER in your research, please cite:
   url={https://arxiv.org/abs/2508.12117}
 }
 ```
-## SPIDER
-
-SPIDER (**S**calable **P**robabilistic **I**nference for **D**ifferential **E**arthquake **R**elocation) relocates earthquakes from differential travel times using:
-
-- A fast travel‑time surrogate (EikoNet, PyTorch)
-- A multi‑phase inference pipeline (MAP warmup → preconditioning drift → noise ramp → sampling)
-- GPU acceleration and optional Weights & Biases logging
-
-This repo contains the `spider/` Python package and its CLI.
-
-## Installation
-
-```bash
-pip install -e .
-```
-
-Optional extras:
-
-```bash
-pip install -e '.[wandb]'
-```
-
-## Quick start (CLI)
-
-1) Copy a nested config and edit paths:
-
-- `spider/examples/params_template.json`
-- or a project config (e.g., `project/SPIDER.json`)
-
-2) Run the full pipeline on one GPU:
-
-```bash
-python -m spider locate-full path/to/params.json --device 0
-```
-
-3) Recommended workflow: run Phase 1 once, then sample one or more chains:
-
-```bash
-# Phase 1 (MAP) -> writes <checkpoint_dir>/phase2_bundle.pth by default
-python -m spider locate-map path/to/params.json --device 0
-
-# Phase 2–4 (sampling) from the Phase‑2 bundle
-python -m spider sample path/to/params.json --device 0
-```
-
-4) Multiple independent chains across GPUs:
-
-```bash
-python -m spider locate-map path/to/params.json --device 0
-python -m spider sample-multi path/to/params.json --devices 0,1,2,3
-```
-
-See all commands and options:
-
-```bash
-python -m spider --help
-```
-
-## Input data formats (CSV)
-
-SPIDER reads CSVs via **Polars** and expects:
-
-- **Event catalog** (`io.catalog_infile`)
-  - Required: `evid`, `longitude`, `latitude`, `depth`, `time`
-  - `time` must be parseable as a datetime string
-
-- **Stations** (`io.station_file`)
-  - Required: `network`, `station`, `longitude`, `latitude`
-  - Optional: `depth` (missing values treated as 0.0)
-
-- **Differential times** (`io.dtime_file`)
-  - Required: `network`, `station`, `evid1`, `evid2`, `dt`, `phase`
-  - Optional: `cc`
-  - `phase` may be `"P"/"S"` or `0/1` (normalized to `0=P`, `1=S`)
-
-## Outputs
-
-Configured under the `io` block:
-
-- `io.catalog_outfile`: relocated catalog output
-- `io.samples_outfile`: HDF5 MCMC samples (Phase 4)
-- `io.checkpoint_dir`: phase‑tagged checkpoints and bundles
-
-## Configuration guide (nested JSON)
-
-Configs are **strict nested blocks**. Start from a template and modify.
-
-Top‑level sections you will typically edit:
-
-### `io`
-Paths, checkpoints, and sample saving.
-
-### `model`
-- `model.model_file`: EikoNet checkpoint
-- `model.domain`: spatial bounds and scale (`lon_min`, `lat_min`, `z_min`, `z_max`, `scale`)
-- `model.priors`: event and centroid priors
-- `model.likelihood`: residual model and correlated errors
-- `model.filters`: dtimes/events/residual filters
-
-### `inference`
-- `inference.compute`: device list (single‑device commands also accept `--device`)
-- `inference.sampler`: sampler backend and hyperparameters
-- `inference.batching`: batch sizes and optional event‑batching
-- `inference.diagnostics`: logging, W&B metrics, residual diagnostics
-
-## Likelihood models
-
-`model.likelihood.type` supports:
-
-- `gaussian` / `l2` (alias: `mse`)
-- `laplace` / `l1` / `mae`
-- `huber`
-- `student_t` (with `model.likelihood.student_t.nu`)
-- `correlated` / `correlated_gaussian` (requires `shared_event_re.enabled=true`)
-
-Key fields:
-
-- `phase_unc`: per‑phase noise standard deviation `[P, S]`
-- `sigma_distance_linear`: optional distance‑dependent sigma (linear in separation)
-
-### Shared‑event correlated residuals
-
-Enable with:
-
-```json
-"model": {
-  "likelihood": {
-    "type": "correlated_gaussian",
-    "shared_event_re": { "enabled": true, "grouping": "station_phase", ... }
-  }
-}
-```
-
-Important options:
-
-- `grouping`: `station_phase` (default in most configs)
-- `tau_s`: per‑phase shared‑event scale
-- `solver`: `pcg_sparse` (CPU) + optional GPU batching
-- `whitening`: optional PCG whitening preconditioner
-- `edge_weighting`: distance‑based edge weights (`distance_power` with scale/power)
-
-## Samplers
-
-`inference.sampler.backend` supports:
-
-- `psgld`
-- `sghmc`
-- `adaptive_sghmc`
-- `sgnht`
-- `adsgld_adam`
-
-Common settings:
-
-- `lr`: per‑phase learning rates
-- `temperature`: target temperature
-- `preconditioning`: RMSProp‑style preconditioning
-
-## Batching
-
-`inference.batching.standard` controls Phase‑2/4 batch sizes:
-
-- `warmup`: batch size for Phase‑2 drift
-- `sgld`: batch size for Phase‑4 sampling
-- `shuffle`: shuffle rows per epoch
-
-Optional event‑level batching:
-
-```json
-"inference": { "batching": { "event_batches": { "enabled": true, ... } } }
-```
-
-## Diagnostics and logging
-
-`inference.diagnostics` controls:
-
-- W&B groups (`wandb.groups`)
-- Residual distribution diagnostics
-- Shared‑event correlation diagnostics (`shared_event_legcorr2d`)
-- ESS/online diagnostics
-
-## Python API (analysis/plotting)
-
-For scripting and analysis:
-
-- `spider.io.samples.read_all_samples`
-- `spider.analysis.compute_cat_dd_and_xyz`
-- `spider.plotting` helpers
-
-## Repository structure
-
-- `spider/`: core package
-- `spider/core/`: inference + model
-- `spider/io/`: reading/writing and samples
-- `spider/analysis/`: diagnostics and calibration
-- `spider/plotting/`: plotting utilities
-- `spider/examples/`: minimal config template
-
-
