@@ -23,6 +23,154 @@ def _log(*parts, section: str = "SAMPLES", **_kwargs) -> None:
 
 SAMPLE_FIELDS = ['longitude', 'latitude', 'depth', 'delta_t', 'X', 'Y', 'Z']
 
+
+def read_growclust_bootstrap(
+    path: str,
+    params,
+    *,
+    backend: str = "numpy",
+    device: str | None = None,
+    dtype: torch.dtype = torch.float32,
+    pin_memory: bool = False,
+    thin: int = 1,
+) -> Dict[str, np.ndarray] | Dict[str, torch.Tensor]:
+    """
+    Read a growclust bootstrap file with repeating header lines followed by fixed-count samples.
+
+    Each header line begins with event_id, then many metadata fields. It is followed by a fixed
+    number of sample lines (lat, lon, depth, unused, unused). We parse lat/lon/depth only.
+    """
+    if thin < 1:
+        raise ValueError(f"thin must be >= 1, got {thin}")
+    if not isinstance(params, dict):
+        raise ValueError("read_growclust_bootstrap: params must be a dict with lat_min/lon_min")
+    if "lat_min" in params and "lon_min" in params:
+        lat0 = float(params["lat_min"])
+        lon0 = float(params["lon_min"])
+    else:
+        domain = None
+        try:
+            model_cfg = params.get("model", None)
+            if isinstance(model_cfg, dict):
+                domain = model_cfg.get("domain", None)
+        except Exception:
+            domain = None
+        if isinstance(domain, dict) and ("lat_min" in domain) and ("lon_min" in domain):
+            lat0 = float(domain["lat_min"])
+            lon0 = float(domain["lon_min"])
+        else:
+            raise ValueError("read_growclust_bootstrap: params must include lat_min/lon_min (top-level or model.domain)")
+
+    events: list[str] = []
+    lat_samples: list[list[float]] = []
+    lon_samples: list[list[float]] = []
+    dep_samples: list[list[float]] = []
+
+    def _is_header(tokens: list[str]) -> bool:
+        # Header rows are long and start with two integers (event_id repeated).
+        if len(tokens) <= 8:
+            return False
+        try:
+            int(tokens[0])
+            int(tokens[1])
+            return True
+        except Exception:
+            return False
+
+    with open(path, "r") as f:
+        cur_lat: list[float] = []
+        cur_lon: list[float] = []
+        cur_dep: list[float] = []
+        cur_event: str | None = None
+        sample_idx = 0
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            tokens = line.split()
+            if _is_header(tokens):
+                if cur_event is not None:
+                    events.append(cur_event)
+                    lat_samples.append(cur_lat)
+                    lon_samples.append(cur_lon)
+                    dep_samples.append(cur_dep)
+                cur_event = str(tokens[0])
+                cur_lat = []
+                cur_lon = []
+                cur_dep = []
+                sample_idx = 0
+                continue
+            if len(tokens) < 3:
+                continue
+            if (sample_idx % thin) == 0:
+                try:
+                    lat = float(tokens[0])
+                    lon = float(tokens[1])
+                    dep = float(tokens[2])
+                except Exception:
+                    sample_idx += 1
+                    continue
+                cur_lat.append(lat)
+                cur_lon.append(lon)
+                cur_dep.append(dep)
+            sample_idx += 1
+
+        if cur_event is not None:
+            events.append(cur_event)
+            lat_samples.append(cur_lat)
+            lon_samples.append(cur_lon)
+            dep_samples.append(cur_dep)
+
+    if not events:
+        _log(f"Growclust bootstrap file appears empty: {path}")
+        return {}
+
+    n_samples_list = [len(v) for v in lat_samples]
+    min_samples = min(n_samples_list) if n_samples_list else 0
+    if min_samples <= 0:
+        _log("Growclust bootstrap reader: no samples parsed for any event")
+        return {}
+    if len(set(n_samples_list)) > 1:
+        _log(
+            f"Growclust bootstrap reader: inconsistent sample counts {sorted(set(n_samples_list))}; "
+            f"truncating to min={min_samples}"
+        )
+    n_events = len(events)
+    lat = np.stack([np.asarray(v[:min_samples], dtype=np.float32) for v in lat_samples], axis=0)
+    lon = np.stack([np.asarray(v[:min_samples], dtype=np.float32) for v in lon_samples], axis=0)
+    dep = np.stack([np.asarray(v[:min_samples], dtype=np.float32) for v in dep_samples], axis=0)
+
+    projector = Proj(proj="laea", lat_0=lat0, lon_0=lon0, datum="WGS84", units="km")
+    x_flat, y_flat = projector(lon.reshape(-1), lat.reshape(-1))
+    X = np.asarray(x_flat, dtype=np.float32).reshape(lon.shape)
+    Y = np.asarray(y_flat, dtype=np.float32).reshape(lon.shape)
+    Z = dep.astype(np.float32)
+    delta_t = np.zeros((n_events, min_samples), dtype=np.float32)
+
+    out_map: Dict[str, Any] = {
+        "event_ids": np.asarray(events, dtype=str),
+        "longitude": lon,
+        "latitude": lat,
+        "depth": dep,
+        "delta_t": delta_t,
+        "X": X,
+        "Y": Y,
+        "Z": Z,
+    }
+
+    if str(backend).lower() == "numpy":
+        return out_map  # type: ignore[return-value]
+
+    target_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    out_torch: Dict[str, torch.Tensor] | Dict[str, np.ndarray] = {"event_ids": out_map["event_ids"]}
+    for name in SAMPLE_FIELDS:
+        arr = out_map[name]
+        t = torch.from_numpy(arr).to(dtype)
+        if pin_memory and target_device != "cpu":
+            t = t.pin_memory()
+        out_torch[name] = t.to(target_device, non_blocking=True) if target_device != "cpu" else t
+    return out_torch  # type: ignore[return-value]
+
 def merge_samples_hdf5(
     *,
     out_path: str,

@@ -532,9 +532,12 @@ def plot_event_marginal_hist2d(samples_data: Union[dict, Any],
                                sharex='col',
                                sharey='row',
                                cmap='Blues',
+                               vmin=None,
+                               vmax=None,
                                density=True,
                                top_row_ylim=None,
                                n_contours=8,
+                               contour_log=False,
                                equal_aspect=True,
                                title=None,
                                center_data=False):
@@ -555,9 +558,11 @@ def plot_event_marginal_hist2d(samples_data: Union[dict, Any],
         bin_width: used when bins is None to create np.arange(xlim[0], xlim[1], bin_width).
         figsize, constrained_layout, height_ratios, sharex, sharey: matplotlib layout options.
         cmap: colormap for 2D hist imshow.
+        vmin, vmax: color scale limits for 2D hist imshow (shared across panels).
         density: if True, 1D hist uses density=True.
         top_row_ylim: optional y-limit for top-row histograms.
         n_contours: number of contour levels (excluding min).
+        contour_log: if True, use log-spaced contour levels (positive bins only).
         equal_aspect: if True, set equal aspect for bottom row plots.
         title: optional suptitle for the figure.
         center_data: if True, subtract the mean from each coordinate before plotting.
@@ -661,11 +666,19 @@ def plot_event_marginal_hist2d(samples_data: Union[dict, Any],
         ycenters = 0.5 * (yedges[1:] + yedges[:-1])
         Xgrid, Ygrid = _np.meshgrid(xcenters, ycenters)
         extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
-        ax.imshow(hist.T, origin='lower', extent=extent, cmap=cmap, aspect='auto')
+        ax.imshow(hist.T, origin='lower', extent=extent, cmap=cmap, aspect='auto', vmin=vmin, vmax=vmax)
         # Contours (skip zero-only)
         hmin, hmax = float(hist.min()), float(hist.max())
         if hmax > 0.0 and n_contours and n_contours > 0:
-            levels = _np.linspace(hmin, hmax, int(n_contours) + 1)[1:]
+            if contour_log:
+                pos = hist[hist > 0.0]
+                if pos.size > 0:
+                    vmin_pos = float(pos.min())
+                    levels = _np.logspace(_np.log10(vmin_pos), _np.log10(hmax), int(n_contours))
+                else:
+                    levels = _np.linspace(hmin, hmax, int(n_contours) + 1)[1:]
+            else:
+                levels = _np.linspace(hmin, hmax, int(n_contours) + 1)[1:]
             ax.contour(Xgrid, Ygrid, hist.T, levels=levels, colors='black', linewidths=1)
         return
 
@@ -699,4 +712,354 @@ def plot_event_marginal_hist2d(samples_data: Union[dict, Any],
 
     if not constrained_layout:
         fig.tight_layout()
+    return fig, axes
+
+
+def plot_event_marginal_kde2d(samples_data: Union[dict, Any],
+                              event_index=None,
+                              event_id=None,
+                              coords=("X", "Y", "Z"),
+                              burn_in=0,
+                              units="km",
+                              xlim=(-0.1, 0.1),
+                              grid_size=100,
+                              figsize=(12, 6),
+                              constrained_layout=True,
+                              height_ratios=(1, 3),
+                              sharex='col',
+                              sharey='row',
+                              cmap='Blues',
+                              vmin=None,
+                              vmax=None,
+                              density=True,
+                              top_row_ylim=None,
+                              n_contours=8,
+                              contour_log=False,
+                              equal_aspect=True,
+                              title=None,
+                              center_data=False,
+                              bw_method=None,
+                              inter_event_k=None,
+                              inter_event_row=False,
+                              inter_event_max_abs=None,
+                              inter_event_mode="centered_pairs",
+                              inter_event_scale_figsize=True,
+                              subplot_wspace=None,
+                              subplot_hspace=None,
+                              top_row_hide_yaxis=False):
+    """Plot 1D KDE marginals and 2D KDE contours for a single event.
+
+    Args mirror plot_event_marginal_hist2d, but use KDEs instead of binning.
+    bw_method: passed to scipy.stats.gaussian_kde (None for default).
+    inter_event_row: if True, add a third row showing k-nearest inter-event structure.
+    inter_event_k: number of nearest neighbors to use (None -> all other events).
+    inter_event_max_abs: optional symmetric limit for inter-event axes (km or m).
+    inter_event_mode:
+        "centered_pairs" -> KDE of centered (x_i vs x_j), (y_i vs y_j), (z_i vs z_j)
+    inter_event_scale_figsize: if True, scale figure height to keep subplot size similar.
+    subplot_wspace/subplot_hspace: optional spacing overrides (passed to subplots_adjust).
+    top_row_hide_yaxis: if True, hide y-axis ticks/labels for top row except first.
+    """
+    plt = _lazy_import_plt()
+    try:
+        from scipy.stats import gaussian_kde  # type: ignore
+    except Exception as e:
+        raise ImportError("plot_event_marginal_kde2d requires scipy") from e
+
+    # Validate coords
+    if len(coords) != 3:
+        raise ValueError("coords must be a tuple/list of exactly three field names")
+    is_summary = _is_event_samples_summary(samples_data)
+    for c in coords:
+        if is_summary:
+            if c not in ("X", "Y", "Z"):
+                raise KeyError(f"When using EventSamplesSummary, only 'X','Y','Z' are supported (got '{c}')")
+        else:
+            if c not in samples_data:
+                raise KeyError(f"Coordinate '{c}' not found in samples_data")
+
+    # Resolve event index
+    event_ids_resolved = None
+    if is_summary:
+        if getattr(samples_data, 'cat_dd', None) is not None and 'evid' in samples_data.cat_dd.columns:
+            event_ids_resolved = _np.asarray(samples_data.cat_dd['evid'].values)
+    else:
+        if 'event_ids' in samples_data:
+            event_ids_resolved = _np.asarray(samples_data['event_ids'])
+    if event_id is not None and event_ids_resolved is not None:
+        eid_arr = event_ids_resolved
+        matches = _np.nonzero(eid_arr == event_id)[0]
+        if matches.size > 0:
+            event_index = int(matches[0])
+    if event_index is None:
+        event_index = 0
+
+    # Extract series and apply burn-in and units
+    factor = 1000.0 if units.lower().startswith('meter') else 1.0
+    series = []
+    for c in coords:
+        if is_summary:
+            arr = getattr(samples_data, c)[event_index, :]
+        else:
+            arr = samples_data[c][event_index, burn_in:]
+        arr = _np.asarray(arr) * factor
+        if arr.ndim > 1:
+            arr = arr.reshape(-1)
+        if center_data and arr.size > 0:
+            arr = arr - _np.mean(arr)
+        series.append(arr)
+    Xv, Yv, Zv = series
+
+    n_rows = 3 if inter_event_row else 2
+    if inter_event_row and len(height_ratios) == 2:
+        height_ratios = (height_ratios[0], height_ratios[1], height_ratios[1])
+    if inter_event_row and inter_event_scale_figsize and len(height_ratios) == 3:
+        base_sum = float(height_ratios[0] + height_ratios[1])
+        new_sum = float(sum(height_ratios))
+        if base_sum > 0.0 and new_sum > base_sum:
+            scale = new_sum / base_sum
+            figsize = (figsize[0], figsize[1] * scale)
+    # Inter-event row uses different axis scales; disable shared axes.
+    sharex_used = sharex
+    sharey_used = sharey
+    if inter_event_row:
+        sharex_used = False
+        sharey_used = False
+    fig, axes = plt.subplots(
+        n_rows, 3,
+        figsize=figsize,
+        constrained_layout=constrained_layout,
+        gridspec_kw={'height_ratios': height_ratios},
+        sharex=sharex_used,
+        sharey=sharey_used
+    )
+    if (subplot_wspace is not None) or (subplot_hspace is not None):
+        if constrained_layout:
+            fig.set_constrained_layout(False)
+        fig.subplots_adjust(
+            wspace=subplot_wspace if subplot_wspace is not None else 0.2,
+            hspace=subplot_hspace if subplot_hspace is not None else 0.2,
+        )
+
+    # 1D KDEs
+    xs = _np.linspace(xlim[0], xlim[1], int(grid_size))
+    for ax, data, label in zip(axes[0], (Xv, Yv, Zv), coords):
+        data = _np.asarray(data)
+        if data.size == 0:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+            continue
+        kde = gaussian_kde(data, bw_method=bw_method)
+        ys = kde(xs)
+        ax.plot(xs, ys, color='black')
+        ax.set_title(label)
+        ax.set_xlim(xlim)
+        ax.set_ylabel("Density" if density else "KDE")
+        if top_row_ylim is not None:
+            ax.set_ylim(top_row_ylim)
+
+    if top_row_hide_yaxis:
+        for ax in axes[0, 1:]:
+            ax.tick_params(left=False, labelleft=False)
+
+    def _plot_2d_kde(ax, x, y, *, xlim_local=None, ylim_local=None):
+        x = _np.asarray(x)
+        y = _np.asarray(y)
+        mask = _np.isfinite(x) & _np.isfinite(y)
+        x = x[mask]
+        y = y[mask]
+        if x.size == 0 or y.size == 0:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+            return
+        if xlim_local is None:
+            xlim_local = xlim
+        if ylim_local is None:
+            ylim_local = xlim
+        xgrid = _np.linspace(xlim_local[0], xlim_local[1], int(grid_size))
+        ygrid = _np.linspace(ylim_local[0], ylim_local[1], int(grid_size))
+        Xg, Yg = _np.meshgrid(xgrid, ygrid)
+        kde = gaussian_kde(_np.vstack([x, y]), bw_method=bw_method)
+        Zg = kde(_np.vstack([Xg.ravel(), Yg.ravel()])).reshape(Xg.shape)
+        ax.imshow(Zg, origin='lower', extent=[xgrid[0], xgrid[-1], ygrid[0], ygrid[-1]], cmap=cmap, aspect='auto', vmin=vmin, vmax=vmax)
+        if n_contours and n_contours > 0:
+            zmin = float(Zg.min())
+            zmax = float(Zg.max())
+            if contour_log:
+                pos = Zg[Zg > 0.0]
+                if pos.size > 0:
+                    zmin = float(pos.min())
+                    levels = _np.logspace(_np.log10(zmin), _np.log10(zmax), int(n_contours))
+                else:
+                    levels = _np.linspace(zmin, zmax, int(n_contours) + 1)[1:]
+            else:
+                levels = _np.linspace(zmin, zmax, int(n_contours) + 1)[1:]
+            ax.contour(Xg, Yg, Zg, levels=levels, colors='black', linewidths=1)
+
+    _plot_2d_kde(axes[1, 0], Xv, Yv, xlim_local=xlim, ylim_local=xlim)
+    _plot_2d_kde(axes[1, 1], Xv, Zv, xlim_local=xlim, ylim_local=xlim)
+    _plot_2d_kde(axes[1, 2], Yv, Zv, xlim_local=xlim, ylim_local=xlim)
+
+    # Optional inter-event row (k-nearest structure)
+    if inter_event_row:
+        if is_summary:
+            X_all = _np.asarray(samples_data.X) * factor
+            Y_all = _np.asarray(samples_data.Y) * factor
+            Z_all = _np.asarray(samples_data.Z) * factor
+            Xm = _np.mean(X_all, axis=1)
+            Ym = _np.mean(Y_all, axis=1)
+            Zm = _np.mean(Z_all, axis=1)
+        else:
+            X_all = _np.asarray(samples_data[coords[0]]) * factor
+            Y_all = _np.asarray(samples_data[coords[1]]) * factor
+            Z_all = _np.asarray(samples_data[coords[2]]) * factor
+            Xm = _np.mean(X_all[:, burn_in:], axis=1)
+            Ym = _np.mean(Y_all[:, burn_in:], axis=1)
+            Zm = _np.mean(Z_all[:, burn_in:], axis=1)
+        if center_data:
+            Xm = Xm - _np.mean(Xm)
+            Ym = Ym - _np.mean(Ym)
+            Zm = Zm - _np.mean(Zm)
+
+        dx = Xm - Xm[event_index]
+        dy = Ym - Ym[event_index]
+        dz = Zm - Zm[event_index]
+        d = _np.sqrt(dx * dx + dy * dy + dz * dz)
+        mask = _np.isfinite(d)
+        mask[event_index] = False
+        dx = dx[mask]
+        dy = dy[mask]
+        dz = dz[mask]
+        d = d[mask]
+
+        if d.size > 0:
+            order = _np.argsort(d)
+            if inter_event_k is not None:
+                k = max(1, int(inter_event_k))
+                order = order[:min(k, order.size)]
+            dx = dx[order]
+            dy = dy[order]
+            dz = dz[order]
+            d = d[order]
+            neighbor_idx = _np.nonzero(mask)[0][order]
+        else:
+            neighbor_idx = _np.array([], dtype=int)
+
+        def _auto_sym_lim(vals, fallback):
+            vals = _np.asarray(vals)
+            vals = vals[_np.isfinite(vals)]
+            if vals.size == 0:
+                return fallback
+            vmax = float(_np.nanpercentile(_np.abs(vals), 99.5))
+            if not _np.isfinite(vmax) or vmax <= 0.0:
+                return fallback
+            return (-vmax, vmax)
+
+        if inter_event_max_abs is not None:
+            lim_dx = (-float(inter_event_max_abs), float(inter_event_max_abs))
+            lim_dy = lim_dx
+            lim_dz = lim_dx
+        else:
+            # Default: match the main plot limits for comparability.
+            lim_dx = xlim
+            lim_dy = xlim
+            lim_dz = xlim
+
+        if inter_event_mode == "centered_pairs":
+            # Build centered sample pairs for event i vs neighbors j
+            if is_summary:
+                xi = X_all[event_index, :]
+                yi = Y_all[event_index, :]
+                zi = Z_all[event_index, :]
+            else:
+                xi = X_all[event_index, burn_in:]
+                yi = Y_all[event_index, burn_in:]
+                zi = Z_all[event_index, burn_in:]
+            xi = _np.asarray(xi).reshape(-1)
+            yi = _np.asarray(yi).reshape(-1)
+            zi = _np.asarray(zi).reshape(-1)
+            xi = xi - _np.mean(xi) if xi.size > 0 else xi
+            yi = yi - _np.mean(yi) if yi.size > 0 else yi
+            zi = zi - _np.mean(zi) if zi.size > 0 else zi
+
+            xj_all = []
+            yj_all = []
+            zj_all = []
+            for j in neighbor_idx.tolist():
+                if is_summary:
+                    xj = X_all[j, :]
+                    yj = Y_all[j, :]
+                    zj = Z_all[j, :]
+                else:
+                    xj = X_all[j, burn_in:]
+                    yj = Y_all[j, burn_in:]
+                    zj = Z_all[j, burn_in:]
+                xj = _np.asarray(xj).reshape(-1)
+                yj = _np.asarray(yj).reshape(-1)
+                zj = _np.asarray(zj).reshape(-1)
+                if xj.size == 0 or yj.size == 0 or zj.size == 0:
+                    continue
+                xj = xj - _np.mean(xj)
+                yj = yj - _np.mean(yj)
+                zj = zj - _np.mean(zj)
+                xj_all.append(xj)
+                yj_all.append(yj)
+                zj_all.append(zj)
+
+            if xj_all:
+                xj_all = _np.concatenate(xj_all, axis=0)
+                yj_all = _np.concatenate(yj_all, axis=0)
+                zj_all = _np.concatenate(zj_all, axis=0)
+            else:
+                xj_all = _np.array([], dtype=float)
+                yj_all = _np.array([], dtype=float)
+                zj_all = _np.array([], dtype=float)
+
+            def _match_lengths(a, b):
+                a = _np.asarray(a)
+                b = _np.asarray(b)
+                a = a[_np.isfinite(a)]
+                b = b[_np.isfinite(b)]
+                if a.size == 0 or b.size == 0:
+                    return _np.array([], dtype=float), _np.array([], dtype=float)
+                if a.size == b.size:
+                    return a, b
+                n = int(min(a.size, b.size))
+                rng = _np.random.default_rng(0)
+                if a.size > n:
+                    a = a[rng.choice(a.size, size=n, replace=False)]
+                if b.size > n:
+                    b = b[rng.choice(b.size, size=n, replace=False)]
+                return a, b
+
+            # Pairwise KDEs: x_i vs x_j, y_i vs y_j, z_i vs z_j
+            xi_plot, xj_plot = _match_lengths(xi, xj_all)
+            yi_plot, yj_plot = _match_lengths(yi, yj_all)
+            zi_plot, zj_plot = _match_lengths(zi, zj_all)
+            _plot_2d_kde(axes[2, 0], xi_plot, xj_plot, xlim_local=lim_dx, ylim_local=lim_dx)
+            _plot_2d_kde(axes[2, 1], yi_plot, yj_plot, xlim_local=lim_dy, ylim_local=lim_dy)
+            _plot_2d_kde(axes[2, 2], zi_plot, zj_plot, xlim_local=lim_dz, ylim_local=lim_dz)
+            axes[2, 0].set_xlabel(f"{coords[0]}_i (centered)")
+            axes[2, 0].set_ylabel(f"{coords[0]}_j (centered)")
+            axes[2, 1].set_xlabel(f"{coords[1]}_i (centered)")
+            axes[2, 1].set_ylabel(f"{coords[1]}_j (centered)")
+            axes[2, 2].set_xlabel(f"{coords[2]}_i (centered)")
+            axes[2, 2].set_ylabel(f"{coords[2]}_j (centered)")
+        else:
+            raise ValueError(f"Unknown inter_event_mode='{inter_event_mode}'")
+
+    axes[1, 0].set_xlabel(f"{coords[0]} ({'km' if factor==1.0 else 'm'})")
+    axes[1, 0].set_ylabel(f"{coords[1]} ({'km' if factor==1.0 else 'm'})")
+    axes[1, 1].set_xlabel(f"{coords[0]} ({'km' if factor==1.0 else 'm'})")
+    axes[1, 1].set_ylabel(f"{coords[2]} ({'km' if factor==1.0 else 'm'})")
+    axes[1, 2].set_xlabel(f"{coords[1]} ({'km' if factor==1.0 else 'm'})")
+    axes[1, 2].set_ylabel(f"{coords[2]} ({'km' if factor==1.0 else 'm'})")
+
+    if equal_aspect:
+        for ax in axes[1, :]:
+            ax.set_aspect('equal', adjustable='box')
+        if inter_event_row:
+            for ax in axes[2, :]:
+                ax.set_aspect('equal', adjustable='box')
+
+    if title:
+        fig.suptitle(title)
     return fig, axes

@@ -165,6 +165,18 @@ def _build_initial_state(
         covariance_matrix=torch.diag(torch.tensor(prior_event_std, device=device, dtype=torch.float32) ** 2),
     )
 
+    centroid_prior_enable = bool(params.get("prior_centroid_enable", False))
+    prior_centroid_std = params.get("prior_centroid_std", None)
+    if centroid_prior_enable and prior_centroid_std is None:
+        raise KeyError("prior_centroid_std is required when prior_centroid_enable=true")
+    if prior_centroid_std is None:
+        prior_centroid_std = [9999.0, 9999.0, 9999.0, 9999.0]
+
+    prior_centroid = torch.distributions.multivariate_normal.MultivariateNormal(
+        loc=torch.zeros(len(prior_centroid_std), device=device, dtype=torch.float32),
+        covariance_matrix=torch.diag(torch.tensor(prior_centroid_std, device=device, dtype=torch.float32) ** 2),
+    )
+
     # Noise scales: fixed (scalar phase_unc only)
     phase_unc_list = params.get("phase_unc", [0.05, 0.08])
     scale_theta = torch.tensor(phase_unc_list, device=device, dtype=torch.float32)
@@ -439,6 +451,7 @@ def _build_initial_state(
         dd_event_degree=dd_event_degree,
         model=model,
         prior_event=prior_event,
+        prior_centroid=prior_centroid,
         optimizer=optimizer,
         N=N,
         batch_size_warmup=batch_size_warmup,

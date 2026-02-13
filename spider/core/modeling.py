@@ -577,6 +577,39 @@ def compute_likelihood_loss(
     
     Loss = Mean( DataLoss(residual / sigma) + log(sigma) )
     """
+    def _abort_on_pcg_fallback(params: dict, *, context: str) -> None:
+        try:
+            if not bool(params.get("_shared_event_re_abort_on_pcg_fallback", False)):
+                return
+        except Exception:
+            return
+        g_fb = int(params.get("_shared_event_re_runtime_last_groups_fallback_diag", 0) or 0)
+        g_rows = int(params.get("_shared_event_re_runtime_last_groups_rows_cap", 0) or 0)
+        g_nodes = int(params.get("_shared_event_re_runtime_last_groups_nodes_cap", 0) or 0)
+        g_tau0 = int(params.get("_shared_event_re_runtime_last_groups_tau_zero", 0) or 0)
+        w_fb = int(params.get("_shared_event_re_whitening_last_groups_fallback_diag", 0) or 0)
+        w_rows = int(params.get("_shared_event_re_whitening_last_groups_rows_cap", 0) or 0)
+        w_nodes = int(params.get("_shared_event_re_whitening_last_groups_nodes_cap", 0) or 0)
+        w_tau0 = int(params.get("_shared_event_re_whitening_last_groups_tau_zero", 0) or 0)
+        w_pcg_fail = int(params.get("_shared_event_re_whitening_last_pcg_fail", 0) or 0)
+        g_fb_gpu = int(params.get("_shared_event_re_gpu_last_groups_fallback_diag", 0) or 0)
+        if (g_fb + w_fb + w_pcg_fail + g_fb_gpu) <= 0:
+            return
+        max_rows = int(params.get("_shared_event_re_runtime_last_max_rows", 0) or 0)
+        max_nodes = int(params.get("_shared_event_re_runtime_last_max_nodes", 0) or 0)
+        msg = (
+            f"shared_event_re PCG fallback detected (context={context}).\n"
+            f"fallback_counts: runtime={g_fb} whitening={w_fb} whitening_pcg_fail={w_pcg_fail} gpu={g_fb_gpu}\n"
+            f"reasons: rows_cap={g_rows or w_rows} nodes_cap={g_nodes or w_nodes} tau_zero={g_tau0 or w_tau0}\n"
+            f"max_seen: rows={max_rows} nodes={max_nodes}\n"
+            "Suggested fixes:\n"
+            "- Increase model.likelihood.shared_event_re.max_rows_per_group / max_nodes_per_group\n"
+            "- Reduce inference.batching.standard.warmup/sgld batch sizes\n"
+            "- Enable inference.batching.event_batches to limit group sizes\n"
+            "- Ensure shared_event_re.tau_s > 0 (tau_zero indicates zero tau)\n"
+            "- If whitening is enabled, increase shared_event_re.whitening.pcg_bucket_nodes or max_nodes\n"
+        )
+        raise RuntimeError(msg)
     # Tempering removed; keep core residual distributions only.
     alpha = 1.0
 
@@ -592,6 +625,39 @@ def compute_likelihood_loss(
     # phase < 0.5 implies P-wave
     is_p = (phase < 0.5)
     sigma = torch.where(is_p, σ_p, σ_s)
+
+    # Optional: distance-dependent sigma (linear in event-pair separation).
+    try:
+        if bool(params.get("_sigma_distance_enable", False)):
+            slope_ps = params.get("_sigma_distance_slope_ps", [0.0, 0.0])
+            min_ps = params.get("_sigma_distance_min_sigma_ps", [0.0, 0.0])
+            max_km = params.get("_sigma_distance_max_dist_km", None)
+            slope_p = float(slope_ps[0]) if isinstance(slope_ps, (list, tuple)) and len(slope_ps) >= 2 else float(slope_ps)
+            slope_s = float(slope_ps[1]) if isinstance(slope_ps, (list, tuple)) and len(slope_ps) >= 2 else float(slope_ps)
+            min_p = float(min_ps[0]) if isinstance(min_ps, (list, tuple)) and len(min_ps) >= 2 else float(min_ps)
+            min_s = float(min_ps[1]) if isinstance(min_ps, (list, tuple)) and len(min_ps) >= 2 else float(min_ps)
+            # Event pair distance in km (XYZ already in km)
+            x1 = (X_src + ΔX_src).index_select(0, idx[:, 0])[:, :3]
+            x2 = (X_src + ΔX_src).index_select(0, idx[:, 1])[:, :3]
+            dist = torch.linalg.norm(x2 - x1, dim=1)
+            if isinstance(max_km, (int, float)) and float(max_km) > 0.0:
+                dist = dist.clamp_max(float(max_km))
+            slope = torch.where(is_p, torch.tensor(float(slope_p), device=dist.device, dtype=dist.dtype),
+                                torch.tensor(float(slope_s), device=dist.device, dtype=dist.dtype))
+            sigma = sigma + slope * dist
+            min_sigma = torch.where(is_p, torch.tensor(float(min_p), device=dist.device, dtype=dist.dtype),
+                                    torch.tensor(float(min_s), device=dist.device, dtype=dist.dtype))
+            sigma = torch.maximum(sigma, min_sigma)
+            # Whitening path currently uses phase-wise sigma scalars; warn once if enabled.
+            if bool(params.get("_shared_event_re_whitening_enabled", False)) and not bool(params.get("_sigma_distance_warned_whiten", False)):
+                params["_sigma_distance_warned_whiten"] = True
+                _log(
+                    "Warning: sigma_distance_linear enabled, but shared_event_re whitening uses phase-wise sigma only. "
+                    "Distance-dependent sigma is ignored in whitening logdet approximation.",
+                    flush=True,
+                )
+    except Exception:
+        pass
     
     # 3. Standardized Residuals
     # Clamp sigma to avoid division by zero
@@ -965,6 +1031,7 @@ def compute_likelihood_loss(
                     raise
                 quad = quad_w + quad_diag_extra + quad_sp
                 loss_like = (quad / m_tot_full) + log_sigma_mean
+                _abort_on_pcg_fallback(params, context="whitening")
                 return float(alpha) * loss_like
 
             # Optional GPU-native prototype path (batched PCG + grouping).
@@ -1081,6 +1148,7 @@ def compute_likelihood_loss(
                     )
                     quad = quad + quad_diag_extra + quad_sp
                     loss_like = (quad / m_tot_full) + log_sigma_mean
+                    _abort_on_pcg_fallback(params, context="gpu")
                     if bool(params.get("_shared_event_re_gpu_profile", False)):
                         dt_ms = float(1000.0 * (time.perf_counter() - t0_gpu))
                         params["_shared_event_re_gpu_time_ms_sum"] = float(params.get("_shared_event_re_gpu_time_ms_sum", 0.0) or 0.0) + dt_ms
@@ -1381,6 +1449,7 @@ def compute_likelihood_loss(
             quad = quad + quad_diag_extra + quad_sp
             # Keep the independent log(sigma) term for compatibility (with learn_noise_scale=false it's a constant anyway).
             loss_like = (quad / m_tot_full) + log_sigma_mean
+            _abort_on_pcg_fallback(params, context="cpu")
             return float(alpha) * loss_like
         else:
             raise NotImplementedError(
@@ -1433,6 +1502,7 @@ def compute_likelihood_loss(
 def compute_prior_loss(
     ΔX_src: torch.Tensor,
     prior_event: torch.distributions.Distribution,
+    prior_centroid: torch.distributions.Distribution,
     σ_p: torch.Tensor,
     σ_s: torch.Tensor,
     N_total: int,
@@ -1448,8 +1518,10 @@ def compute_prior_loss(
     """
     # Explicit enable flags (defaults preserve legacy behavior)
     event_prior_enable = bool(params.get("prior_event_enable", True))
+    centroid_prior_enable = bool(params.get("prior_centroid_enable", False))
     # Runtime gates for other priors (set by the epoch runner). Defaults keep legacy behavior.
     event_runtime_enable = bool(params.get("_prior_event_runtime_enable", True))
+    centroid_runtime_enable = bool(params.get("_prior_centroid_runtime_enable", True))
 
     # 1. Event Location Prior (sum over M events)
     # P(ΔX)
@@ -1505,11 +1577,25 @@ def compute_prior_loss(
         # We treat prior_event as a batch distribution or independent
         log_prob_events = prior_event.log_prob(ΔX_src).sum()
     
-    # 2. Noise prior removed: SPIDER uses fixed `phase_unc` only (no σ learning).
+    # 2. Centroid prior (scaled by number of events for comparable strength)
+    if (not centroid_prior_enable) or (not centroid_runtime_enable):
+        log_prob_centroid = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
+    else:
+        if ΔX_src.numel() == 0:
+            log_prob_centroid = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
+        else:
+            centroid = ΔX_src.mean(dim=0)
+            log_prob_centroid = prior_centroid.log_prob(centroid)
+            if isinstance(log_prob_centroid, torch.Tensor) and log_prob_centroid.ndim > 0:
+                log_prob_centroid = log_prob_centroid.sum()
+            n_events = int(ΔX_src.shape[0])
+            log_prob_centroid = log_prob_centroid * float(n_events)
+
+    # 3. Noise prior removed: SPIDER uses fixed `phase_unc` only (no σ learning).
     log_prob_noise = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
     
     # Total Log Prior
-    total_log_prior = log_prob_events + log_prob_noise
+    total_log_prior = log_prob_events + log_prob_centroid + log_prob_noise
     
     base_prior_loss = -total_log_prior / float(N_total)
     return base_prior_loss
@@ -1517,7 +1603,7 @@ def compute_prior_loss(
 
 def total_loss(
     idx, y, X_src, ΔX_src, model,
-    prior_event, σ_p, σ_s,
+    prior_event, prior_centroid, σ_p, σ_s,
     N_total, params, nuisance_delta=None,
     cluster_ids=None, cluster_counts=None,
     event_precision_matrix=None,
@@ -1537,7 +1623,7 @@ def total_loss(
     )
     
     loss_prior = compute_prior_loss(
-        ΔX_src, prior_event, σ_p, σ_s, N_total, params,
+        ΔX_src, prior_event, prior_centroid, σ_p, σ_s, N_total, params,
         cluster_ids, cluster_counts, event_precision_matrix,
     )
     

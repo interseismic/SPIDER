@@ -7,6 +7,7 @@ import math
 import torch
 import torch.nn as nn
 import numpy as np
+import polars as pl
 
 from spider.io.phase_bundle import load_phase2_bundle
 from spider.core.init_state import _build_initial_state
@@ -14,6 +15,7 @@ from spider.utils.console import info, warn
 
 from spider.core.modeling import compute_residuals
 from spider.core.state import _current_noise_scales
+from spider.core.shared_event_re_whitening import build_whitening_cache_entry
 
 
 
@@ -79,6 +81,143 @@ def _diag_enabled(cfg: dict, *, default: bool = True) -> bool:
     except Exception:
         pass
     return bool(default)
+
+
+def _get_truth_catalog_cfg(state) -> dict:
+    cfg = _get_diag_cfg(state, "truth_catalog")
+    if isinstance(cfg, dict) and cfg:
+        return cfg
+    cfg = _get_diag_cfg(state, "truth_locations")
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _truth_dX_from_catalog(state) -> Optional[torch.Tensor]:
+    """
+    Build a ΔX_src tensor from a truth catalog (CSV).
+    Falls back to MAP dX_src for missing events or missing time.
+    """
+    try:
+        cfg = _get_truth_catalog_cfg(state)
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict) or not cfg:
+        warn("residuals_at='truth' requested but no diagnostics.truth_catalog config found.", section="DIAG")
+        return None
+
+    path = cfg.get("path", None)
+    if path is None:
+        path = cfg.get("catalog_path", None)
+    if path is None:
+        path = cfg.get("truth_catalog", None)
+    if path is None:
+        warn("truth_catalog config missing 'path' (or 'catalog_path')", section="DIAG")
+        return None
+    path = str(path)
+
+    require_all = bool(cfg.get("require_all", False))
+    time_source = str(cfg.get("time_source", "map")).strip().lower()
+    if time_source not in {"map", "initial", "truth"}:
+        time_source = "map"
+    time_ref = str(cfg.get("time_ref", "min")).strip().lower()
+    if time_ref not in {"min", "median", "first"}:
+        time_ref = "min"
+
+    try:
+        truth = pl.read_csv(path)
+    except Exception as e:
+        warn(f"Failed to read truth_catalog '{path}': {e}", section="DIAG")
+        return None
+
+    missing_cols = [c for c in ("evid", "longitude", "latitude", "depth") if c not in truth.columns]
+    if missing_cols:
+        warn(f"truth_catalog missing required columns: {missing_cols}", section="DIAG")
+        return None
+
+    truth = truth.with_columns(pl.col("evid").cast(pl.Utf8).alias("evid"))
+    evid_truth = truth["evid"].to_list()
+    truth_idx = {str(ev): i for i, ev in enumerate(evid_truth)}
+
+    try:
+        lon = truth["longitude"].to_numpy()
+        lat = truth["latitude"].to_numpy()
+        dep = truth["depth"].to_numpy()
+    except Exception:
+        warn("truth_catalog could not be converted to numpy arrays", section="DIAG")
+        return None
+
+    try:
+        xx, yy = state.projector(lon, lat)
+        xyz = np.column_stack([np.asarray(xx, dtype=np.float64), np.asarray(yy, dtype=np.float64), np.asarray(dep, dtype=np.float64)])
+    except Exception as e:
+        warn(f"Failed to project truth_catalog lon/lat: {e}", section="DIAG")
+        return None
+
+    base = state.X_src.detach().cpu().numpy().astype(np.float64, copy=False)
+    dX_map = state.dX_src.detach().cpu().numpy().astype(np.float64, copy=False)
+    dX = dX_map.copy()
+
+    # Optional truth time (seconds relative to reference)
+    t_truth = None
+    if time_source == "truth":
+        if "time" not in truth.columns:
+            warn("truth_catalog missing 'time' column; falling back to MAP times.", section="DIAG")
+            time_source = "map"
+        else:
+            try:
+                tcol = truth["time"].cast(pl.Utf8).str.strptime(pl.Datetime("ns"), strict=False)
+                if tcol.null_count() > 0:
+                    raise ValueError("truth_catalog.time parse failed")
+                t_ns = tcol.cast(pl.Int64).to_numpy()
+                if time_ref == "first":
+                    ref_ns = int(t_ns[0]) if t_ns.size > 0 else 0
+                elif time_ref == "median":
+                    ref_ns = int(np.median(t_ns)) if t_ns.size > 0 else 0
+                else:
+                    ref_ns = int(np.min(t_ns)) if t_ns.size > 0 else 0
+                t_truth = (t_ns - ref_ns).astype(np.float64) / 1e9
+            except Exception as e:
+                warn(f"truth_catalog time parse failed; falling back to MAP times. ({e})", section="DIAG")
+                time_source = "map"
+
+    n_events = int(base.shape[0])
+    missing = 0
+    for i, row in enumerate(state.origins0.iter_rows(named=True)):
+        ev = str(row.get("evid"))
+        j = truth_idx.get(ev, None)
+        if j is None:
+            missing += 1
+            continue
+        dX[i, 0] = float(xyz[j, 0] - base[i, 0])
+        dX[i, 1] = float(xyz[j, 1] - base[i, 1])
+        dX[i, 2] = float(xyz[j, 2] - base[i, 2])
+        if time_source == "truth" and t_truth is not None and int(j) < int(t_truth.size):
+            dX[i, 3] = float(t_truth[int(j)] - base[i, 3])
+        elif time_source == "initial":
+            dX[i, 3] = 0.0
+        # else keep MAP time from dX_map
+
+    if missing > 0:
+        msg = f"truth_catalog missing {missing}/{n_events} events; falling back to MAP for those."
+        if require_all:
+            raise ValueError(msg)
+        warn(msg, section="DIAG")
+
+    return torch.tensor(dX, dtype=torch.float32, device=state.device)
+
+
+def _resolve_dX_use(state, residuals_at: str) -> torch.Tensor:
+    mode = str(residuals_at).strip().lower()
+    if mode in {"init", "initial"}:
+        return torch.zeros_like(state.dX_src, device=state.dX_src.device)
+    if mode in {"truth", "true"}:
+        dX_truth = getattr(state, "_truth_dX_cache", None)
+        if not isinstance(dX_truth, torch.Tensor):
+            dX_truth = _truth_dX_from_catalog(state)
+            setattr(state, "_truth_dX_cache", dX_truth)
+        if isinstance(dX_truth, torch.Tensor):
+            return dX_truth
+        warn("truth residuals requested but truth catalog unavailable; using MAP.", section="DIAG")
+    return state.dX_src
 
 
 def _mpl_pyplot():
@@ -155,6 +294,521 @@ def _tail_ratio(abs_z: np.ndarray, *, q_hi: float = 0.95, q_lo: float = 0.75) ->
         return float("nan")
 
 
+def _robust_std_from_residuals(r: Any) -> float:
+    """
+    Robust scale estimate using MAD (with std fallback).
+    Accepts torch.Tensor or numpy arrays.
+    """
+    try:
+        if isinstance(r, np.ndarray):
+            x = np.asarray(r, dtype=np.float64)
+            x = x[np.isfinite(x)]
+            if x.size < 4:
+                return float("nan")
+            med = float(np.median(x))
+            mad = float(np.median(np.abs(x - med)))
+            s = 1.4826 * mad
+            if (not np.isfinite(s)) or s <= 0.0:
+                s = float(np.std(x, ddof=0))
+            return float(s)
+        if not isinstance(r, torch.Tensor):
+            return float("nan")
+        x = r.detach().to(dtype=torch.float32).flatten()
+        if x.numel() < 4:
+            return float("nan")
+        finite = torch.isfinite(x)
+        if not bool(finite.any()):
+            return float("nan")
+        x = x[finite]
+        med = torch.median(x)
+        mad = torch.median(torch.abs(x - med))
+        s = 1.4826 * mad
+        if (not torch.isfinite(s)) or float(s.item()) <= 0.0:
+            s = torch.std(x, unbiased=False)
+        return float(s.detach().cpu().item())
+    except Exception:
+        return float("nan")
+
+
+@torch.no_grad()
+def estimate_shared_event_re_tau_s(
+    *,
+    state,
+    n_rows: int = 200_000,
+    seed: int = 0,
+    batch_size: int = 50_000,
+    residuals_at: str = "map",  # "map" | "initial"
+    sigma_quantile: float = 0.2,
+    sigma_source: str = "quantile",  # "quantile" | "params"
+) -> Optional[dict]:
+    """
+    Estimate shared_event_re tau from residual variance:
+      Var(r) ≈ sigma^2 + 2*tau^2  =>  tau ≈ sqrt(max(0, Var - sigma^2) / 2)
+    """
+    try:
+        if not bool(state.params.get("_shared_event_re_enabled", False)):
+            return None
+    except Exception:
+        return None
+
+    try:
+        N = int(getattr(state, "N", 0))
+        if N <= 0:
+            return None
+        n_rows = int(max(1, min(int(n_rows), N)))
+        batch_size = int(max(1, int(batch_size)))
+    except Exception:
+        return None
+
+    try:
+        mode = str(residuals_at).strip().lower()
+    except Exception:
+        mode = "map"
+    if mode not in {"map", "initial", "truth"}:
+        mode = "map"
+    dX_use = _resolve_dX_use(state, mode)
+
+    rng = np.random.default_rng(int(seed))
+    rows_np = rng.choice(N, size=n_rows, replace=False).astype(np.int64)
+    rows_np.sort()
+
+    rP_all: list[torch.Tensor] = []
+    rS_all: list[torch.Tensor] = []
+    for i0 in range(0, int(rows_np.size), batch_size):
+        ii = rows_np[i0 : i0 + batch_size]
+        idx = state.II.index_select(0, torch.from_numpy(ii).to(device=state.device, dtype=torch.int64))
+        y = state.YY.index_select(0, torch.from_numpy(ii).to(device=state.device, dtype=torch.int64))
+        r = compute_residuals(idx, y, state.X_src, dX_use, state.model).detach()
+        ph = y[:, 4].detach()
+        is_s = (ph > 0.5)
+        finite = torch.isfinite(r)
+        if not bool(finite.any()):
+            continue
+        if not bool(finite.all()):
+            r = r[finite]
+            is_s = is_s[finite]
+        if bool((~is_s).any()):
+            rP_all.append(r[~is_s].detach().to("cpu", dtype=torch.float32))
+        if bool(is_s.any()):
+            rS_all.append(r[is_s].detach().to("cpu", dtype=torch.float32))
+
+    rP = torch.cat(rP_all, dim=0) if rP_all else torch.empty((0,), dtype=torch.float32)
+    rS = torch.cat(rS_all, dim=0) if rS_all else torch.empty((0,), dtype=torch.float32)
+    if rP.numel() + rS.numel() == 0:
+        return None
+
+    def _sigma_from_quantile(r: torch.Tensor, q: float) -> float:
+        try:
+            if r.numel() == 0:
+                return float("nan")
+            q = float(q)
+            if not (0.01 <= q <= 0.99):
+                q = 0.5
+            a = r.detach().float()
+            a = a[torch.isfinite(a)]
+            if a.numel() == 0:
+                return float("nan")
+            a_np = a.detach().cpu().numpy()
+            aq = float(np.quantile(np.abs(a_np), q))
+            if not (np.isfinite(aq) and aq >= 0.0):
+                return float("nan")
+            zf = float("nan")
+            try:
+                from scipy.stats import norm  # type: ignore
+                zf = float(norm.ppf((q + 1.0) / 2.0))
+            except Exception:
+                try:
+                    zt = torch.distributions.Normal(0.0, 1.0).icdf(
+                        torch.tensor((q + 1.0) / 2.0, dtype=torch.float32)
+                    )
+                    zf = float(zt.detach().cpu().item())
+                except Exception:
+                    zf = float("nan")
+            if not (np.isfinite(zf) and zf > 1e-6):
+                return float("nan")
+            return float(aq / zf)
+        except Exception:
+            return float("nan")
+
+    stdP = _robust_std_from_residuals(rP)
+    stdS = _robust_std_from_residuals(rS)
+
+    sigma_p_est = _sigma_from_quantile(rP, float(sigma_quantile))
+    sigma_s_est = _sigma_from_quantile(rS, float(sigma_quantile))
+    if not np.isfinite(sigma_p_est):
+        sigma_p_est = _robust_std_from_residuals(rP)
+    if not np.isfinite(sigma_s_est):
+        sigma_s_est = _robust_std_from_residuals(rS)
+
+    try:
+        vv = state.params.get("phase_unc", [float("nan"), float("nan")])
+        sigma_p_param = float(vv[0])
+        sigma_s_param = float(vv[1])
+    except Exception:
+        sigma_p_param = float("nan")
+        sigma_s_param = float("nan")
+    if not (np.isfinite(sigma_p_param) and sigma_p_param > 0.0):
+        sigma_p_param = float("nan")
+    if not (np.isfinite(sigma_s_param) and sigma_s_param > 0.0):
+        sigma_s_param = float("nan")
+
+    sigma_source = str(sigma_source).strip().lower()
+    if sigma_source not in {"params", "quantile"}:
+        sigma_source = "quantile"
+
+    sigma_p = sigma_p_est
+    sigma_s = sigma_s_est
+    sigma_source_used = "quantile"
+    if sigma_source == "params" and np.isfinite(sigma_p_param) and np.isfinite(sigma_s_param):
+        sigma_p = sigma_p_param
+        sigma_s = sigma_s_param
+        sigma_source_used = "params"
+
+    def _tau_from_std(std: float, sigma: float) -> float:
+        if not (np.isfinite(std) and std > 0.0):
+            return float("nan")
+        if not (np.isfinite(sigma) and sigma >= 0.0):
+            sigma = 0.0
+        v = max(0.0, std * std - sigma * sigma)
+        return float(np.sqrt(v / 2.0))
+
+    tau_p = _tau_from_std(stdP, sigma_p)
+    tau_s = _tau_from_std(stdS, sigma_s)
+
+    return {
+        "tau_p": float(tau_p),
+        "tau_s": float(tau_s),
+        "sigma_p_used": float(sigma_p),
+        "sigma_s_used": float(sigma_s),
+        "sigma_source": str(sigma_source_used),
+        "sigma_p_est": float(sigma_p_est),
+        "sigma_s_est": float(sigma_s_est),
+        "sigma_p_param": float(sigma_p_param),
+        "sigma_s_param": float(sigma_s_param),
+        "resid_std_p": float(stdP),
+        "resid_std_s": float(stdS),
+        "n_rows_used_p": int(rP.numel()),
+        "n_rows_used_s": int(rS.numel()),
+    }
+
+
+@torch.no_grad()
+def estimate_shared_event_re_tau_logdet(
+    *,
+    state,
+    n_rows: int,
+    seed: int,
+    batch_size: int,
+    residuals_at: str,
+    sigma_source: str,
+    sigma_quantile: float,
+    tau_grid: list[float],
+    max_groups: int,
+    max_nodes: int,
+    max_edges: int,
+) -> Optional[dict]:
+    """
+    Estimate tau by minimizing (0.5 r^T Σ^{-1} r + 0.5 log|Σ|) over a tau grid,
+    using a small subset of groups and dense Cholesky (node-space).
+    """
+    try:
+        if not bool(state.params.get("_shared_event_re_enabled", False)):
+            return None
+    except Exception:
+        return None
+
+    try:
+        N = int(getattr(state, "N", 0))
+        if N <= 0:
+            return None
+        n_rows = int(max(1, min(int(n_rows), N)))
+        batch_size = int(max(1, int(batch_size)))
+    except Exception:
+        return None
+
+    try:
+        mode = str(residuals_at).strip().lower()
+    except Exception:
+        mode = "map"
+    if mode not in {"map", "initial", "truth"}:
+        mode = "map"
+    dX_use = _resolve_dX_use(state, mode)
+
+    rng = np.random.default_rng(int(seed))
+    rows_np = rng.choice(N, size=n_rows, replace=False).astype(np.int64)
+    rows_np.sort()
+    rows_t = torch.tensor(rows_np, device=state.device, dtype=torch.int64)
+
+    idx = state.II.index_select(0, rows_t)
+    y = state.YY.index_select(0, rows_t)
+    r = compute_residuals(idx, y, state.X_src, dX_use, state.model).detach()
+    ph = y[:, 4].detach()
+    is_s = (ph > 0.5)
+    finite = torch.isfinite(r)
+    if not bool(finite.any()):
+        return None
+    if not bool(finite.all()):
+        r = r[finite]
+        is_s = is_s[finite]
+        idx = idx[finite]
+
+    # sigma selection
+    try:
+        vv = state.params.get("phase_unc", [float("nan"), float("nan")])
+        sigma_p_param = float(vv[0])
+        sigma_s_param = float(vv[1])
+    except Exception:
+        sigma_p_param = float("nan")
+        sigma_s_param = float("nan")
+    if not (np.isfinite(sigma_p_param) and sigma_p_param > 0.0):
+        sigma_p_param = float("nan")
+    if not (np.isfinite(sigma_s_param) and sigma_s_param > 0.0):
+        sigma_s_param = float("nan")
+
+    def _sigma_from_quantile(r0: torch.Tensor, q: float) -> float:
+        try:
+            if r0.numel() == 0:
+                return float("nan")
+            q = float(q)
+            if not (0.01 <= q <= 0.99):
+                q = 0.5
+            a = r0.detach().float()
+            a = a[torch.isfinite(a)]
+            if a.numel() == 0:
+                return float("nan")
+            a_np = a.detach().cpu().numpy()
+            aq = float(np.quantile(np.abs(a_np), q))
+            if not (np.isfinite(aq) and aq >= 0.0):
+                return float("nan")
+            zf = float("nan")
+            try:
+                from scipy.stats import norm  # type: ignore
+                zf = float(norm.ppf((q + 1.0) / 2.0))
+            except Exception:
+                try:
+                    zt = torch.distributions.Normal(0.0, 1.0).icdf(
+                        torch.tensor((q + 1.0) / 2.0, dtype=torch.float32)
+                    )
+                    zf = float(zt.detach().cpu().item())
+                except Exception:
+                    zf = float("nan")
+            if not (np.isfinite(zf) and zf > 1e-6):
+                return float("nan")
+            return float(aq / zf)
+        except Exception:
+            return float("nan")
+
+    rP = r[~is_s]
+    rS = r[is_s]
+    sigma_p_est = _sigma_from_quantile(rP, float(sigma_quantile))
+    sigma_s_est = _sigma_from_quantile(rS, float(sigma_quantile))
+    if not np.isfinite(sigma_p_est):
+        sigma_p_est = _robust_std_from_residuals(rP)
+    if not np.isfinite(sigma_s_est):
+        sigma_s_est = _robust_std_from_residuals(rS)
+
+    sigma_source = str(sigma_source).strip().lower()
+    if sigma_source not in {"params", "quantile"}:
+        sigma_source = "quantile"
+    sigma_p = sigma_p_est
+    sigma_s = sigma_s_est
+    sigma_source_used = "quantile"
+    if sigma_source == "params" and np.isfinite(sigma_p_param) and np.isfinite(sigma_s_param):
+        sigma_p = sigma_p_param
+        sigma_s = sigma_s_param
+        sigma_source_used = "params"
+
+    # Build grouping keys
+    grouping = str(state.params.get("_shared_event_re_grouping", "phase")).strip().lower()
+    if grouping in {"stationphase", "station-phase"}:
+        grouping = "station_phase"
+    ph_id = torch.where(is_s, torch.ones_like(r, dtype=torch.int64), torch.zeros_like(r, dtype=torch.int64))
+    if grouping == "station_phase":
+        sta_idx = getattr(state, "row_station_index", None)
+        if not isinstance(sta_idx, torch.Tensor):
+            warn("shared_event_re tau logdet: missing row_station_index; falling back to phase.", section="DIAG")
+            grouping = "phase"
+            keys = ph_id
+        else:
+            sta = sta_idx.index_select(0, rows_t)[finite]
+            keys = (sta.to(dtype=torch.int64) * 2) + ph_id
+    else:
+        keys = ph_id
+
+    # Whitening weights configuration
+    edge_weighting = str(state.params.get("_shared_event_re_whitening_edge_weighting", "uniform")).strip().lower()
+    edge_weight_ell_km = float(state.params.get("_shared_event_re_whitening_edge_weight_ell_km", 1.0))
+    edge_weight_eps_km = float(state.params.get("_shared_event_re_whitening_edge_weight_eps_km", 1e-3))
+    edge_weight_power = float(state.params.get("_shared_event_re_whitening_edge_weight_power", 1.0))
+    edge_weight_scale_km = float(state.params.get("_shared_event_re_whitening_edge_weight_scale_km", 1.0))
+    edge_weight_global_scale = float(state.params.get("_shared_event_re_whitening_edge_weight_global_scale", 1.0))
+    edge_weight_normalize = bool(state.params.get("_shared_event_re_whitening_edge_weight_normalize", False))
+
+    X_event = (state.X_src + dX_use)[:, :3].detach()
+
+    cache = build_whitening_cache_entry(
+        idx=idx,
+        keys=keys,
+        ph_id=ph_id,
+        sigma_p=torch.tensor(float(sigma_p), device=state.device),
+        sigma_s=torch.tensor(float(sigma_s), device=state.device),
+        tau_p=1.0,
+        tau_s=1.0,
+        jitter0=0.0,
+        max_rows_per_group=int(max_edges),
+        max_nodes_per_group=int(max_nodes),
+        solver="pcg",
+        edge_weighting=edge_weighting,
+        edge_weight_ell_km=float(edge_weight_ell_km),
+        edge_weight_eps_km=float(edge_weight_eps_km),
+        edge_weight_power=float(edge_weight_power),
+        edge_weight_scale_km=float(edge_weight_scale_km),
+        edge_weight_global_scale=float(edge_weight_global_scale),
+        edge_weight_normalize=bool(edge_weight_normalize),
+        X_event=X_event,
+        grouping_cache=None,
+    )
+
+    perm = cache.get("perm", None)
+    groups = cache.get("groups", None)
+    group_ph = cache.get("group_ph", None)
+    if not isinstance(perm, torch.Tensor) or not isinstance(groups, list):
+        return None
+    r_perm = r.index_select(0, perm)
+
+    # Gather group data and filter by size
+    gdata_p = []
+    gdata_s = []
+    for gi, gd in enumerate(groups):
+        if not isinstance(gd, dict):
+            continue
+        n_nodes = int(gd.get("n_nodes", 0) or 0)
+        s0 = int(gd.get("start", 0))
+        e0 = int(gd.get("end", 0))
+        m = int(max(e0 - s0, 0))
+        if n_nodes <= 1 or m <= 1:
+            continue
+        if n_nodes > int(max_nodes) or m > int(max_edges):
+            continue
+        local_u = gd.get("local_u", None)
+        local_v = gd.get("local_v", None)
+        w = gd.get("w", None)
+        if not (isinstance(local_u, torch.Tensor) and isinstance(local_v, torch.Tensor) and isinstance(w, torch.Tensor)):
+            continue
+        ph_bit = None
+        try:
+            if isinstance(group_ph, torch.Tensor) and int(group_ph.numel()) > gi:
+                ph_bit = float(group_ph[gi].item())
+        except Exception:
+            ph_bit = None
+        sigma_g = float(gd.get("sigma", float("nan")))
+        r_g = r_perm[s0:e0].detach().to("cpu", dtype=torch.float64)
+        if not torch.isfinite(r_g).any():
+            continue
+        # Precompute Laplacian + weights (CPU, dense)
+        u = local_u.detach().to("cpu")
+        v = local_v.detach().to("cpu")
+        w_cpu = w.detach().to("cpu", dtype=torch.float64)
+        w_sqrt = torch.sqrt(w_cpu.clamp_min(0.0))
+        L = torch.zeros((n_nodes, n_nodes), dtype=torch.float64)
+        deg = torch.zeros((n_nodes,), dtype=torch.float64)
+        deg.index_add_(0, u, w_cpu)
+        deg.index_add_(0, v, w_cpu)
+        L[u, v] -= w_cpu
+        L[v, u] -= w_cpu
+        L.diagonal().add_(deg)
+        entry = {
+            "r": r_g,
+            "u": u,
+            "v": v,
+            "w": w_cpu,
+            "w_sqrt": w_sqrt,
+            "L": L,
+            "n_nodes": int(n_nodes),
+            "m": int(m),
+            "sigma": float(sigma_g),
+        }
+        if ph_bit is not None and float(ph_bit) < 0.5:
+            gdata_p.append(entry)
+        else:
+            gdata_s.append(entry)
+
+    def _take_top(groups_in: list[dict]) -> list[dict]:
+        if not groups_in:
+            return []
+        groups_in = sorted(groups_in, key=lambda d: int(d.get("m", 0)), reverse=True)
+        return groups_in[: int(max_groups)]
+
+    gdata_p = _take_top(gdata_p)
+    gdata_s = _take_top(gdata_s)
+
+    def _logdet_fit(groups_in: list[dict], tau_grid_v: list[float]) -> tuple[float, float]:
+        best_tau = float("nan")
+        best_obj = float("inf")
+        for tau in tau_grid_v:
+            t = float(tau)
+            if not (np.isfinite(t) and t > 0.0):
+                continue
+            obj = 0.0
+            n_used = 0
+            for gd in groups_in:
+                r_g = gd["r"]
+                u = gd["u"]
+                v = gd["v"]
+                w = gd["w"]
+                w_sqrt = gd["w_sqrt"]
+                L = gd["L"]
+                n_nodes = int(gd["n_nodes"])
+                m = int(gd["m"])
+                sig = float(gd["sigma"])
+                if not (np.isfinite(sig) and sig > 0.0):
+                    continue
+                alpha = 1.0 / (t * t)
+                beta = 1.0 / (sig * sig)
+                M = L.mul(beta)
+                M.diagonal().add_(alpha)
+                try:
+                    chol = torch.linalg.cholesky(M)
+                except Exception:
+                    continue
+                # logdet(M)
+                logdet_M = 2.0 * torch.log(torch.diagonal(chol)).sum().item()
+                # b = A^T (beta * w_sqrt * r)
+                edge_vals = (beta * w_sqrt * r_g)
+                b = torch.zeros((n_nodes,), dtype=torch.float64)
+                b.index_add_(0, u, -edge_vals)
+                b.index_add_(0, v, edge_vals)
+                x = torch.cholesky_solve(b.unsqueeze(1), chol).squeeze(1)
+                ax = x.index_select(0, v) - x.index_select(0, u)
+                u_edge = beta * (r_g - (w_sqrt * ax))
+                quad = 0.5 * (r_g * u_edge).sum().item()
+                logdet_sigma = (float(m) * math.log(sig * sig)) + logdet_M - (float(n_nodes) * math.log(alpha))
+                obj += float(quad + 0.5 * logdet_sigma)
+                n_used += 1
+            if n_used <= 0:
+                continue
+            if obj < best_obj:
+                best_obj = obj
+                best_tau = t
+        return best_tau, float(best_obj)
+
+    tau_p_best, obj_p = _logdet_fit(gdata_p, tau_grid)
+    tau_s_best, obj_s = _logdet_fit(gdata_s, tau_grid)
+
+    return {
+        "tau_p": float(tau_p_best),
+        "tau_s": float(tau_s_best),
+        "obj_p": float(obj_p),
+        "obj_s": float(obj_s),
+        "sigma_p_used": float(sigma_p),
+        "sigma_s_used": float(sigma_s),
+        "sigma_source": str(sigma_source_used),
+        "n_groups_p": int(len(gdata_p)),
+        "n_groups_s": int(len(gdata_s)),
+        "n_rows_used": int(r.numel()),
+    }
+
+
 @torch.no_grad()
 def estimate_shared_event_re_hier_tau_s(
     *,
@@ -215,11 +869,9 @@ def estimate_shared_event_re_hier_tau_s(
         mode = str(residuals_at).strip().lower()
     except Exception:
         mode = "map"
-    if mode not in {"map", "initial"}:
+    if mode not in {"map", "initial", "truth"}:
         mode = "map"
-    dX_use = state.dX_src
-    if mode == "initial":
-        dX_use = torch.zeros_like(state.dX_src, device=state.dX_src.device)
+    dX_use = _resolve_dX_use(state, mode)
 
     rng = np.random.default_rng(int(seed))
     rows_np = rng.choice(N, size=n_rows, replace=False).astype(np.int64)
@@ -423,6 +1075,7 @@ def estimate_shared_event_re_station_phase_tau_s(
     batch_size: int,
     residuals_at: str,
     sigma_quantile: float,
+    sigma_source: str,
     min_rows_per_group: int,
 ) -> Optional[dict]:
     try:
@@ -453,11 +1106,9 @@ def estimate_shared_event_re_station_phase_tau_s(
         mode = str(residuals_at).strip().lower()
     except Exception:
         mode = "map"
-    if mode not in {"map", "initial"}:
+    if mode not in {"map", "initial", "truth"}:
         mode = "map"
-    dX_use = state.dX_src
-    if mode == "initial":
-        dX_use = torch.zeros_like(state.dX_src, device=state.dX_src.device)
+    dX_use = _resolve_dX_use(state, mode)
 
     rng = np.random.default_rng(int(seed))
     rows_np = rng.choice(N, size=n_rows, replace=False).astype(np.int64)
@@ -513,6 +1164,29 @@ def estimate_shared_event_re_station_phase_tau_s(
     if not np.isfinite(sigma_s_est):
         sigma_s_est = float(_robust_std_from_residuals(torch.from_numpy(rS_all)) if rS_all.size > 0 else float("nan"))
 
+    try:
+        vv = state.params.get("phase_unc", [float("nan"), float("nan")])
+        sigma_p_param = float(vv[0])
+        sigma_s_param = float(vv[1])
+    except Exception:
+        sigma_p_param = float("nan")
+        sigma_s_param = float("nan")
+    if not (np.isfinite(sigma_p_param) and sigma_p_param > 0.0):
+        sigma_p_param = float("nan")
+    if not (np.isfinite(sigma_s_param) and sigma_s_param > 0.0):
+        sigma_s_param = float("nan")
+
+    sigma_source = str(sigma_source).strip().lower()
+    if sigma_source not in {"params", "quantile"}:
+        sigma_source = "quantile"
+    sigma_p_use = sigma_p_est
+    sigma_s_use = sigma_s_est
+    sigma_source_used = "quantile"
+    if sigma_source == "params" and np.isfinite(sigma_p_param) and np.isfinite(sigma_s_param):
+        sigma_p_use = sigma_p_param
+        sigma_s_use = sigma_s_param
+        sigma_source_used = "params"
+
     valid = counts >= int(min_rows_per_group)
     var = np.zeros_like(sum_r2)
     mask = valid & (counts > 0)
@@ -525,14 +1199,19 @@ def estimate_shared_event_re_station_phase_tau_s(
     var_p_med = float(np.median(var_p[mask[0::2]])) if n_groups_p > 0 else float("nan")
     var_s_med = float(np.median(var_s[mask[1::2]])) if n_groups_s > 0 else float("nan")
 
-    tau_p = float(np.sqrt(max(0.0, var_p_med - sigma_p_est * sigma_p_est))) if np.isfinite(var_p_med) else float("nan")
-    tau_s = float(np.sqrt(max(0.0, var_s_med - sigma_s_est * sigma_s_est))) if np.isfinite(var_s_med) else float("nan")
+    tau_p = float(np.sqrt(max(0.0, var_p_med - sigma_p_use * sigma_p_use))) if np.isfinite(var_p_med) else float("nan")
+    tau_s = float(np.sqrt(max(0.0, var_s_med - sigma_s_use * sigma_s_use))) if np.isfinite(var_s_med) else float("nan")
 
     return {
         "tau_p": float(tau_p),
         "tau_s": float(tau_s),
+        "sigma_p_used": float(sigma_p_use),
+        "sigma_s_used": float(sigma_s_use),
+        "sigma_source": str(sigma_source_used),
         "sigma_p_est": float(sigma_p_est),
         "sigma_s_est": float(sigma_s_est),
+        "sigma_p_param": float(sigma_p_param),
+        "sigma_s_param": float(sigma_s_param),
         "var_p_med": float(var_p_med),
         "var_s_med": float(var_s_med),
         "n_groups_p": int(n_groups_p),
@@ -614,11 +1293,9 @@ def _shared_event_re_station_phase_joint_holdout(
         mode = str(residuals_at).strip().lower()
     except Exception:
         mode = "map"
-    if mode not in {"map", "initial"}:
+    if mode not in {"map", "initial", "truth"}:
         mode = "map"
-    dX_use = state.dX_src
-    if mode == "initial":
-        dX_use = torch.zeros_like(state.dX_src, device=state.dX_src.device)
+    dX_use = _resolve_dX_use(state, mode)
 
     rng = np.random.default_rng(int(seed))
     rows_np = rng.choice(N, size=n_rows, replace=False).astype(np.int64)
@@ -984,11 +1661,9 @@ def _shared_event_re_holdout_calibration(
         mode = str(residuals_at).strip().lower()
     except Exception:
         mode = "map"
-    if mode not in {"map", "initial"}:
+    if mode not in {"map", "initial", "truth"}:
         mode = "map"
-    dX_use = state.dX_src
-    if mode == "initial":
-        dX_use = torch.zeros_like(state.dX_src, device=state.dX_src.device)
+    dX_use = _resolve_dX_use(state, mode)
 
     rng = np.random.default_rng(int(seed))
     rows_np = rng.choice(N, size=n_rows, replace=False).astype(np.int64)
@@ -2627,7 +3302,8 @@ def _maybe_shared_event_legcorr2d(*, state, plot_dir: str) -> None:
                         f"(label={label} variant={tag} n_points={int(fit.get('n_points', 0))}): "
                         f"power≈{fit.get('power', float('nan')):.3g} "
                         f"scale_km≈{fit.get('scale_km', float('nan')):.3g} "
-                        f"linear_slope≈{fit.get('linear_slope', float('nan')):.3g}",
+                        f"linear_slope≈{fit.get('linear_slope', float('nan')):.3g} "
+                        f"linear_intercept≈{fit.get('linear_intercept', float('nan')):.3g}",
                         flush=True,
                     )
                 # Persist scores as JSON next to plots for easy run-to-run diffing.
@@ -2912,7 +3588,7 @@ def _maybe_event_pair_station_corr(*, state, plot_dir: str) -> None:
         top_k_stations: int (default 30)
         min_common_pairs: int (default 50)   # min shared event-pairs needed to compute corr
         standardize_by_sigma: bool (default True)
-        residuals_at: str (default "map")    # "map" | "initial" (ΔX=0)
+      residuals_at: str (default "map")    # "map" | "initial" | "truth"
         outfile_prefix: str (default "event_pair_station_corr")
     """
     cfg = _get_diag_cfg(state, "event_pair_station_corr")
@@ -2934,7 +3610,7 @@ def _maybe_event_pair_station_corr(*, state, plot_dir: str) -> None:
         min_common = int(max(10, min_common))
         standardize_by_sigma = bool(cfg.get("standardize_by_sigma", True))
         residuals_at = str(cfg.get("residuals_at", "map")).strip().lower()
-        if residuals_at not in {"map", "initial"}:
+        if residuals_at not in {"map", "initial", "truth"}:
             residuals_at = "map"
         out_prefix = str(cfg.get("outfile_prefix", "event_pair_station_corr") or "event_pair_station_corr")
         residual_variant = str(cfg.get("residual_variant", "base")).strip().lower()
@@ -2966,9 +3642,7 @@ def _maybe_event_pair_station_corr(*, state, plot_dir: str) -> None:
 
     # Residuals for sampled rows
     from spider.core.modeling import compute_residuals
-    dX_use = state.dX_src
-    if residuals_at == "initial":
-        dX_use = torch.zeros_like(state.dX_src, device=state.dX_src.device)
+    dX_use = _resolve_dX_use(state, residuals_at)
 
     r_chunks = []
     for i0 in range(0, int(rows_t_all.numel()), batch_size):
@@ -3197,7 +3871,7 @@ def analyze_resid_from_bundle(
         cfg = _get_diag_cfg(state, "resid_distribution")
         if _diag_enabled(cfg, default=False):
             residuals_at = str(cfg.get("residuals_at", "map")).strip().lower()
-            if residuals_at not in {"map", "initial"}:
+            if residuals_at not in {"map", "initial", "truth"}:
                 residuals_at = "map"
             n_rows = int(cfg.get("n_rows", 200_000))
             seed = int(cfg.get("seed", 0))
@@ -3287,7 +3961,7 @@ def analyze_resid_from_bundle(
 
             # Residuals (seconds)
             r_chunks: list[np.ndarray] = []
-            dX_use = torch.zeros_like(state.dX_src) if residuals_at == "initial" else state.dX_src
+            dX_use = _resolve_dX_use(state, residuals_at)
             for i0 in range(0, int(II_all.shape[0]), bs):
                 i1 = min(i0 + bs, int(II_all.shape[0]))
                 II_b = II_all[i0:i1]
@@ -3504,6 +4178,476 @@ def analyze_resid_from_bundle(
 
     except Exception as e:
         warn(f"Residual distribution diagnostics failed: {e}", section="DIAG")
+
+    # Optional: scalar residual-correlation metrics (quick CLI diagnostics).
+    try:
+        cfg = _get_diag_cfg(state, "resid_scalar_metrics")
+        if _diag_enabled(cfg, default=False):
+            residuals_at = str(cfg.get("residuals_at", "map")).strip().lower()
+            if residuals_at not in {"map", "initial", "truth"}:
+                residuals_at = "map"
+            n_rows = int(cfg.get("n_rows", 200_000))
+            seed = int(cfg.get("seed", 0))
+            bs = int(cfg.get("batch_size", 50_000))
+            sigma_source = str(cfg.get("sigma_source", "quantile")).strip().lower()
+            sigma_q = float(cfg.get("sigma_quantile", 0.2))
+            min_rows_per_group = int(cfg.get("min_rows_per_group", 200))
+            min_rows_per_event = int(cfg.get("min_rows_per_event", 50))
+            dist_bins = int(cfg.get("dist_bins", 8))
+            min_rows_per_bin = int(cfg.get("min_rows_per_bin", 50))
+            residual_variant = str(cfg.get("residual_variant", "base")).strip().lower()
+
+            N = int(state.N)
+            if n_rows <= 0 or n_rows >= N:
+                rows_np = np.arange(N, dtype=np.int64)
+            else:
+                rng = np.random.default_rng(int(seed))
+                rows_np = rng.choice(N, size=int(n_rows), replace=False).astype(np.int64, copy=False)
+                rows_np.sort()
+
+            rows_t = torch.tensor(rows_np, device=state.device, dtype=torch.int64)
+            II_all = state.II.index_select(0, rows_t)
+            YY_all = state.YY.index_select(0, rows_t)
+            ph = YY_all[:, 4].detach().to("cpu").numpy().astype(np.int64, copy=False)
+
+            sta = None
+            sta_all_t: Optional[torch.Tensor] = None
+            try:
+                if getattr(state, "row_station_index", None) is not None:
+                    sta_t = state.row_station_index.index_select(0, rows_t)  # type: ignore[union-attr]
+                    sta = sta_t.detach().to("cpu").numpy().astype(np.int64, copy=False)
+                    sta_all_t = sta_t
+            except Exception:
+                sta = None
+                sta_all_t = None
+
+            if residual_variant in {"with_corr_error", "corr"}:
+                residual_variant = "corr_error"
+            if residual_variant not in {"base", "corr_error"}:
+                residual_variant = "base"
+
+            dX_use = _resolve_dX_use(state, residuals_at)
+            r_chunks: list[np.ndarray] = []
+            for i0 in range(0, int(II_all.shape[0]), bs):
+                i1 = min(i0 + bs, int(II_all.shape[0]))
+                II_b = II_all[i0:i1]
+                YY_b = YY_all[i0:i1]
+                sta_b = (sta_all_t[i0:i1] if isinstance(sta_all_t, torch.Tensor) else None)
+                rb = _compute_residuals_numpy(state=state, II_b=II_b, YY_b=YY_b, dX_use=dX_use, sta_b=sta_b, variant=residual_variant)
+                r_chunks.append(rb)
+            resid = np.concatenate(r_chunks, axis=0) if r_chunks else np.zeros((rows_np.size,), dtype=np.float64)
+
+            keep = np.isfinite(resid) & np.isfinite(ph) & ((ph == 0) | (ph == 1))
+            resid = resid[keep]
+            ph = ph[keep]
+            II_np = II_all.detach().cpu().numpy().astype(np.int64, copy=False)[keep]
+            if isinstance(sta, np.ndarray) and sta.shape[0] == keep.shape[0]:
+                sta = sta[keep]
+            else:
+                sta = None
+
+            rP = resid[ph == 0]
+            rS = resid[ph == 1]
+
+            def _sigma_from_quantile_np(r: np.ndarray, q: float) -> float:
+                if r.size == 0:
+                    return float("nan")
+                rq = np.quantile(np.abs(r), q)
+                return float(rq / 0.6744897501960817)
+
+            try:
+                vv = state.params.get("phase_unc", [float("nan"), float("nan")])
+                sigma_p_param = float(vv[0])
+                sigma_s_param = float(vv[1])
+            except Exception:
+                sigma_p_param = float("nan")
+                sigma_s_param = float("nan")
+            if not (np.isfinite(sigma_p_param) and sigma_p_param > 0.0):
+                sigma_p_param = float("nan")
+            if not (np.isfinite(sigma_s_param) and sigma_s_param > 0.0):
+                sigma_s_param = float("nan")
+
+            sigma_source = sigma_source if sigma_source in {"params", "quantile"} else "quantile"
+            sigma_p = _sigma_from_quantile_np(rP, sigma_q)
+            sigma_s = _sigma_from_quantile_np(rS, sigma_q)
+            if not np.isfinite(sigma_p):
+                sigma_p = float(_robust_std_from_residuals(torch.from_numpy(rP)) if rP.size > 0 else float("nan"))
+            if not np.isfinite(sigma_s):
+                sigma_s = float(_robust_std_from_residuals(torch.from_numpy(rS)) if rS.size > 0 else float("nan"))
+            if sigma_source == "params" and np.isfinite(sigma_p_param) and np.isfinite(sigma_s_param):
+                sigma_p = sigma_p_param
+                sigma_s = sigma_s_param
+
+            def _pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
+                if x.size < 8 or y.size < 8:
+                    return float("nan")
+                if not (np.isfinite(x).all() and np.isfinite(y).all()):
+                    return float("nan")
+                sx = float(np.std(x))
+                sy = float(np.std(y))
+                if sx <= 0.0 or sy <= 0.0:
+                    return float("nan")
+                return float(np.corrcoef(x, y)[0, 1])
+
+            def _lin_slope(x: np.ndarray, y: np.ndarray) -> float:
+                if x.size < 8 or y.size < 8:
+                    return float("nan")
+                vx = float(np.var(x))
+                if vx <= 0.0:
+                    return float("nan")
+                return float(np.cov(x, y, ddof=0)[0, 1] / vx)
+
+            def _station_phase_bias_metrics(r: np.ndarray, sta_idx: np.ndarray, sigma: float) -> tuple[float, float]:
+                if r.size < 8 or sta_idx is None:
+                    return float("nan"), float("nan")
+                k = sta_idx.astype(np.int64, copy=False)
+                counts = np.bincount(k, minlength=int(k.max()) + 1 if k.size else 0)
+                sum_r = np.bincount(k, weights=r, minlength=counts.size)
+                m = (counts >= int(min_rows_per_group))
+                if not np.any(m):
+                    return float("nan"), float("nan")
+                mean = np.zeros_like(sum_r, dtype=np.float64)
+                mean[m] = sum_r[m] / counts[m]
+                z = mean[m] / float(sigma if np.isfinite(sigma) and sigma > 0 else 1.0)
+                return float(np.max(np.abs(z))), float(np.sqrt(np.mean(z * z)))
+
+            def _event_bias_metrics(r: np.ndarray, e1: np.ndarray, e2: np.ndarray, sigma: float) -> tuple[float, float]:
+                if r.size < 8:
+                    return float("nan"), float("nan")
+                n_ev = int(state.X_src.shape[0])
+                sum_r = np.zeros((n_ev,), dtype=np.float64)
+                cnt = np.zeros((n_ev,), dtype=np.int64)
+                sum_r[e1] -= r
+                sum_r[e2] += r
+                cnt[e1] += 1
+                cnt[e2] += 1
+                m = cnt >= int(min_rows_per_event)
+                if not np.any(m):
+                    return float("nan"), float("nan")
+                mean = np.zeros_like(sum_r, dtype=np.float64)
+                mean[m] = sum_r[m] / cnt[m]
+                z = mean[m] / float(sigma if np.isfinite(sigma) and sigma > 0 else 1.0)
+                return float(np.max(np.abs(z))), float(np.std(z))
+
+            # Compute per-phase metrics
+            e1 = II_np[:, 0]
+            e2 = II_np[:, 1]
+
+            def _phase_metrics(phase_bit: int, r_phase: np.ndarray, sigma: float) -> dict:
+                m = (ph == int(phase_bit))
+                if np.count_nonzero(m) < 8:
+                    return {}
+                e1p = e1[m]; e2p = e2[m]
+                rp = r_phase
+                # station-phase bias (mean residual per station)
+                sp_max, sp_rms = _station_phase_bias_metrics(rp, sta[m] if isinstance(sta, np.ndarray) else None, sigma)
+                # event bias (mean signed residual per event)
+                ev_max, ev_std = _event_bias_metrics(rp, e1p, e2p, sigma)
+                # distance correlation (abs residual vs event separation)
+                X = (state.X_src + dX_use)[:, :3].detach().cpu().numpy().astype(np.float64, copy=False)
+                dist = np.linalg.norm(X[e2p] - X[e1p], axis=1)
+                corr_abs_dist = _pearson_corr(np.abs(rp), dist)
+                slope_abs_dist = _lin_slope(dist, np.abs(rp))
+                # distance-binned |r| median trend (robust sigma(d) proxy)
+                med_slope = float("nan")
+                med_intercept = float("nan")
+                med_r2 = float("nan")
+                med_ratio = float("nan")
+                try:
+                    if dist_bins < 3:
+                        nb = 3
+                    else:
+                        nb = int(dist_bins)
+                    # quantile bins to balance counts
+                    edges = np.quantile(dist, np.linspace(0.0, 1.0, nb + 1))
+                    edges = np.unique(edges)
+                    if edges.size >= 3:
+                        meds = []
+                        centers = []
+                        for i in range(edges.size - 1):
+                            lo = edges[i]
+                            hi = edges[i + 1]
+                            mask = (dist >= lo) & (dist <= hi) if i == edges.size - 2 else (dist >= lo) & (dist < hi)
+                            if np.count_nonzero(mask) < int(min_rows_per_bin):
+                                continue
+                            meds.append(float(np.median(np.abs(rp[mask]))))
+                            centers.append(float(0.5 * (lo + hi)))
+                        if len(meds) >= 3:
+                            x = np.asarray(centers, dtype=np.float64)
+                            y = np.asarray(meds, dtype=np.float64)
+                            med_slope = _lin_slope(x, y)
+                            if np.isfinite(med_slope):
+                                med_intercept = float(np.mean(y) - med_slope * np.mean(x))
+                                y_hat = med_slope * x + med_intercept
+                                ss_res = float(np.sum((y - y_hat) ** 2))
+                                ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+                                if ss_tot > 0:
+                                    med_r2 = 1.0 - (ss_res / ss_tot)
+                            if len(meds) >= 2 and meds[0] > 0:
+                                med_ratio = float(meds[-1] / meds[0])
+                except Exception:
+                    pass
+                # time correlation (residual vs mean event time)
+                t_corr = float("nan")
+                try:
+                    tcol = state.origins0.get_column("time")
+                    t_ns = tcol.cast(pl.Datetime("ns")).cast(pl.Int64).to_numpy()
+                    t0 = float(np.min(t_ns)) if t_ns.size else 0.0
+                    tsec = (t_ns - t0).astype(np.float64) / 1e9
+                    tpair = 0.5 * (tsec[e1p] + tsec[e2p])
+                    t_corr = _pearson_corr(rp, tpair)
+                except Exception:
+                    t_corr = float("nan")
+                return {
+                    "sp_bias_max_z": sp_max,
+                    "sp_bias_rms_z": sp_rms,
+                    "event_bias_max_z": ev_max,
+                    "event_bias_std_z": ev_std,
+                    "corr_abs_r_dist": corr_abs_dist,
+                    "slope_abs_r_dist": slope_abs_dist,
+                    "med_slope_abs_r_dist": med_slope,
+                    "med_r2_abs_r_dist": med_r2,
+                    "med_ratio_abs_r_dist": med_ratio,
+                    "corr_r_time": t_corr,
+                }
+
+            mP = _phase_metrics(0, rP, sigma_p)
+            mS = _phase_metrics(1, rS, sigma_s)
+
+            _log("\nResidual scalar metrics (analyze-resid)", flush=True)
+            _log(
+                f"- residuals_at={residuals_at} n_rows_used={int(resid.size):,} "
+                f"sigma_source={sigma_source} sigma_q={sigma_q}",
+                flush=True,
+            )
+            if mP:
+                _log(
+                    f"  P: sp_bias_max_z={mP.get('sp_bias_max_z', float('nan')):.3g} "
+                    f"sp_bias_rms_z={mP.get('sp_bias_rms_z', float('nan')):.3g} "
+                    f"event_bias_max_z={mP.get('event_bias_max_z', float('nan')):.3g} "
+                    f"event_bias_std_z={mP.get('event_bias_std_z', float('nan')):.3g} "
+                    f"corr(|r|,dist)={mP.get('corr_abs_r_dist', float('nan')):.3g} "
+                    f"slope(|r|,dist)={mP.get('slope_abs_r_dist', float('nan')):.3g} "
+                    f"med_slope(|r|,dist)={mP.get('med_slope_abs_r_dist', float('nan')):.3g} "
+                    f"med_r2={mP.get('med_r2_abs_r_dist', float('nan')):.3g} "
+                    f"med_ratio={mP.get('med_ratio_abs_r_dist', float('nan')):.3g} "
+                    f"corr(r,time)={mP.get('corr_r_time', float('nan')):.3g}",
+                    flush=True,
+                )
+            if mS:
+                _log(
+                    f"  S: sp_bias_max_z={mS.get('sp_bias_max_z', float('nan')):.3g} "
+                    f"sp_bias_rms_z={mS.get('sp_bias_rms_z', float('nan')):.3g} "
+                    f"event_bias_max_z={mS.get('event_bias_max_z', float('nan')):.3g} "
+                    f"event_bias_std_z={mS.get('event_bias_std_z', float('nan')):.3g} "
+                    f"corr(|r|,dist)={mS.get('corr_abs_r_dist', float('nan')):.3g} "
+                    f"slope(|r|,dist)={mS.get('slope_abs_r_dist', float('nan')):.3g} "
+                    f"med_slope(|r|,dist)={mS.get('med_slope_abs_r_dist', float('nan')):.3g} "
+                    f"med_r2={mS.get('med_r2_abs_r_dist', float('nan')):.3g} "
+                    f"med_ratio={mS.get('med_ratio_abs_r_dist', float('nan')):.3g} "
+                    f"corr(r,time)={mS.get('corr_r_time', float('nan')):.3g}",
+                    flush=True,
+                )
+    except Exception as e:
+        warn(f"Residual scalar metrics failed: {e}", section="DIAG")
+
+    # Optional: shared_event_re tau estimation (method-of-moments).
+    try:
+        cfg = _get_diag_cfg(state, "shared_event_re_tau")
+        if _diag_enabled(cfg, default=False):
+            residuals_at = str(cfg.get("residuals_at", "map")).strip().lower()
+            if residuals_at not in {"map", "initial", "truth"}:
+                residuals_at = "map"
+            n_rows = int(cfg.get("n_rows", 200_000))
+            seed = int(cfg.get("seed", 0))
+            bs = int(cfg.get("batch_size", 50_000))
+            sigma_q = float(cfg.get("sigma_quantile", 0.2))
+            sigma_source = str(cfg.get("sigma_source", "quantile")).strip().lower()
+            min_events_per_cluster = int(cfg.get("min_events_per_cluster", 1))
+            min_rows_per_group = int(cfg.get("min_rows_per_group", 500))
+            method = str(cfg.get("method", "moments")).strip().lower()
+            prefer_hier = cfg.get("hierarchical", None)
+            if prefer_hier is None:
+                prefer_hier = bool(state.params.get("_shared_event_re_hierarchical", False))
+
+            _log("\nshared_event_re tau estimate (analyze-resid)", flush=True)
+            _log(
+                f"- residuals_at={residuals_at} n_rows={n_rows:,} seed={seed} batch_size={bs:,} "
+                f"sigma_source={sigma_source} sigma_q={sigma_q} method={method}",
+                flush=True,
+            )
+
+            if bool(prefer_hier):
+                est_h = estimate_shared_event_re_hier_tau_s(
+                    state=state,
+                    n_rows=n_rows,
+                    seed=seed,
+                    batch_size=bs,
+                    residuals_at=residuals_at,
+                    sigma_quantile=sigma_q,
+                    min_events_per_cluster=min_events_per_cluster,
+                )
+                if isinstance(est_h, dict):
+                    tp = float(est_h.get("tau_event_p", float("nan")))
+                    ts = float(est_h.get("tau_event_s", float("nan")))
+                    tc_p = float(est_h.get("tau_cluster_p", float("nan")))
+                    tc_s = float(est_h.get("tau_cluster_s", float("nan")))
+                    sigp = float(est_h.get("sigma_p_est", float("nan")))
+                    sigs = float(est_h.get("sigma_s_est", float("nan")))
+                    _log(
+                        f"  tau_event: P={tp:.4g}s ({1e3*tp:.3g} ms)  S={ts:.4g}s ({1e3*ts:.3g} ms)",
+                        flush=True,
+                    )
+                    _log(
+                        f"  tau_cluster: P={tc_p:.4g}s ({1e3*tc_p:.3g} ms)  S={tc_s:.4g}s ({1e3*tc_s:.3g} ms)",
+                        flush=True,
+                    )
+                    _log(
+                        f"  sigma_est: P={sigp:.4g}s ({1e3*sigp:.3g} ms)  S={sigs:.4g}s ({1e3*sigs:.3g} ms)",
+                        flush=True,
+                    )
+                else:
+                    _log("  (hierarchical) tau estimate skipped: missing cluster ids or feature disabled.", flush=True)
+            elif method in {"logdet", "mle", "logdet_small"}:
+                # Build tau grid
+                grid_raw = cfg.get("tau_grid", None)
+                if isinstance(grid_raw, list) and len(grid_raw) > 0:
+                    tau_grid = [float(x) for x in grid_raw if np.isfinite(float(x)) and float(x) > 0.0]
+                else:
+                    tmin = float(cfg.get("tau_grid_min", 1e-3))
+                    tmax = float(cfg.get("tau_grid_max", 0.5))
+                    tn = int(cfg.get("tau_grid_n", 16))
+                    tmin = max(1e-6, tmin)
+                    tmax = max(tmin * 1.01, tmax)
+                    tn = max(3, tn)
+                    tau_grid = list(np.exp(np.linspace(np.log(tmin), np.log(tmax), tn)))
+                max_groups = int(cfg.get("logdet_max_groups", 24))
+                max_nodes = int(cfg.get("logdet_max_nodes", 400))
+                max_edges = int(cfg.get("logdet_max_edges", 20000))
+                est = estimate_shared_event_re_tau_logdet(
+                    state=state,
+                    n_rows=n_rows,
+                    seed=seed,
+                    batch_size=bs,
+                    residuals_at=residuals_at,
+                    sigma_source=sigma_source,
+                    sigma_quantile=sigma_q,
+                    tau_grid=tau_grid,
+                    max_groups=max_groups,
+                    max_nodes=max_nodes,
+                    max_edges=max_edges,
+                )
+                if isinstance(est, dict):
+                    tp = float(est.get("tau_p", float("nan")))
+                    ts = float(est.get("tau_s", float("nan")))
+                    sigp = float(est.get("sigma_p_used", float("nan")))
+                    sigs = float(est.get("sigma_s_used", float("nan")))
+                    ngp = int(est.get("n_groups_p", 0))
+                    ngs = int(est.get("n_groups_s", 0))
+                    _log(
+                        f"  tau_logdet: P={tp:.4g}s ({1e3*tp:.3g} ms)  S={ts:.4g}s ({1e3*ts:.3g} ms) "
+                        f"(groups P={ngp} S={ngs})",
+                        flush=True,
+                    )
+                    _log(
+                        f"  sigma_used[{est.get('sigma_source','?')}]: "
+                        f"P={sigp:.4g}s ({1e3*sigp:.3g} ms)  S={sigs:.4g}s ({1e3*sigs:.3g} ms)",
+                        flush=True,
+                    )
+                else:
+                    _log("  tau_logdet estimate skipped: insufficient groups or residuals.", flush=True)
+            else:
+                est = estimate_shared_event_re_tau_s(
+                    state=state,
+                    n_rows=n_rows,
+                    seed=seed,
+                    batch_size=bs,
+                    residuals_at=residuals_at,
+                    sigma_quantile=sigma_q,
+                    sigma_source=sigma_source,
+                )
+                if isinstance(est, dict):
+                    tp = float(est.get("tau_p", float("nan")))
+                    ts = float(est.get("tau_s", float("nan")))
+                    sigp = float(est.get("sigma_p_used", float("nan")))
+                    sigs = float(est.get("sigma_s_used", float("nan")))
+                    sigp_est = float(est.get("sigma_p_est", float("nan")))
+                    sigs_est = float(est.get("sigma_s_est", float("nan")))
+                    sigp_param = float(est.get("sigma_p_param", float("nan")))
+                    sigs_param = float(est.get("sigma_s_param", float("nan")))
+                    sigp_only = float(est.get("resid_std_p", float("nan")))
+                    sigs_only = float(est.get("resid_std_s", float("nan")))
+                    src = str(est.get("sigma_source", "quantile"))
+                    _log(
+                        f"  tau: P={tp:.4g}s ({1e3*tp:.3g} ms)  S={ts:.4g}s ({1e3*ts:.3g} ms)",
+                        flush=True,
+                    )
+                    _log(
+                        f"  sigma_used[{src}]: P={sigp:.4g}s ({1e3*sigp:.3g} ms)  "
+                        f"S={sigs:.4g}s ({1e3*sigs:.3g} ms)",
+                        flush=True,
+                    )
+                    _log(
+                        f"  sigma_est(quantile): P={sigp_est:.4g}s ({1e3*sigp_est:.3g} ms)  "
+                        f"S={sigs_est:.4g}s ({1e3*sigs_est:.3g} ms)",
+                        flush=True,
+                    )
+                    _log(
+                        f"  sigma_param(phase_unc): P={sigp_param:.4g}s ({1e3*sigp_param:.3g} ms)  "
+                        f"S={sigs_param:.4g}s ({1e3*sigs_param:.3g} ms)",
+                        flush=True,
+                    )
+                    _log(
+                        f"  phase_unc_iid (resid std @ {residuals_at}): P={sigp_only:.4g}s ({1e3*sigp_only:.3g} ms)  "
+                        f"S={sigs_only:.4g}s ({1e3*sigs_only:.3g} ms)",
+                        flush=True,
+                    )
+                else:
+                    _log("  tau estimate skipped: shared_event_re disabled or no residuals.", flush=True)
+
+            if bool(cfg.get("station_phase_re", False)):
+                est_sp = estimate_shared_event_re_station_phase_tau_s(
+                    state=state,
+                    n_rows=n_rows,
+                    seed=seed,
+                    batch_size=bs,
+                    residuals_at=residuals_at,
+                    sigma_quantile=sigma_q,
+                    sigma_source=sigma_source,
+                    min_rows_per_group=min_rows_per_group,
+                )
+                if isinstance(est_sp, dict):
+                    tp = float(est_sp.get("tau_p", float("nan")))
+                    ts = float(est_sp.get("tau_s", float("nan")))
+                    sigp = float(est_sp.get("sigma_p_used", float("nan")))
+                    sigs = float(est_sp.get("sigma_s_used", float("nan")))
+                    sigp_est = float(est_sp.get("sigma_p_est", float("nan")))
+                    sigs_est = float(est_sp.get("sigma_s_est", float("nan")))
+                    sigp_param = float(est_sp.get("sigma_p_param", float("nan")))
+                    sigs_param = float(est_sp.get("sigma_s_param", float("nan")))
+                    src = str(est_sp.get("sigma_source", "quantile"))
+                    _log(
+                        f"  station_phase_re tau: P={tp:.4g}s ({1e3*tp:.3g} ms)  "
+                        f"S={ts:.4g}s ({1e3*ts:.3g} ms)",
+                        flush=True,
+                    )
+                    _log(
+                        f"  station_phase_re sigma_used[{src}]: P={sigp:.4g}s ({1e3*sigp:.3g} ms)  "
+                        f"S={sigs:.4g}s ({1e3*sigs:.3g} ms)",
+                        flush=True,
+                    )
+                    _log(
+                        f"  station_phase_re sigma_est(quantile): P={sigp_est:.4g}s ({1e3*sigp_est:.3g} ms)  "
+                        f"S={sigs_est:.4g}s ({1e3*sigs_est:.3g} ms)",
+                        flush=True,
+                    )
+                    _log(
+                        f"  station_phase_re sigma_param(phase_unc): P={sigp_param:.4g}s ({1e3*sigp_param:.3g} ms)  "
+                        f"S={sigs_param:.4g}s ({1e3*sigs_param:.3g} ms)",
+                        flush=True,
+                    )
+    except Exception as e:
+        warn(f"shared_event_re tau estimate failed: {e}", section="DIAG")
 
     # Run the same "end of Phase 1" diagnostics (config-driven).
     # These functions are all safe no-ops when their corresponding features are disabled.

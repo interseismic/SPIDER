@@ -15,11 +15,13 @@ from typing import Any, Dict, List, Tuple
 _FORBIDDEN_TOPLEVEL_KEYS: Tuple[str, ...] = (
     # Prior enable toggles
     "prior_event_enable",
+    "prior_centroid_enable",
     "prior_noise_enable",
     "prior_laplacian_enable",
     "prior_laplacian_phase4_only",
     # Event prior params
     "prior_event_std",
+    "prior_centroid_std",
     # Hierarchical event prior
     "hierarchical_event_prior",
     "hierarchical_prior_dof",
@@ -206,6 +208,27 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
         ev_hyper_scale_std = None
         ev_hyper_every = None
 
+    # ---- Centroid prior (optional) ----
+    centroid = priors.get("centroid", None)
+    if centroid is None:
+        centroid_enabled = False
+        centroid_std = None
+    else:
+        centroid = _require_dict(centroid, "priors.centroid")
+        centroid_enabled = _require_bool(_require(centroid, "enabled", "priors.centroid"), "priors.centroid.enabled")
+        centroid_type = _require_str(_require(centroid, "type", "priors.centroid"), "priors.centroid.type").lower()
+        if centroid_type not in {"gaussian"}:
+            raise _err("priors.centroid.type", "supported types: 'gaussian'")
+        centroid_params = _require_dict(_require(centroid, "params", "priors.centroid"), "priors.centroid.params")
+        if centroid_enabled:
+            centroid_std = _require_float_list(
+                _require(centroid_params, "std", "priors.centroid.params"),
+                "priors.centroid.params.std",
+                length=4,
+            )
+        else:
+            centroid_std = None
+
     # Noise prior removed (start fresh): fixed phase_unc only, no σ learning.
     if "noise" in priors:
         raise _err("priors.noise", "removed; delete this block from your config")
@@ -223,6 +246,11 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
         params["hierarchical_prior_dof"] = float(ev_hyper_df)
         params["_hierarchical_scale_std"] = ev_hyper_scale_std
         params["_hierarchical_update_every_epochs"] = int(ev_hyper_every)
+
+    # Centroid prior (optional)
+    params["prior_centroid_enable"] = bool(centroid_enabled)
+    if centroid_std is not None:
+        params["prior_centroid_std"] = centroid_std
 
     return params
 

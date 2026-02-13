@@ -42,6 +42,7 @@ class LocateState:
     # Model and priors
     model: nn.Module
     prior_event: torch.distributions.Distribution
+    prior_centroid: torch.distributions.Distribution
 
     # Optim/SGD
     optimizer: torch.optim.Optimizer

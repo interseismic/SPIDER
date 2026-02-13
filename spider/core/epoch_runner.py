@@ -353,6 +353,7 @@ def _update_svrg_snapshot(state: LocateState, batch_size: int, optimizer: torch.
     l_prior = compute_prior_loss(
         ΔX_src=state.dX_src,
         prior_event=state.prior_event,
+        prior_centroid=state.prior_centroid,
         σ_p=σp,
         σ_s=σs,
         N_total=state.N,
@@ -480,6 +481,7 @@ def _run_epoch(
     # --- Per-prior runtime enables (materialized by validate_and_materialize_priors) ---
     # Hard break: priors are active in all phases when enabled (no per-phase scheduling).
     state.params["_prior_event_runtime_enable"] = bool(state.params.get("prior_event_enable", True))
+    state.params["_prior_centroid_runtime_enable"] = bool(state.params.get("prior_centroid_enable", False))
     # Noise prior removed (fixed phase_unc only).
 
     ddp_enabled, ddp_rank, ddp_world_size, ddp_is_main = _ddp_info(state.params)
@@ -1489,6 +1491,7 @@ def _run_epoch(
             loss_prior = compute_prior_loss(
                 ΔX_src=state.dX_src,
                 prior_event=state.prior_event,
+                prior_centroid=state.prior_centroid,
                 σ_p=σp,
                 σ_s=σs,
                 N_total=state.N,
@@ -1682,6 +1685,7 @@ def _run_epoch(
             loss_prior = compute_prior_loss(
                 ΔX_src=state.dX_src,
                 prior_event=state.prior_event,
+                prior_centroid=state.prior_centroid,
                 σ_p=σp,
                 σ_s=σs,
                 N_total=state.N,
@@ -1825,6 +1829,7 @@ def _run_epoch(
                 ΔX_src=state.dX_src, # Now holding snapshot
                 model=state.model,
                 prior_event=state.prior_event,
+                prior_centroid=state.prior_centroid,
                 σ_p=σp,
                 σ_s=σs,
                 N_total=state.N,

@@ -724,6 +724,37 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     # Internal legacy variable used by some older compatibility checks below.
     learn_noise_scale = False
 
+    # Optional: distance-dependent sigma (linear in event-pair separation).
+    sigma_dist_enable = False
+    sigma_dist_slope_ps = [0.0, 0.0]  # seconds per km for [P,S]
+    sigma_dist_min_ps = [0.0, 0.0]    # minimum sigma per phase (seconds)
+    sigma_dist_max_km = None
+    sigma_dist_cfg = lk.get("sigma_distance_linear", None)
+    if isinstance(sigma_dist_cfg, dict):
+        if "enabled" in sigma_dist_cfg and sigma_dist_cfg.get("enabled", None) is not None:
+            sigma_dist_enable = bool(_require_bool(sigma_dist_cfg.get("enabled"), "model.likelihood.sigma_distance_linear.enabled"))
+        if "slope_s_per_km" in sigma_dist_cfg and sigma_dist_cfg.get("slope_s_per_km", None) is not None:
+            sigma_dist_slope_ps = _require_float_list(
+                sigma_dist_cfg.get("slope_s_per_km"),
+                "model.likelihood.sigma_distance_linear.slope_s_per_km",
+                length=2,
+            )
+        if "min_sigma_s" in sigma_dist_cfg and sigma_dist_cfg.get("min_sigma_s", None) is not None:
+            sigma_dist_min_ps = _require_float_list(
+                sigma_dist_cfg.get("min_sigma_s"),
+                "model.likelihood.sigma_distance_linear.min_sigma_s",
+                length=2,
+            )
+        if "max_dist_km" in sigma_dist_cfg and sigma_dist_cfg.get("max_dist_km", None) is not None:
+            sigma_dist_max_km = float(_require_num(sigma_dist_cfg.get("max_dist_km"), "model.likelihood.sigma_distance_linear.max_dist_km"))
+            if not (sigma_dist_max_km >= 0.0):
+                raise _err("model.likelihood.sigma_distance_linear.max_dist_km", "must be >= 0")
+    if sigma_dist_enable:
+        if not (sigma_dist_slope_ps[0] >= 0.0 and sigma_dist_slope_ps[1] >= 0.0):
+            raise _err("model.likelihood.sigma_distance_linear.slope_s_per_km", "must be >= 0")
+        if not (sigma_dist_min_ps[0] >= 0.0 and sigma_dist_min_ps[1] >= 0.0):
+            raise _err("model.likelihood.sigma_distance_linear.min_sigma_s", "must be >= 0")
+
     # Optional: Student-t likelihood parameters.
     #
     # NLL per obs (up to a constant) is:
@@ -787,6 +818,7 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     se_max_nodes_per_group = 512
     se_max_rows_per_group = 200000
     se_fallback_to_diag = True
+    se_abort_on_pcg_fallback = True
     se_jitter0 = 1e-8
     se_jitter_max = 1e-3
     # Optional: internal runtime controls for station_phase caching/debugging
@@ -949,6 +981,10 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
                 raise _err("model.likelihood.shared_event_re.max_rows_per_group", "must be >= 2")
         if "fallback_to_diag" in se_cfg and se_cfg["fallback_to_diag"] is not None:
             se_fallback_to_diag = bool(se_cfg.get("fallback_to_diag", True))
+        if "abort_on_pcg_fallback" in se_cfg and se_cfg["abort_on_pcg_fallback"] is not None:
+            se_abort_on_pcg_fallback = bool(se_cfg.get("abort_on_pcg_fallback", False))
+        if "abort_on_fallback" in se_cfg and se_cfg["abort_on_fallback"] is not None:
+            se_abort_on_pcg_fallback = bool(se_cfg.get("abort_on_fallback", False))
         if "jitter0" in se_cfg and se_cfg["jitter0"] is not None:
             se_jitter0 = float(_require_num(se_cfg["jitter0"], "model.likelihood.shared_event_re.jitter0"))
             if se_jitter0 <= 0.0:
@@ -1311,7 +1347,24 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     # ---- materialize legacy flat keys (implementation detail) ----
     params["likelihood"] = lk_type
     params["phase_unc"] = phase_unc
+    params["_sigma_distance_enable"] = bool(sigma_dist_enable)
+    params["_sigma_distance_slope_ps"] = [float(sigma_dist_slope_ps[0]), float(sigma_dist_slope_ps[1])]
+    params["_sigma_distance_min_sigma_ps"] = [float(sigma_dist_min_ps[0]), float(sigma_dist_min_ps[1])]
+    params["_sigma_distance_max_dist_km"] = (float(sigma_dist_max_km) if sigma_dist_max_km is not None else None)
     params["_student_t_nu"] = float(student_t_nu)
+    # Filters (materialize legacy flat keys used by data.py)
+    params["remove_duplicates"] = bool(remove_duplicates)
+    params["max_abs_input_dt"] = float(max_abs_input_dt)
+    params["dtime_thin_frac"] = float(dtime_thin_frac)
+    params["flip_dt_sign"] = bool(flip_dt_sign)
+    params["cc_min"] = float(cc_min)
+    params["min_dtimes"] = int(min_dtimes)
+    params["min_unique_phase_per_event"] = int(min_unique_phase_per_event)
+    params["min_dtimes_per_pair"] = int(min_dtimes_per_pair)
+    params["min_event_degree"] = int(min_event_degree)
+    params["min_events_per_cluster"] = int(min_events_per_cluster)
+    params["max_pair_station_ratio"] = float(max_pair_station_ratio)
+    params["ratio_filter_phase"] = str(ratio_filter_phase)
 
     # Collapsed shared-event random effects (optional)
     params["_shared_event_re_enabled"] = bool(se_enabled)
@@ -1327,6 +1380,7 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["_shared_event_re_max_nodes_per_group"] = int(se_max_nodes_per_group)
     params["_shared_event_re_max_rows_per_group"] = int(se_max_rows_per_group)
     params["_shared_event_re_fallback_to_diag"] = bool(se_fallback_to_diag)
+    params["_shared_event_re_abort_on_pcg_fallback"] = bool(se_abort_on_pcg_fallback)
     params["_shared_event_re_jitter0"] = float(se_jitter0)
     params["_shared_event_re_jitter_max"] = float(se_jitter_max)
     params["_shared_event_re_cache_max_entries"] = int(se_cache_max_entries)

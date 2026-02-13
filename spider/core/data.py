@@ -554,18 +554,12 @@ def prepare_input_dfs(params, *, model=None, device=None):
             tmp = dtimes.with_row_index("__row") if hasattr(dtimes, "with_row_index") else dtimes.with_row_count("__row")
             dtimes = tmp.filter(pl.col("__row").is_in(pl.Series(keep_idx))).drop("__row")
 
-        # Immediately after the linearization filter (before), apply residual-based outlier filtering if enabled.
-        try:
-            _maybe_residual_outlier_filter_dtimes()
-        except Exception as e:
-            warn(f"Residual filter (after linearization 'before') failed: {e}", section="FILTER")
+        # Residual filter is applied only during sampling (Phase 2), not during data prep.
+        # See locate.py _pre_filter_outlier_residuals for the Phase-2 implementation.
 
-    else:
-        # If no linearization filter ran here, still run residual outlier filtering as early as possible.
-        try:
-            _maybe_residual_outlier_filter_dtimes()
-        except Exception as e:
-            warn(f"Residual filter (early) failed: {e}", section="FILTER")
+    # else:
+        # Residual filter is applied only during sampling (Phase 2), not during data prep.
+        # See locate.py _pre_filter_outlier_residuals for the Phase-2 implementation.
 
     # Remove duplicates if requested
     if bool(params.get("remove_duplicates", False)):
