@@ -1,67 +1,54 @@
-## SPIDER (code-only repository)
+## SPIDER package
 
-This repository is intentionally **code-only**: the tracked surface area is the
-`spider/` Python package (plus a minimal root `.gitignore`). Large datasets,
-plots, W&B runs, notebooks, and ad-hoc scripts may exist locally but are not
-part of the tracked project state.
-
-### Supported entrypoint
-
-Run the CLI from the repository root:
+This is the core Python package for SPIDER. The main entrypoint is the CLI:
 
 ```bash
 python -m spider --help
 ```
 
-Core workflow:
+### Core workflow
 
 ```bash
 # Phase 1 (MAP) -> writes <checkpoint_dir>/phase2_bundle.pth by default
-# (bundle contains post-filter picks + MAP locations; sampling rebuilds all other runtime artifacts)
 python -m spider locate-map path/to/params.json --device 0
 
-# Phase 2–4 (sampling) from the Phase-2 bundle
+# Phase 2–4 (sampling) from the Phase‑2 bundle
 python -m spider sample path/to/params.json --device 0
 
-# Multi-GPU independent chains (one process per device)
+# Multi‑GPU independent chains (one process per device)
 python -m spider sample-multi path/to/params.json --devices 0,1,2,3
 ```
 
-### Configuration
+### Configuration schema
 
 SPIDER uses a **strict nested JSON** schema:
 
 - Schema/validation: `spider/core/config_schema.py`
 - Priors validation: `spider/core/priors_config.py`
 
-Start from the template:
+Template:
 
 - `spider/examples/params_template.json`
 
-Notes on optional likelihoods:
+### Module map
 
+- `spider/core/`: inference pipeline, likelihoods, priors, sampling
+- `spider/io/`: reading/writing, samples, checkpoints
+- `spider/analysis/`: diagnostics and calibration
+- `spider/plotting/`: visualization helpers
+- `spider/diagnostics/`: online ESS and other runtime diagnostics
+- `spider/optim/`: samplers and optimizers
 
-### Library utilities (optional)
-
-The CLI does not depend on these modules, but they are available for scripting:
-
-- `spider.analysis` (post-processing)
-- `spider.plotting` (plot helpers)
-
-### Maintenance / “what’s stale?”
-
-See:
-
-- `spider/MAINTENANCE.md`
-
-Tools:
+### Utilities
 
 ```bash
-# Static import-graph audit (conservative)
+# Static import‑graph audit (conservative)
 python -m spider.tools.audit_reachability
 
-# Clean common local artifacts (defaults to dry-run; add --yes to delete)
+# Clean common local artifacts (dry‑run by default; add --yes to delete)
 python -m spider.tools.clean_worktree
 python -m spider.tools.clean_worktree --yes
 ```
+
+See the root `README.md` for a full workflow description.
 
