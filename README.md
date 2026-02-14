@@ -249,8 +249,31 @@ Enable:
       "enabled": true,
       "grouping": "station_phase",
       "tau_s": [0.03, 0.04],
+      "max_nodes_per_group": 25000,
+      "max_rows_per_group": 1500000,
       "solver": "pcg_sparse",
-      "whitening": { "enabled": true }
+      "pcg_max_iters": 20,
+      "pcg_tol": 5e-3,
+      "gpu_max_groups_per_batch": 128,
+      "gpu_max_edges_per_batch": 1500000,
+      "gpu_reuse_pcg_init": true,
+      "edge_weighting": "distance_power",
+      "edge_weight_power": 0.25,
+      "edge_weight_scale_km": 40.0,
+      "edge_weight_global_scale": 1.0,
+      "edge_weight_normalize": true,
+      "edge_weight_eps_km": 1e-3,
+      "whitening": {
+        "enabled": true,
+        "solver": "pcg",
+        "pcg_batched": true,
+        "pcg_bucket_nodes": [4096, 16384, 25000],
+        "pcg_max_iters": 100,
+        "pcg_tol": 3e-4,
+        "pcg_min_iters": 2,
+        "precompute": true,
+        "precompute_device": "gpu"
+      }
     }
   }
 }
