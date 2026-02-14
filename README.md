@@ -226,14 +226,20 @@ python -m spider sample-multi my_params.json --devices 0,1,2,3
 - `student_t` (requires `model.likelihood.student_t.nu`)
 - `correlated` / `correlated_gaussian`
 
-Key fields:
+### Base residual model
+
+All likelihoods use per‑phase noise:
 
 - `phase_unc`: per‑phase noise standard deviation `[P, S]`
-- `sigma_distance_linear`: optional distance‑dependent sigma
+- `sigma_distance_linear`: optional distance‑dependent sigma (linear in event‑pair separation)
 
-### Shared‑event correlated residuals
+### Shared‑event correlated residuals (whitening assumed ON)
 
-Enable the collapsed shared‑event random‑effects model:
+For correlated Gaussian residuals, SPIDER uses a collapsed shared‑event random‑effects model,
+grouped by station‑phase. In the current workflow, **whitening is assumed enabled** to
+accelerate PCG solves and improve conditioning.
+
+Enable:
 
 ```json
 "model": {
@@ -243,19 +249,25 @@ Enable the collapsed shared‑event random‑effects model:
       "enabled": true,
       "grouping": "station_phase",
       "tau_s": [0.03, 0.04],
-      "solver": "pcg_sparse"
+      "solver": "pcg_sparse",
+      "whitening": { "enabled": true }
     }
   }
 }
 ```
 
-Important options:
+Key pieces:
 
-- `grouping`: `station_phase`
-- `tau_s`: per‑phase shared‑event scale
-- `solver`: PCG‑based solvers (`pcg_sparse`)
-- `whitening`: optional PCG whitening preconditioner
-- `edge_weighting`: distance‑based edge weights (`distance_power`)
+- **Grouping**: `grouping="station_phase"` (default in configs)
+- **Shared‑event scale**: `tau_s` per phase
+- **PCG solver**: `solver="pcg_sparse"` (CPU) with GPU batching options
+- **Whitening (assumed ON)**: `shared_event_re.whitening.*` controls PCG whitening
+  - `pcg_batched`, `pcg_bucket_nodes`, `pcg_max_iters`, `pcg_tol`
+  - `precompute=true` + `precompute_device="gpu"` for cached factors
+- **Edge weights**: distance‑based weighting of residual correlations
+  - `edge_weighting="distance_power"`, `edge_weight_power`, `edge_weight_scale_km`
+
+If you disable whitening, increase PCG iterations and expect slower/less stable solves.
 
 ## Samplers
 
