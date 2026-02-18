@@ -166,17 +166,39 @@ These are commonly used in real configs but not exhaustively listed above:
 
 ### Filters
 
-- `model.filters.dtimes`: duplicate removal, thinning, sign flips, cc thresholds
-- `model.filters.events`: min counts, degree filters, pair‑station ratio filters
-- `model.filters.events.linearization_error`: linearization error filter (optional)
-- `model.filters.residual`: residual outlier filter (usually Phase‑2 only)
+`model.filters.dtimes` (row‑level filters):
+
+- `remove_duplicates`: drop duplicate dt rows.
+- `max_abs_input_dt`: discard rows with |dt| above this threshold.
+- `dtime_thin_frac`: random thinning fraction (0–1) to subsample dtimes.
+- `flip_dt_sign`: if true, multiply dt by −1 (for convention changes).
+- `cc_min`: drop rows with cross‑correlation below this threshold.
+
+`model.filters.events` (event‑level filters):
+
+- `min_dtimes`: minimum number of dt rows per event.
+- `min_unique_phase_per_event`: minimum unique station‑phase picks per event.
+- `min_dtimes_per_pair`: minimum dt rows per event pair.
+- `min_event_degree`: minimum graph degree for each event.
+- `min_events_per_cluster`: minimum cluster size to keep a component.
+- `ratio_filter_phase`: whether to apply ratio filters `before` or `after` other filters.
+- `linearization_error`: optional filter block for large linearization errors.
+
+`model.filters.residual` (residual outliers, usually Phase‑2 only):
+
+- `enabled`: turn the residual outlier filter on/off.
+- `method`: outlier method (e.g., `mad`).
+- `mad_sigma`: MAD threshold in standard‑deviation units.
+- `abs_max`: absolute residual cap.
 
 ### Sampler details
 
-- `inference.sampler.epochs_per_phase`: per‑phase epochs
-- `inference.sampler.dt_lr_mult`: learning‑rate scale for dt parameters
-- `inference.sampler.eps`, `beta`, `sghmc_alpha`
-- `inference.sampler.preconditioning`: RMSProp config
+- `inference.sampler.epochs_per_phase`: per‑phase epoch counts `[map, warmup, burnin, sample]`.
+- `inference.sampler.dt_lr_mult`: learning‑rate scale for the dt parameter.
+- `inference.sampler.eps`: numerical stabilizer for preconditioning.
+- `inference.sampler.beta`: RMSProp/EMA decay for preconditioning stats.
+- `inference.sampler.sghmc_alpha`: SGHMC friction (only for `backend="sghmc"`).
+- `inference.sampler.preconditioning`: RMSProp config block (`enabled`, `type`).
 
 ### Diagnostics
 
@@ -230,8 +252,10 @@ python -m spider sample-multi my_params.json --devices 0,1,2,3
 
 All likelihoods use per‑phase noise:
 
-- `phase_unc`: per‑phase noise standard deviation `[P, S]`
-- `sigma_distance_linear`: optional distance‑dependent sigma (linear in event‑pair separation)
+- `model.likelihood.type`: residual distribution (`gaussian`, `laplace`, `huber`, `student_t`, or `correlated_gaussian`).
+- `phase_unc`: per‑phase noise standard deviation `[P, S]` applied to residuals.
+- `sigma_distance_linear`: optional distance‑dependent sigma (linear in event‑pair separation) to broaden uncertainty for wide pairs.
+- `student_t.nu`: degrees of freedom for the Student‑t likelihood (only used when `type="student_t"`).
 
 ### Shared‑event correlated residuals (whitening assumed ON)
 
@@ -281,14 +305,40 @@ Enable:
 
 Key pieces:
 
-- **Grouping**: `grouping="station_phase"` (default in configs)
-- **Shared‑event scale**: `tau_s` per phase
-- **PCG solver**: `solver="pcg_sparse"` (CPU) with GPU batching options
-- **Whitening (assumed ON)**: `shared_event_re.whitening.*` controls PCG whitening
-  - `pcg_batched`, `pcg_bucket_nodes`, `pcg_max_iters`, `pcg_tol`
-  - `precompute=true` + `precompute_device="gpu"` for cached factors
-- **Edge weights**: distance‑based weighting of residual correlations
-  - `edge_weighting="distance_power"`, `edge_weight_power`, `edge_weight_scale_km`
+- **Grouping**: `grouping="station_phase"` groups residuals by station/phase for shared‑event correlations.
+- **Shared‑event scale**: `tau_s` per phase sets the shared‑event random‑effect scale.
+- **PCG solver**: `solver="pcg_sparse"` uses a sparse PCG solve on CPU; GPU batching controls memory.
+- **Whitening (assumed ON)**: `shared_event_re.whitening.*` configures the PCG whitening preconditioner.
+- **Edge weights**: distance‑based weighting of residual correlations.
+
+Shared‑event correlated residual parameters:
+
+- `shared_event_re.enabled`: turn on/off the correlated residual model (required for `type="correlated_gaussian"`).
+- `shared_event_re.grouping`: grouping strategy (`station_phase` is standard).
+- `shared_event_re.tau_s`: per‑phase shared‑event scales `[P, S]`.
+- `shared_event_re.max_nodes_per_group`: cap group size to control memory/compute.
+- `shared_event_re.max_rows_per_group`: cap total residual rows per group.
+- `shared_event_re.solver`: linear solver (`pcg_sparse` for CPU PCG).
+- `shared_event_re.pcg_max_iters`: PCG iteration cap for the correlated solve.
+- `shared_event_re.pcg_tol`: PCG tolerance for the correlated solve.
+- `shared_event_re.gpu_max_groups_per_batch`: GPU batching limit for correlated solves.
+- `shared_event_re.gpu_max_edges_per_batch`: GPU edge limit per batch.
+- `shared_event_re.gpu_reuse_pcg_init`: reuse PCG initial guesses to speed repeated solves.
+- `shared_event_re.edge_weighting`: edge‑weight model (`distance_power` for distance‑based scaling).
+- `shared_event_re.edge_weight_power`: power for distance‑based edge weights.
+- `shared_event_re.edge_weight_scale_km`: distance scale (km) for edge weights.
+- `shared_event_re.edge_weight_global_scale`: global multiplier on edge weights.
+- `shared_event_re.edge_weight_normalize`: normalize weights to stabilize scaling across groups.
+- `shared_event_re.edge_weight_eps_km`: epsilon (km) to avoid divide‑by‑zero in weights.
+- `shared_event_re.whitening.enabled`: enable the whitening preconditioner.
+- `shared_event_re.whitening.solver`: whitening solver (`pcg`).
+- `shared_event_re.whitening.pcg_batched`: batch PCG whitening solves for speed.
+- `shared_event_re.whitening.pcg_bucket_nodes`: bucket sizes for batched whitening.
+- `shared_event_re.whitening.pcg_max_iters`: PCG iteration cap for whitening.
+- `shared_event_re.whitening.pcg_tol`: PCG tolerance for whitening.
+- `shared_event_re.whitening.pcg_min_iters`: minimum PCG iterations for whitening.
+- `shared_event_re.whitening.precompute`: precompute whitening factors.
+- `shared_event_re.whitening.precompute_device`: device for precomputation (`gpu` or `cpu`).
 
 If you disable whitening, increase PCG iterations and expect slower/less stable solves.
 
@@ -301,9 +351,16 @@ If you disable whitening, increase PCG iterations and expect slower/less stable 
 
 Common settings:
 
-- `lr`: per‑phase learning rates
-- `temperature`: target temperature
-- `preconditioning`: RMSProp‑style preconditioning
+- `backend`: sampler choice (`psgld` or `sghmc`).
+- `epochs_per_phase`: epochs for phases 1–4 `[map, warmup, burnin, sample]`.
+- `lr`: per‑phase learning rates `[phase1, phase2, phase3, phase4]` (scaled per‑obs).
+- `dt_lr_mult`: multiplier for the dt parameter learning rate.
+- `temperature`: target posterior temperature (1.0 = nominal posterior).
+- `eps`: numerical stabilizer for preconditioning updates.
+- `beta`: RMSProp/EMA decay for preconditioning statistics.
+- `sghmc_alpha`: friction term for SGHMC (only used when `backend="sghmc"`).
+- `preconditioning.enabled`: toggle RMSProp‑style preconditioning.
+- `preconditioning.type`: preconditioner type (e.g., `rmsprop`).
 
 ## Batching and performance
 
