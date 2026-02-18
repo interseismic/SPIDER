@@ -23,7 +23,6 @@ This is a brand new codebase. Please be patient with us as we work to making thi
 - [WandB outputs](#wandb-outputs)
 - [Learning rate tuning (variance ratio)](#learning-rate-tuning-variance-ratio)
 - [Python API](#python-api)
-- [Example run](#example-run)
 - [Citation](#citation)
 
 ## Installation
@@ -40,23 +39,22 @@ pip install -e '.[wandb]'
 
 ## Quick start
 
-1) Copy a nested config and edit paths:
+Use the lightweight example in `./example`:
 
 ```bash
-cp spider/examples/params_template.json my_params.json
+# Phase 1 (MAP)
+python -m spider locate-map example/SPIDER_example.json --device 0
+
+# Phase 2–4 (sampling)
+python -m spider sample example/SPIDER_example.json --device 0
 ```
 
-2) Run Phase 1 (MAP), then sample:
+Outputs are written to the paths defined in `example/SPIDER_example.json`.
+
+Multi‑GPU independent chains:
 
 ```bash
-python -m spider locate-map my_params.json --device 0
-python -m spider sample my_params.json --device 0
-```
-
-3) Multi‑GPU independent chains:
-
-```bash
-python -m spider sample-multi my_params.json --devices 0,1,2,3
+python -m spider sample-multi example/SPIDER_example.json --devices 0,1,2,3
 ```
 
 ## EikoNet training
@@ -429,21 +427,6 @@ fig, axes = plot_event_marginal_kde2d(samples_data=samples, event_index=0, coord
 fig, ax = plot_uncertainty_histograms(summary, coords=("X", "Y", "Z", "T"))
 ```
 
-See `notebooks/plot_ridgecrest_syn.ipynb` for a more complete analysis workflow.
-
-## Example run
-
-Use the lightweight example in `./example`:
-
-```bash
-# Phase 1 (MAP)
-python -m spider locate-map example/SPIDER_example.json --device 0
-
-# Phase 2–4 (sampling)
-python -m spider sample example/SPIDER_example.json --device 0
-```
-
-Outputs are written to the paths defined in `example/SPIDER_example.json`.
 
 ## Citation
 
