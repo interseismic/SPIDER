@@ -35,22 +35,6 @@
                         0.5,
                         0.2
                     ]
-                },
-                "hyper": {
-                    "enabled": false,
-                    "type": "wishart_precision",
-                    "params": {
-                        "df": 1000,
-                        "scale_std": [
-                            0.01,
-                            0.01,
-                            0.01,
-                            0.01
-                        ]
-                    },
-                    "update": {
-                        "every_epochs": 1
-                    }
                 }
             },
             "centroid": {
