@@ -12,10 +12,8 @@ import pyproj
 
 # %%
 device = "cuda:6"
-infile = '/home/zross/git/SPIDER/yifan_redo/eikonet.json'
-#infile = '/home/zross/git/SPIDER/maunaloa/eikonet.json'
-# infile = '/home/zross/git/SPIDER/tottori/eikonet.json'
-# infile = '/home/zross/git/SPIDER/cahuilla/eikonet.json'
+infile = '/home/zross/git/SPIDER/eikonet.json'
+
 with open(infile) as f:
     params = json.load(f)
 model_file = params["model_file"]
@@ -195,6 +193,21 @@ class EikoNet(torch.nn.Module):
         # s_pred = torch.cat((s_src, s_rec), dim=1)
         return s_rec
 
+def _remap_legacy_state_dict(sd_legacy: dict, *, n_blocks: int) -> dict:
+    out = {}
+    out["input_layer.weight"] = sd_legacy["linear1.weight"]
+    out["input_layer.bias"] = sd_legacy["linear1.bias"]
+    for i in range(int(n_blocks)):
+        k1 = 2 + 2 * i
+        k2 = 3 + 2 * i
+        out[f"blocks.{i}.0.weight"] = sd_legacy[f"linear{k1}.weight"]
+        out[f"blocks.{i}.0.bias"] = sd_legacy[f"linear{k1}.bias"]
+        out[f"blocks.{i}.1.weight"] = sd_legacy[f"linear{k2}.weight"]
+        out[f"blocks.{i}.1.bias"] = sd_legacy[f"linear{k2}.bias"]
+    out["output_layer.weight"] = sd_legacy["linear_out.weight"]
+    out["output_layer.bias"] = sd_legacy["linear_out.bias"]
+    return out
+
 def build_dataset():
     n_dataset = n_train
 
@@ -282,5 +295,14 @@ for epoch in range(params["n_epochs"]):
     
     if val_loss < best_loss:
         best_loss = val_loss 
-        # print("NOT SAVING FILE") 
-        torch.save(model, model_file)
+        # print("NOT SAVING FILE")
+        n_blocks = 5
+        meta = {
+            "scale": float(model.scale),
+            "vs": float(model.vs),
+            "vp": float(model.vp),
+            "n_hidden": int(model.n_hidden),
+            "n_blocks": int(n_blocks),
+        }
+        sd_new = _remap_legacy_state_dict(model.state_dict(), n_blocks=n_blocks)
+        torch.save({"state_dict": sd_new, "meta": meta}, model_file)

@@ -5,6 +5,8 @@
 
 SPIDER is a Python toolkit for probabilistic earthquake relocation using differential travel times, neural travel‑time prediction, and scalable MCMC sampling. It combines a fast surrogate travel‑time model (EikoNet) with a multi‑phase inference pipeline to estimate event locations with uncertainty.
 
+This is a brand new codebase. Please be patient with us as we work to making this usable by the broader scientific community.
+
 ## Table of contents
 
 - [Installation](#installation)
@@ -391,6 +393,43 @@ Useful modules:
 - `spider.analysis`: diagnostics and calibration
 - `spider.plotting`: visualization helpers
 - `spider.core`: inference pipeline and likelihoods
+
+### Analysis and plotting
+
+The plotting/analysis utilities are typically driven from a summary produced by
+`compute_cat_dd_and_xyz`. A minimal workflow:
+
+```python
+from spider.io.samples import read_all_samples
+from spider.analysis import compute_cat_dd_and_xyz
+from spider.plotting import (
+    plot_event_distributions,
+    plot_event_chains,
+    plot_event_marginal_hist2d,
+    plot_uncertainty_histograms,
+)
+from spider.plotting.events import plot_event_marginal_kde2d
+
+samples = read_all_samples(params, thin=5)
+summary = compute_cat_dd_and_xyz(samples, burn_in=100, include=["X", "Y", "Z", "T"])
+
+# Posterior spreads for many events
+fig, ax = plot_event_distributions(summary, coords=("X", "Y", "Z"), units="meters")
+
+# Per-event chains
+fig, ax = plot_event_chains(summary, coords=("X",), n_rows=6, n_cols=4)
+
+# 2D marginal histograms
+fig, axes = plot_event_marginal_hist2d(samples_data=samples, event_index=0, coords=("X", "Y", "Z"))
+
+# KDE-based 2D marginals (single event)
+fig, axes = plot_event_marginal_kde2d(samples_data=samples, event_index=0, coords=("X", "Y", "Z"))
+
+# Aggregate uncertainty histograms
+fig, ax = plot_uncertainty_histograms(summary, coords=("X", "Y", "Z", "T"))
+```
+
+See `notebooks/plot_ridgecrest_syn.ipynb` for a more complete analysis workflow.
 
 ## Example configuration
 
