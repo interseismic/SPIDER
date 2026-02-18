@@ -240,22 +240,31 @@ python -m spider sample-multi my_params.json --devices 0,1,2,3
 
 ## Likelihoods and correlated residuals
 
-`model.likelihood.type` supports:
-
-- `gaussian` / `l2` (alias: `mse`)
-- `laplace` / `l1` / `mae`
-- `huber`
-- `student_t` (requires `model.likelihood.student_t.nu`)
-- `correlated` / `correlated_gaussian`
+`model.likelihood.type` is assumed to be `correlated_gaussian` in this codebase.
 
 ### Base residual model
 
-All likelihoods use per‑phase noise:
+The correlated Gaussian likelihood uses per‑phase noise:
 
-- `model.likelihood.type`: residual distribution (`gaussian`, `laplace`, `huber`, `student_t`, or `correlated_gaussian`).
+- `model.likelihood.type`: residual distribution (use `correlated_gaussian`).
 - `phase_unc`: per‑phase noise standard deviation `[P, S]` applied to residuals.
 - `sigma_distance_linear`: optional distance‑dependent sigma (linear in event‑pair separation) to broaden uncertainty for wide pairs.
-- `student_t.nu`: degrees of freedom for the Student‑t likelihood (only used when `type="student_t"`).
+
+## Priors
+
+`model.priors` controls optional priors over events and the centroid:
+
+`model.priors.event`:
+
+- `enabled`: enable/disable event priors.
+- `type`: prior family (currently `gaussian`).
+- `params.std`: per‑event standard deviations for `[x, y, z, dt]` (units follow your domain).
+
+`model.priors.centroid`:
+
+- `enabled`: enable/disable centroid prior.
+- `type`: prior family (currently `gaussian`).
+- `params.std`: centroid standard deviations for `[x, y, z, dt]`.
 
 ### Shared‑event correlated residuals (whitening assumed ON)
 
