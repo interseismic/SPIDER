@@ -144,7 +144,7 @@ Paths and output settings:
 - `model_file`: EikoNet checkpoint
 - `domain`: `lon_min`, `lat_min`, `z_min`, `z_max`, `scale`
 - `priors`: event and centroid priors
-- `likelihood`: residual model and correlated residual options
+- `likelihoods`: phase‑specific residual models (locate_map vs sample)
 - `filters`: dtimes/events/residual filters
 
 ### `inference`
@@ -158,11 +158,11 @@ Paths and output settings:
 
 These are commonly used in real configs but not exhaustively listed above:
 
-### Likelihood extras
+### Likelihood extras (sample)
 
-- `model.likelihood.sigma_distance_linear`: distance‑dependent sigma (linear in separation)
-- `model.likelihood.shared_event_re.whitening`: PCG whitening preconditioner options
-- `model.likelihood.shared_event_re.edge_weighting`: distance‑based weights (`distance_power`)
+- `model.likelihoods.sample.sigma_distance_linear`: distance‑dependent sigma (linear in separation)
+- `model.likelihoods.sample.shared_event_re.whitening`: PCG whitening preconditioner options
+- `model.likelihoods.sample.shared_event_re.edge_weighting`: distance‑based weights (`distance_power`)
 
 ### Filters
 
@@ -240,13 +240,13 @@ python -m spider sample-multi my_params.json --devices 0,1,2,3
 
 ## Likelihoods and correlated residuals
 
-`model.likelihood.type` is assumed to be `correlated_gaussian` in this codebase.
+`model.likelihoods` provides separate likelihoods for Phase 1 (`locate_map`) and Phases 2–4 (`sample`).
 
 ### Base residual model
 
-The correlated Gaussian likelihood uses per‑phase noise:
+The correlated Gaussian likelihood uses per‑phase noise (for `model.likelihoods.sample`):
 
-- `model.likelihood.type`: residual distribution (use `correlated_gaussian`).
+- `model.likelihoods.sample.type`: residual distribution (use `correlated_gaussian`).
 - `phase_unc`: per‑phase noise standard deviation `[P, S]` applied to residuals.
 - `sigma_distance_linear`: optional distance‑dependent sigma (linear in event‑pair separation) to broaden uncertainty for wide pairs.
 
@@ -276,36 +276,42 @@ Enable:
 
 ```json
 "model": {
-  "likelihood": {
-    "type": "correlated_gaussian",
-    "shared_event_re": {
-      "enabled": true,
-      "grouping": "station_phase",
-      "tau_s": [0.03, 0.04],
-      "max_nodes_per_group": 25000,
-      "max_rows_per_group": 1500000,
-      "solver": "pcg_sparse",
-      "pcg_max_iters": 20,
-      "pcg_tol": 5e-3,
-      "gpu_max_groups_per_batch": 128,
-      "gpu_max_edges_per_batch": 1500000,
-      "gpu_reuse_pcg_init": true,
-      "edge_weighting": "distance_power",
-      "edge_weight_power": 0.25,
-      "edge_weight_scale_km": 40.0,
-      "edge_weight_global_scale": 1.0,
-      "edge_weight_normalize": true,
-      "edge_weight_eps_km": 1e-3,
-      "whitening": {
+  "likelihoods": {
+    "locate_map": {
+      "type": "laplace",
+      "phase_unc": [0.02, 0.03]
+    },
+    "sample": {
+      "type": "correlated_gaussian",
+      "shared_event_re": {
         "enabled": true,
-        "solver": "pcg",
-        "pcg_batched": true,
-        "pcg_bucket_nodes": [4096, 16384, 25000],
-        "pcg_max_iters": 100,
-        "pcg_tol": 3e-4,
-        "pcg_min_iters": 2,
-        "precompute": true,
-        "precompute_device": "gpu"
+        "grouping": "station_phase",
+        "tau_s": [0.03, 0.04],
+        "max_nodes_per_group": 25000,
+        "max_rows_per_group": 1500000,
+        "solver": "pcg_sparse",
+        "pcg_max_iters": 20,
+        "pcg_tol": 5e-3,
+        "gpu_max_groups_per_batch": 128,
+        "gpu_max_edges_per_batch": 1500000,
+        "gpu_reuse_pcg_init": true,
+        "edge_weighting": "distance_power",
+        "edge_weight_power": 0.25,
+        "edge_weight_scale_km": 40.0,
+        "edge_weight_global_scale": 1.0,
+        "edge_weight_normalize": true,
+        "edge_weight_eps_km": 1e-3,
+        "whitening": {
+          "enabled": true,
+          "solver": "pcg",
+          "pcg_batched": true,
+          "pcg_bucket_nodes": [4096, 16384, 25000],
+          "pcg_max_iters": 100,
+          "pcg_tol": 3e-4,
+          "pcg_min_iters": 2,
+          "precompute": true,
+          "precompute_device": "gpu"
+        }
       }
     }
   }

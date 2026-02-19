@@ -1483,7 +1483,7 @@ def compute_likelihood_loss(
         data_loss = torch.abs(scaled_resid)
     else:
         # Huber (Smooth L1)
-        huber_delta = float(params["model"]["likelihood"].get("huber_delta", 1.0))
+        huber_delta = float(params.get("_huber_delta", 1.0))
         data_loss = F.huber_loss(
             scaled_resid, 
             torch.zeros_like(scaled_resid), 

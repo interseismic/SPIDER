@@ -616,12 +616,13 @@ def _require_float_list(v: Any, path: str, *, length: int) -> List[float]:
 
 def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Block 3 (hard-break schema): strict nested `model.likelihood` + `model.filters` + `inference.batching`.
+    Block 3 (hard-break schema): strict nested `model.likelihoods` + `model.filters` + `inference.batching`.
 
-    Likelihood:
-      model.likelihood.type (str)
-      model.likelihood.phase_unc ([float,float])
-      model.likelihood.learn_noise_scale (bool)
+    Likelihoods:
+      model.likelihoods.locate_map.type (str)
+      model.likelihoods.locate_map.phase_unc ([float,float])
+      model.likelihoods.sample.type (str; correlated_gaussian)
+      model.likelihoods.sample.phase_unc ([float,float])
 
     Filters:
       model.filters.dtimes.{remove_duplicates,max_abs_input_dt,dtime_thin_frac,flip_dt_sign,cc_min}
@@ -642,7 +643,7 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
 
     # Hard break: these blocks moved under `model.*` / `inference.*`.
     if "likelihood" in params:
-        raise _err("likelihood", "moved; put this under `model.likelihood` (top-level `likelihood` is no longer supported)")
+        raise _err("likelihood", "moved; put this under `model.likelihoods` (top-level `likelihood` is no longer supported)")
     if "filters" in params:
         raise _err("filters", "moved; put this under `model.filters` (top-level `filters` is no longer supported)")
     if "batching" in params:
@@ -651,8 +652,113 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     model = _require_dict(_require(params, "model", "model"), "model")
     inf = _require_dict(_require(params, "inference", "inference"), "inference")
 
-    # ---- likelihood ----
-    lk = _require_dict(_require(model, "likelihood", "model"), "model.likelihood")
+    # ---- likelihoods ----
+    if "likelihood" in model:
+        raise _err("model.likelihood", "removed; use `model.likelihoods.locate_map` and `model.likelihoods.sample`")
+    lk_groups = _require_dict(_require(model, "likelihoods", "model"), "model.likelihoods")
+    lk_locate = _require_dict(_require(lk_groups, "locate_map", "model.likelihoods"), "model.likelihoods.locate_map")
+    lk_sample = _require_dict(_require(lk_groups, "sample", "model.likelihoods"), "model.likelihoods.sample")
+    # Validate locate_map (IID only).
+    lk_locate_type = _require_str(_require(lk_locate, "type", "model.likelihoods.locate_map"), "model.likelihoods.locate_map.type").lower().strip()
+    if lk_locate_type in {"student-t", "studentt"}:
+        lk_locate_type = "student_t"
+    if lk_locate_type in {"correlated", "correlated_gaussian"}:
+        raise _err("model.likelihoods.locate_map.type", "must be an IID likelihood (use `sample` for correlated)")
+    if lk_locate_type not in {"huber", "l2", "gaussian", "laplace", "l1", "mae", "mse", "student_t"}:
+        raise _err(
+            "model.likelihoods.locate_map.type",
+            "supported: 'huber', 'l2'/'gaussian' (aliases: 'mse'), 'laplace' (aliases: 'l1','mae'), 'student_t'",
+        )
+    locate_phase_unc = _require_float_list(
+        _require(lk_locate, "phase_unc", "model.likelihoods.locate_map"),
+        "model.likelihoods.locate_map.phase_unc",
+        length=2,
+    )
+    if "learn_noise_scale" in lk_locate:
+        raise _err("model.likelihoods.locate_map.learn_noise_scale", "removed; use fixed `phase_unc` only")
+    if "shared_event_re" in lk_locate:
+        raise _err("model.likelihoods.locate_map.shared_event_re", "not supported; use `sample` for correlated likelihoods")
+    if "student_t_scale" in lk_locate:
+        raise _err("model.likelihoods.locate_map.student_t_scale", "removed; delete this block from your config")
+    if "tempering" in lk_locate:
+        raise _err("model.likelihoods.locate_map.tempering", "removed; delete this block from your config")
+    if "sigma_inflation" in lk_locate:
+        raise _err("model.likelihoods.locate_map.sigma_inflation", "removed; delete this block from your config")
+    if "residual_correlation" in lk_locate:
+        raise _err("model.likelihoods.locate_map.residual_correlation", "removed; structured residual correlation models are no longer supported")
+    if "shared_event_latent" in lk_locate:
+        raise _err("model.likelihoods.locate_map.shared_event_latent", "removed; delete this block from your config")
+    if "latent_field" in lk_locate:
+        raise _err("model.likelihoods.locate_map.latent_field", "removed; delete this block from your config")
+    if "corr_error" in lk_locate:
+        raise _err("model.likelihoods.locate_map.corr_error", "removed; delete this block from your config")
+    if "slowness_re" in lk_locate:
+        raise _err("model.likelihoods.locate_map.slowness_re", "removed; delete this block from your config")
+    if "dd_graph_re" in lk_locate:
+        raise _err("model.likelihoods.locate_map.dd_graph_re", "removed; delete this block from your config")
+    locate_sigma_dist_enable = False
+    locate_sigma_dist_slope_ps = [0.0, 0.0]
+    locate_sigma_dist_min_ps = [0.0, 0.0]
+    locate_sigma_dist_max_km = None
+    locate_sigma_dist_cfg = lk_locate.get("sigma_distance_linear", None)
+    if isinstance(locate_sigma_dist_cfg, dict):
+        if "enabled" in locate_sigma_dist_cfg and locate_sigma_dist_cfg.get("enabled", None) is not None:
+            locate_sigma_dist_enable = bool(_require_bool(locate_sigma_dist_cfg.get("enabled"), "model.likelihoods.locate_map.sigma_distance_linear.enabled"))
+        if "slope_s_per_km" in locate_sigma_dist_cfg and locate_sigma_dist_cfg.get("slope_s_per_km", None) is not None:
+            locate_sigma_dist_slope_ps = _require_float_list(
+                locate_sigma_dist_cfg.get("slope_s_per_km"),
+                "model.likelihoods.locate_map.sigma_distance_linear.slope_s_per_km",
+                length=2,
+            )
+        if "min_sigma_s" in locate_sigma_dist_cfg and locate_sigma_dist_cfg.get("min_sigma_s", None) is not None:
+            locate_sigma_dist_min_ps = _require_float_list(
+                locate_sigma_dist_cfg.get("min_sigma_s"),
+                "model.likelihoods.locate_map.sigma_distance_linear.min_sigma_s",
+                length=2,
+            )
+        if "max_dist_km" in locate_sigma_dist_cfg and locate_sigma_dist_cfg.get("max_dist_km", None) is not None:
+            locate_sigma_dist_max_km = float(_require_num(locate_sigma_dist_cfg.get("max_dist_km"), "model.likelihoods.locate_map.sigma_distance_linear.max_dist_km"))
+            if not (locate_sigma_dist_max_km >= 0.0):
+                raise _err("model.likelihoods.locate_map.sigma_distance_linear.max_dist_km", "must be >= 0")
+    if locate_sigma_dist_enable:
+        if not (locate_sigma_dist_slope_ps[0] >= 0.0 and locate_sigma_dist_slope_ps[1] >= 0.0):
+            raise _err("model.likelihoods.locate_map.sigma_distance_linear.slope_s_per_km", "must be >= 0")
+        if not (locate_sigma_dist_min_ps[0] >= 0.0 and locate_sigma_dist_min_ps[1] >= 0.0):
+            raise _err("model.likelihoods.locate_map.sigma_distance_linear.min_sigma_s", "must be >= 0")
+    locate_student_t_nu = 4.0
+    locate_student_t_cfg = lk_locate.get("student_t", None)
+    if locate_student_t_cfg is not None:
+        if not isinstance(locate_student_t_cfg, dict):
+            raise _err("model.likelihoods.locate_map.student_t", "expected object/dict or null")
+        if "nu" in locate_student_t_cfg and locate_student_t_cfg.get("nu", None) is not None:
+            locate_student_t_nu = float(_require_num(locate_student_t_cfg.get("nu"), "model.likelihoods.locate_map.student_t.nu"))
+            if (not math.isfinite(locate_student_t_nu)) or (not (locate_student_t_nu > 0.0)):
+                raise _err("model.likelihoods.locate_map.student_t.nu", "must be finite and > 0")
+    if lk_locate_type == "student_t":
+        if not isinstance(locate_student_t_cfg, dict):
+            raise _err("model.likelihoods.locate_map.student_t", "required when model.likelihoods.locate_map.type='student_t'")
+        if ("nu" not in locate_student_t_cfg) or (locate_student_t_cfg.get("nu", None) is None):
+            raise _err("model.likelihoods.locate_map.student_t.nu", "required when model.likelihoods.locate_map.type='student_t'")
+    locate_huber_delta = 1.0
+    if "huber_delta" in lk_locate and lk_locate.get("huber_delta", None) is not None:
+        locate_huber_delta = float(_require_num(lk_locate.get("huber_delta"), "model.likelihoods.locate_map.huber_delta"))
+        if not (locate_huber_delta > 0.0):
+            raise _err("model.likelihoods.locate_map.huber_delta", "must be > 0")
+    locate_group = {
+        "likelihood": lk_locate_type,
+        "phase_unc": locate_phase_unc,
+        "_sigma_distance_enable": bool(locate_sigma_dist_enable),
+        "_sigma_distance_slope_ps": [float(locate_sigma_dist_slope_ps[0]), float(locate_sigma_dist_slope_ps[1])],
+        "_sigma_distance_min_sigma_ps": [float(locate_sigma_dist_min_ps[0]), float(locate_sigma_dist_min_ps[1])],
+        "_sigma_distance_max_dist_km": (float(locate_sigma_dist_max_km) if locate_sigma_dist_max_km is not None else None),
+        "_student_t_nu": float(locate_student_t_nu),
+        "_huber_delta": float(locate_huber_delta),
+        "_shared_event_re_enabled": False,
+        "_shared_event_re_whitening_enabled": False,
+    }
+
+    # Validate sample likelihood (correlated Gaussian).
+    lk = lk_sample
     lk_type = _require_str(_require(lk, "type", "model.likelihood"), "model.likelihood.type").lower().strip()
     # Accept common aliases; `compute_likelihood_loss` handles the mapping.
     if lk_type in {"student-t", "studentt"}:
@@ -662,6 +768,8 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     if lk_type in {"correlated", "correlated_gaussian"}:
         lk_correlated = True
         lk_type = "gaussian"
+    if not lk_correlated:
+        raise _err("model.likelihoods.sample.type", "must be 'correlated_gaussian'")
     if lk_type not in {"huber", "l2", "gaussian", "laplace", "l1", "mae", "mse", "student_t"}:
         raise _err(
             "model.likelihood.type",
@@ -726,6 +834,12 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             raise _err("model.likelihood.student_t", "required when model.likelihood.type='student_t'")
         if ("nu" not in student_t_cfg) or (student_t_cfg.get("nu", None) is None):
             raise _err("model.likelihood.student_t.nu", "required when model.likelihood.type='student_t'")
+
+    huber_delta = 1.0
+    if "huber_delta" in lk and lk.get("huber_delta", None) is not None:
+        huber_delta = float(_require_num(lk.get("huber_delta"), "model.likelihood.huber_delta"))
+        if not (huber_delta > 0.0):
+            raise _err("model.likelihood.huber_delta", "must be > 0")
 
     if "student_t_scale" in lk:
         raise _err("model.likelihood.student_t_scale", "removed; delete this block from your config")
@@ -1303,6 +1417,7 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["_sigma_distance_min_sigma_ps"] = [float(sigma_dist_min_ps[0]), float(sigma_dist_min_ps[1])]
     params["_sigma_distance_max_dist_km"] = (float(sigma_dist_max_km) if sigma_dist_max_km is not None else None)
     params["_student_t_nu"] = float(student_t_nu)
+    params["_huber_delta"] = float(huber_delta)
     # Filters (materialize legacy flat keys used by data.py)
     params["remove_duplicates"] = bool(remove_duplicates)
     params["max_abs_input_dt"] = float(max_abs_input_dt)
@@ -1376,6 +1491,24 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["_shared_event_re_diag_seed"] = int(se_diag_seed)
     params["_shared_event_re_station_phase_enabled"] = bool(se_sp_enabled)
     params["_shared_event_re_station_phase_tau_s"] = [float(se_sp_tau_ps[0]), float(se_sp_tau_ps[1])]
+
+    # ---- likelihood groups (locate_map vs sample) ----
+    sample_group: Dict[str, Any] = {}
+    likelihood_explicit_keys = {"likelihood", "phase_unc", "_student_t_nu", "_huber_delta"}
+    for k, v in params.items():
+        if k in likelihood_explicit_keys or k.startswith("_sigma_distance_") or k.startswith("_shared_event_re_"):
+            sample_group[k] = v
+    params["_likelihood_groups"] = {
+        "locate_map": locate_group,
+        "sample": sample_group,
+    }
+    params["_likelihood_groups_raw"] = {
+        "locate_map": lk_locate,
+        "sample": lk_sample,
+    }
+    params["_likelihood_group_active"] = "sample"
+    # Keep a runtime view of the active likelihood for legacy access patterns.
+    params.setdefault("model", {})["likelihood"] = lk_sample
 
     # Slowness random effects (scalar separation mode)
     # Optional linearization error diagnostic/filter (after Phase 1)

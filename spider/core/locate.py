@@ -84,6 +84,23 @@ def _ddp_is_main(params: dict) -> bool:
         return True
 
 
+def _apply_likelihood_group(state: "LocateState", group_key: str) -> None:
+    groups = state.params.get("_likelihood_groups", {})
+    if not isinstance(groups, dict):
+        return
+    group = groups.get(group_key, None)
+    if not isinstance(group, dict):
+        return
+    for k, v in group.items():
+        state.params[k] = v
+    raw_groups = state.params.get("_likelihood_groups_raw", {})
+    if isinstance(raw_groups, dict):
+        raw = raw_groups.get(group_key, None)
+        if isinstance(raw, dict):
+            state.params.setdefault("model", {})["likelihood"] = raw
+    state.params["_likelihood_group_active"] = str(group_key)
+
+
 def _lr_for_phase(params: dict, phase: str) -> float:
     phase_key = str(phase).strip().lower()
     lr_vec = params.get("_sampler_lr_per_phase", None)
@@ -606,6 +623,7 @@ def _format_epoch_line(*, phase: str, step: int, total: int, metrics: Dict[str, 
 
 def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=None) -> None:
     """Noise-free MAP warmup using Adam on ΔX_src."""
+    _apply_likelihood_group(state, "locate_map")
     ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
     if ddp_main:
         _log(f"Phase 1: MAP (optimizer=adam) | {_format_sampler_status(state.optimizer)}")
@@ -1237,6 +1255,7 @@ def _resume_or_initialize(state: LocateState):
 def _phase2_preconditioner(
     state: LocateState, start_epoch: int = 0, skip_saving_first_epoch: bool = False, wandb_logger=None
 ) -> None:
+    _apply_likelihood_group(state, "sample")
     assert state.sampler is not None
     sampler = state.sampler
     sampler_backend = str(state.params["sampler_backend"]).strip().lower()
@@ -1516,6 +1535,7 @@ def _phase2_preconditioner(
 def _phase3_noise_ramp(
     state: LocateState, start_epoch: int = 0, skip_saving_first_epoch: bool = False, wandb_logger=None
 ) -> None:
+    _apply_likelihood_group(state, "sample")
     assert state.sampler is not None
     sampler = state.sampler
     ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
@@ -1714,6 +1734,7 @@ def _phase3_noise_ramp(
 def _phase4_sampling(
     state: LocateState, start_epoch: int, skip_saving_first_epoch: bool, wandb_logger=None
 ) -> None:
+    _apply_likelihood_group(state, "sample")
     assert state.sampler is not None
     sampler = state.sampler
     ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)

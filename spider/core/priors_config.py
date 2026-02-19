@@ -174,8 +174,13 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
     if "schedule" in ev:
         raise _err("priors.event.schedule", "removed; priors are active in all phases when enabled (delete this block)")
 
-    ev_hyper = _require_dict(_require(ev, "hyper", "priors.event"), "priors.event.hyper")
-    ev_hyper_enabled = _require_bool(_require(ev_hyper, "enabled", "priors.event.hyper"), "priors.event.hyper.enabled")
+    ev_hyper_cfg = ev.get("hyper", None)
+    if ev_hyper_cfg is None:
+        ev_hyper_enabled = False
+        ev_hyper = None
+    else:
+        ev_hyper = _require_dict(ev_hyper_cfg, "priors.event.hyper")
+        ev_hyper_enabled = _require_bool(_require(ev_hyper, "enabled", "priors.event.hyper"), "priors.event.hyper.enabled")
     if ev_hyper_enabled:
         ev_hyper_type = _require_str(_require(ev_hyper, "type", "priors.event.hyper"), "priors.event.hyper.type").lower()
         if ev_hyper_type not in {"wishart_precision"}:
