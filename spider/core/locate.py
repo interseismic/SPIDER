@@ -2032,6 +2032,9 @@ def _phase4_sampling(
 
     # Final flush + checkpoint (rank0 only under torchrun)
     if ddp_main:
+        last_epoch = int(n_epochs) - 1
+        if last_epoch < 0:
+            last_epoch = 0
         if bool(state.params.get("write_samples", True)):
             state.sample_count = save_samples_periodic(
                 state.params,
@@ -2045,7 +2048,6 @@ def _phase4_sampling(
                 epoch=int(last_epoch),
                 phase="phase4",
             )
-        last_epoch = int(n_epochs) - 1
         save_checkpoint(
             state.params,
             sampler,
