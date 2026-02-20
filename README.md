@@ -43,10 +43,10 @@ Use the lightweight example in `./example`:
 
 ```bash
 # Phase 1 (MAP)
-python -m spider locate-map example/SPIDER_example.json --device 0
+spider locate-map example/SPIDER_example.json --device 0
 
 # Phase 2–4 (sampling)
-python -m spider sample example/SPIDER_example.json --device 0
+spider sample example/SPIDER_example.json --device 0
 ```
 
 Outputs are written to the paths defined in `example/SPIDER_example.json`.
@@ -54,7 +54,7 @@ Outputs are written to the paths defined in `example/SPIDER_example.json`.
 Multi‑GPU independent chains:
 
 ```bash
-python -m spider sample-multi example/SPIDER_example.json --devices 0,1,2,3
+spider sample-multi example/SPIDER_example.json --devices 0,1,2,3
 ```
 
 ## EikoNet training
@@ -216,26 +216,26 @@ These are commonly used in real configs but not exhaustively listed above:
 
 ## CLI workflow
 
-The CLI entrypoint is `python -m spider`:
+The CLI entrypoint is `spider`:
 
 ```bash
-python -m spider --help
+spider --help
 ```
 
 Core commands:
 
 ```bash
 # Phase 1 (MAP) -> writes <checkpoint_dir>/phase2_bundle.pth
-python -m spider locate-map my_params.json --device 0
+spider locate-map my_params.json --device 0
 
 # Phase 2–4 (sampling) from the Phase‑2 bundle
-python -m spider sample my_params.json --device 0
+spider sample my_params.json --device 0
 
 # Full pipeline (Phase 1–4)
-python -m spider locate-full my_params.json --device 0
+spider locate-full my_params.json --device 0
 
 # Multi‑GPU independent chains
-python -m spider sample-multi my_params.json --devices 0,1,2,3
+spider sample-multi my_params.json --devices 0,1,2,3
 ```
 
 ## Likelihoods and correlated residuals
