@@ -17,7 +17,7 @@
         "run_name": null
     },
     "model": {
-        "model_file": "PATH/TO/eikonet_state_dict.pt",
+        "model_file": "PATH/TO/eikonet_model.pt",
         "domain": {
             "lon_min": -120.0,
             "lat_min": 35.0,

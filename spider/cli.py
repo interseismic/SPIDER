@@ -14,7 +14,7 @@ from pyproj import Proj
 
 from spider.core import prepare_input_dfs
 from spider.core.locate import locate_all, locate_map, locate_sample_from_bundle
-from spider.core.model import load_eikonet_state_dict
+from spider.core.eikonet_loader import load_eikonet_model
 from spider.core.modeling import compute_travel_times
 from spider.io.synth import synth_initial_catalog_from_truth
 from spider.io.phase_bundle import load_phase2_bundle
@@ -167,17 +167,7 @@ def _load_model(params: dict, device: int | str) -> torch.nn.Module:
 	"""
 	Load and place the neural network model as configured by 'model_file'.
 	"""
-	model_file = params["model_file"]
-	scale = float(params.get("scale", 1.0))
-	n_hidden = int(params.get("n_hidden", 128))
-	n_blocks = int(params.get("n_blocks", 5))
-	return load_eikonet_state_dict(
-		model_file,
-		device=device,
-		default_scale=scale,
-		default_n_hidden=n_hidden,
-		default_n_blocks=n_blocks,
-	)
+	return load_eikonet_model(params=params, device=device)
 
 
 def _remap_cuda_device_ids_for_visible_devices(device_ids: list[int]) -> list[int]:

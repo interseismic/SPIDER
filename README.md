@@ -1,6 +1,6 @@
 # SPIDER: Scalable Probabilistic Inference for Differential Earthquake Relocation
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.8+-red.svg)](https://pytorch.org/)
 
 SPIDER is a Python toolkit for probabilistic earthquake relocation using differential travel times, neural travel‑time prediction, and scalable MCMC sampling. It combines a fast surrogate travel‑time model (EikoNet) with a multi‑phase inference pipeline to estimate event locations with uncertainty.
@@ -28,6 +28,7 @@ This is a brand new codebase. Please be patient with us as we work to making thi
 ## Installation
 
 ```bash
+pip install -e /path/to/eikonet
 pip install -e .
 ```
 
@@ -59,32 +60,30 @@ spider sample-multi example/SPIDER_example.json --devices 0,1,2,3
 
 ## EikoNet training
 
-SPIDER expects a trained EikoNet travel‑time model (`model.model_file`). Train it once for your velocity model and spatial domain.
+SPIDER expects a trained EikoNet travel‑time model (`model.model_file`) created with the external `eikonet` package. SPIDER no longer trains or loads an in-repo legacy EikoNet implementation.
 
 Example `eikonet.json`:
 
 ```json
 {
   "velmod_file": "/path/to/velmod.csv",
-  "lon_min": -117.5,
-  "lat_min": 33.0,
+  "x_max": 400.0,
+  "y_max": 400.0,
   "z_min": -5.0,
   "z_max": 80.0,
-  "scale": 400.0,
-  "model_file": "/path/to/model_state_dict.pt",
-  "train_batch_size": 512,
-  "val_batch_size": 10000,
-  "n_train": 1000000,
-  "n_test": 2000000,
-  "n_epochs": 1000,
+  "model_file": "/path/to/eikonet_model.pt",
+  "batch_size": 512,
+  "n_train": 100000,
+  "n_test": 100000,
+  "n_epochs": 100,
   "lr": 1e-3
 }
 ```
 
-Train (script in repo root):
+Train with the package CLI:
 
 ```bash
-python eikonet_train_1D.py eikonet.json
+eikonet-train --config eikonet.json
 ```
 
 Velocity model CSV format:
@@ -141,8 +140,9 @@ Paths and output settings:
 
 ### `model`
 
-- `model_file`: EikoNet checkpoint
+- `model_file`: EikoNet checkpoint produced by `eikonet`
 - `domain`: `lon_min`, `lat_min`, `z_min`, `z_max`, `scale`
+- Optional `eikonet` sub-block (advanced): override loader params like `x_max`, `y_max`, `model_kind`, `n_hidden`, `n_blocks`
 - `priors`: event and centroid priors
 - `likelihoods`: phase‑specific residual models (locate_map vs sample)
 - `filters`: dtimes/events/residual filters
