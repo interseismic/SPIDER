@@ -870,7 +870,7 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
 
     se_cfg = lk.get("shared_event_re", None)
     se_enabled = False
-    se_grouping = "phase"  # 'phase' or 'station_phase'
+    se_grouping = "station_phase"  # only supported value
     se_cluster_mode = "none"  # 'none' or 'dd_khop' or 'component'
     se_cluster_k = 1
     se_tau_ps = [0.0, 0.0]  # std in seconds for [P,S]; 0 disables (iid)
@@ -897,7 +897,7 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     se_gpu_max_edges_per_batch = 0
     se_gpu_reuse_pcg_init = False
     # Optional: whitening operator for shared_event_re (static covariance).
-    se_whiten_enabled = False
+    se_whiten_enabled = True
     se_whiten_edge_weighting = "uniform"
     se_whiten_edge_weight_ell_km = 1.0
     se_whiten_edge_weight_eps_km = 1e-3
@@ -912,7 +912,9 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     se_whiten_pcg_min_iters = 0
     se_whiten_precompute = False
     se_whiten_precompute_device = "gpu"
-    se_whiten_pcg_batched = False
+    se_whiten_pcg_batched = True
+    se_whiten_pcg_warm_start = False
+    se_whitening_only_mode = True
     se_whiten_pcg_bucket_nodes = [512, 1024, 2048, 4096, 8192, 16384, 32768]
     # Optional: auto-tune caps if fallbacks occur
     se_auto_tune_nodes_cap = False
@@ -940,11 +942,16 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(se_cfg, dict):
         se_enabled = bool(se_cfg.get("enabled", False))
         if "grouping" in se_cfg and se_cfg["grouping"] is not None:
-            se_grouping = str(se_cfg.get("grouping", "phase")).strip().lower()
+            se_grouping = str(se_cfg.get("grouping", "station_phase")).strip().lower()
         if se_grouping in {"stationphase", "station-phase"}:
             se_grouping = "station_phase"
-        if se_grouping not in {"phase", "station_phase"}:
-            raise _err("model.likelihood.shared_event_re.grouping", "supported: 'phase', 'station_phase'")
+        if se_grouping == "phase":
+            raise _err(
+                "model.likelihood.shared_event_re.grouping",
+                "'phase' was removed; use 'station_phase'",
+            )
+        if se_grouping != "station_phase":
+            raise _err("model.likelihood.shared_event_re.grouping", "supported: 'station_phase'")
         if "cluster_mode" in se_cfg and se_cfg["cluster_mode"] is not None:
             se_cluster_mode = str(se_cfg.get("cluster_mode", se_cluster_mode)).strip().lower()
         if se_cluster_mode in {"dd_khop", "dd-khop", "khop"}:
@@ -1100,6 +1107,10 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             )
             if se_stats_log_every_epochs < 0:
                 raise _err("model.likelihood.shared_event_re.stats_log_every_epochs", "must be >= 0")
+        if "whitening_only_mode" in se_cfg and se_cfg["whitening_only_mode"] is not None:
+            se_whitening_only_mode = bool(
+                _require_bool(se_cfg.get("whitening_only_mode"), "model.likelihood.shared_event_re.whitening_only_mode")
+            )
         whiten_cfg = se_cfg.get("whitening", None)
         if isinstance(whiten_cfg, dict):
             if "enabled" in whiten_cfg and whiten_cfg.get("enabled", None) is not None:
@@ -1190,6 +1201,10 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
                 se_whiten_pcg_batched = bool(
                     _require_bool(whiten_cfg.get("pcg_batched"), "model.likelihood.shared_event_re.whitening.pcg_batched")
                 )
+            if "pcg_warm_start" in whiten_cfg and whiten_cfg.get("pcg_warm_start", None) is not None:
+                se_whiten_pcg_warm_start = bool(
+                    _require_bool(whiten_cfg.get("pcg_warm_start"), "model.likelihood.shared_event_re.whitening.pcg_warm_start")
+                )
             if "pcg_bucket_nodes" in whiten_cfg and whiten_cfg.get("pcg_bucket_nodes", None) is not None:
                 v = whiten_cfg.get("pcg_bucket_nodes")
                 if not isinstance(v, (list, tuple)) or not v:
@@ -1200,6 +1215,11 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
                     raise _err("model.likelihood.shared_event_re.whitening.pcg_bucket_nodes", "must be a list of ints")
                 if any(x <= 0 for x in se_whiten_pcg_bucket_nodes):
                     raise _err("model.likelihood.shared_event_re.whitening.pcg_bucket_nodes", "all values must be > 0")
+        if bool(se_whitening_only_mode) and (not bool(se_whiten_enabled)):
+            raise _err(
+                "model.likelihood.shared_event_re.whitening.enabled",
+                "must be true when model.likelihood.shared_event_re.whitening_only_mode=true",
+            )
         if "auto_tune_nodes_cap" in se_cfg and se_cfg["auto_tune_nodes_cap"] is not None:
             se_auto_tune_nodes_cap = bool(_require_bool(se_cfg.get("auto_tune_nodes_cap"), "model.likelihood.shared_event_re.auto_tune_nodes_cap"))
         if "auto_tune_nodes_max" in se_cfg and se_cfg["auto_tune_nodes_max"] is not None:
@@ -1474,6 +1494,8 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["_shared_event_re_whitening_precompute"] = bool(se_whiten_precompute)
     params["_shared_event_re_whitening_precompute_device"] = str(se_whiten_precompute_device)
     params["_shared_event_re_whitening_pcg_batched"] = bool(se_whiten_pcg_batched)
+    params["_shared_event_re_whitening_pcg_warm_start"] = bool(se_whiten_pcg_warm_start)
+    params["_shared_event_re_whitening_only_mode"] = bool(se_whitening_only_mode)
     params["_shared_event_re_whitening_pcg_bucket_nodes"] = list(se_whiten_pcg_bucket_nodes)
     params["_shared_event_re_stats_log_every_epochs"] = int(se_stats_log_every_epochs)
     params["_shared_event_re_auto_tune_nodes_cap"] = bool(se_auto_tune_nodes_cap)

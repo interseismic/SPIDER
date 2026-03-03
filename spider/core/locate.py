@@ -4182,9 +4182,8 @@ def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
             return
         if not bool(state.params.get("_shared_event_re_whitening_precompute", False)):
             return
-        if bool(state.params.get("event_batch_enable", False)):
-            return
-        if bool(state.params.get("batch_shuffle", True)):
+        event_batches = bool(state.params.get("event_batch_enable", False))
+        if (not event_batches) and bool(state.params.get("batch_shuffle", True)):
             return
     except Exception:
         return
@@ -4198,16 +4197,20 @@ def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
 
     batch_size = int(getattr(state, "batch_size_sgld", 0) or state.params.get("batch_size_sgld", 0) or 0)
     N = int(state.N)
-    if batch_size <= 0 or N <= 0:
+    if N <= 0:
         return
 
     cache = state.params.get("_shared_event_re_whitening_cache", None)
     if not isinstance(cache, dict):
         cache = {}
 
-    grouping = str(state.params.get("_shared_event_re_grouping", "phase")).strip().lower()
+    grouping = str(state.params.get("_shared_event_re_grouping", "station_phase")).strip().lower()
     if grouping in {"stationphase", "station-phase"}:
         grouping = "station_phase"
+    if grouping != "station_phase":
+        return
+    if not isinstance(state.row_station_index, torch.Tensor):
+        return
 
     tau_ps = state.params.get("_shared_event_re_tau_s", [0.0, 0.0])
     tau_p = float(tau_ps[0]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
@@ -4236,24 +4239,96 @@ def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
     σp = σp.to(device=state.device)
     σs = σs.to(device=state.device)
 
-    n_batches = int(math.ceil(float(N) / float(batch_size)))
-    for b in range(n_batches):
-        i_start = b * batch_size
-        i_end = min(i_start + batch_size, N)
-        idx_b = state.II[i_start:i_end].to(device=state.device, dtype=torch.int64)
-        YY_b = state.YY[i_start:i_end].to(device=state.device)
+    batch_specs: list[tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    if bool(event_batches):
+        try:
+            from spider.core.batching import _ensure_owner_buckets
+
+            seed0 = int(state.params.get("runtime_seed", 0))
+            epoch_seed = int(seed0 + int(state.params.get("_runtime_epoch_index", 0)))
+            max_edges = int(state.params.get("event_batch_max_edges_sgld", state.params.get("event_batch_max_edges", 0)))
+            events_per_batch = int(state.params.get("event_batch_size", 256))
+            reorder_all = bool(state.params.get("event_bucket_reorder_all", False))
+            reuse_epochs = int(state.params.get("event_bucket_reuse_epochs", 1))
+            _ensure_owner_buckets(
+                state,
+                epoch_index=epoch_seed,
+                events_per_batch=events_per_batch,
+                max_edges_per_batch=max_edges,
+                reorder_all=reorder_all,
+                reuse_epochs=reuse_epochs,
+            )
+            if state._bucket_offsets is None or state._bucket_II is None or state._bucket_YY is None:
+                return
+            if not isinstance(getattr(state, "_bucket_station_index", None), torch.Tensor):
+                return
+            nb = int(state._bucket_offsets.numel() - 1)
+            for b in range(nb):
+                i_start = int(state._bucket_offsets[b].item())
+                i_end = int(state._bucket_offsets[b + 1].item())
+                if i_end <= i_start:
+                    continue
+                idx_b = state._bucket_II[i_start:i_end].to(device=state.device, dtype=torch.int64)
+                YY_b = state._bucket_YY[i_start:i_end].to(device=state.device)
+                sta_b = state._bucket_station_index[i_start:i_end].to(device=state.device, dtype=torch.int64)
+                batch_specs.append(
+                    (
+                        {
+                            "mode": "event_bucket",
+                            "batch_id": -1,
+                            "batch_i0": -1,
+                            "batch_i1": -1,
+                            "bucket_id": int(b),
+                            "bucket_gen": int(getattr(state, "_bucket_last_epoch", -1) or -1),
+                            "is_shuffled": False,
+                            "epoch_index": int(state.params.get("_runtime_epoch_index", -1)),
+                            "batch_seq": int(b),
+                        },
+                        idx_b,
+                        YY_b,
+                        sta_b,
+                    )
+                )
+        except Exception:
+            return
+    else:
+        if batch_size <= 0:
+            return
+        n_batches = int(math.ceil(float(N) / float(batch_size)))
+        for b in range(n_batches):
+            i_start = b * batch_size
+            i_end = min(i_start + batch_size, N)
+            idx_b = state.II[i_start:i_end].to(device=state.device, dtype=torch.int64)
+            YY_b = state.YY[i_start:i_end].to(device=state.device)
+            sta_b = state.row_station_index[i_start:i_end].to(device=state.device, dtype=torch.int64)
+            batch_specs.append(
+                (
+                    {
+                        "mode": "standard",
+                        "batch_id": int(b),
+                        "batch_i0": int(i_start),
+                        "batch_i1": int(i_end),
+                        "bucket_id": -1,
+                        "bucket_gen": -1,
+                        "is_shuffled": False,
+                        "epoch_index": int(state.params.get("_runtime_epoch_index", -1)),
+                        "batch_seq": int(b),
+                    },
+                    idx_b,
+                    YY_b,
+                    sta_b,
+                )
+            )
+
+    for b, (batch_context, idx_b, YY_b, sta_b) in enumerate(batch_specs):
         ph_id = torch.where(
             YY_b[:, 4] < 0.5,
             torch.zeros_like(YY_b[:, 4], dtype=torch.int64),
             torch.ones_like(YY_b[:, 4], dtype=torch.int64),
         )
-        if grouping == "station_phase" and isinstance(state.row_station_index, torch.Tensor):
-            sta_b = state.row_station_index[i_start:i_end].to(device=state.device, dtype=torch.int64)
-            keys = (sta_b * 2) + ph_id
-        else:
-            keys = ph_id
+        keys = (sta_b * 2) + ph_id
 
-        cache_key_extra = ("batch", int(b))
+        cache_key_extra = None
         cache_key = _make_cache_key(
             edge_weighting=edge_weighting,
             edge_weight_ell_km=edge_weight_ell_km,
@@ -4267,7 +4342,7 @@ def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
             max_rows_per_group=int(max_rows_per_group),
             max_nodes_per_group=int(max_nodes_per_group),
             solver=str(solver),
-            idx_rows=int(idx_b.shape[0]),
+            batch_context=batch_context,
             cache_key_extra=cache_key_extra,
         )
         if cache_key in cache:
@@ -4294,6 +4369,12 @@ def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
             X_event=X_event,
         )
         cache[cache_key] = cache_entry
+        try:
+            cache_max = int(state.params.get("_shared_event_re_whitening_cache_max_entries", 0) or 0)
+            if cache_max > 0 and len(cache) > cache_max:
+                cache.pop(next(iter(cache)))
+        except Exception:
+            pass
 
     state.params["_shared_event_re_whitening_cache"] = cache
 

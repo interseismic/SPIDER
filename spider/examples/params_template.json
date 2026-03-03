@@ -96,15 +96,41 @@
                 ]
             },
             "sample": {
-                "type": "gaussian",
-                "huber_delta": 1.0,
-                "student_t": {
-                    "nu": 4.0
-                },
+                "type": "correlated_gaussian",
                 "phase_unc": [
                     0.03,
                     0.03
-                ]
+                ],
+                "shared_event_re": {
+                    "enabled": true,
+                    "whitening_only_mode": true,
+                    "grouping": "station_phase",
+                    "tau_s": [
+                        0.03,
+                        0.04
+                    ],
+                    "max_nodes_per_group": 25000,
+                    "max_rows_per_group": 1500000,
+                    "solver": "pcg_sparse",
+                    "pcg_max_iters": 20,
+                    "pcg_tol": 0.005,
+                    "whitening": {
+                        "enabled": true,
+                        "solver": "pcg",
+                        "pcg_batched": true,
+                        "pcg_warm_start": true,
+                        "pcg_bucket_nodes": [
+                            4096,
+                            16384,
+                            25000
+                        ],
+                        "pcg_max_iters": 100,
+                        "pcg_tol": 0.0003,
+                        "pcg_min_iters": 2,
+                        "precompute": true,
+                        "precompute_device": "gpu"
+                    }
+                }
             }
         }
     },
@@ -114,24 +140,20 @@
                 0
             ]
         },
-        "phases": {
-            "phase1": {
-                "epochs": 200,
-                "lr": 0.001
-            },
-            "phase2": {
-                "epochs": 0
-            },
-            "phase3": {
-                "epochs": 10
-            },
-            "phase4": {
-                "epochs": 10000
-            }
-        },
         "sampler": {
             "backend": "sghmc",
-            "lr": 1e-05,
+            "epochs_per_phase": [
+                200,
+                0,
+                10,
+                10000
+            ],
+            "lr": [
+                0.001,
+                1e-05,
+                1e-05,
+                1e-05
+            ],
             "dt_lr_mult": 1.0,
             "temperature": 1.0,
             "noise_scale_mult": 1.0,

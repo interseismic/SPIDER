@@ -246,6 +246,102 @@ def filter_min_event_degree(params, dtimes, origins):
     return origins, dtimes
 
 
+def filter_min_events_per_cluster(params, dtimes, origins):
+    """
+    Filter to keep only events in connected components with at least N events.
+
+    Applied to the event graph induced by unique (evid1, evid2) pairs.
+    """
+    n_min = int(params.get("min_events_per_cluster", 0))
+    if n_min <= 1:
+        return origins, dtimes
+
+    info(f"Filtering components min_events_per_cluster={n_min}", section="FILTER")
+
+    # First ensure dtimes only contains events present in origins.
+    # This avoids orphan event ids and keeps component sizes consistent.
+    origin_events_s = origins.select(pl.col("evid")).unique()["evid"]
+    dt_in0 = int(dtimes.shape[0])
+    dtimes = dtimes.filter(
+        pl.col("evid1").is_in(origin_events_s) & pl.col("evid2").is_in(origin_events_s)
+    )
+    dt_out0 = int(dtimes.shape[0])
+    if dt_out0 < dt_in0:
+        info(
+            f"Component-size prefilter removed orphan-event rows: kept {dt_out0}/{dt_in0} dtimes.",
+            section="FILTER",
+        )
+
+    pairs = dtimes.select(["evid1", "evid2"]).unique()
+    if pairs.shape[0] == 0:
+        # No edges left: no component can satisfy n_min > 1.
+        info("Component-size filter removed all events (no remaining edges).", section="FILTER")
+        return origins.head(0), dtimes.head(0)
+
+    e1 = pairs["evid1"].to_numpy()
+    e2 = pairs["evid2"].to_numpy()
+    events = np.unique(np.concatenate([e1, e2], axis=0))
+    n_events = int(events.shape[0])
+    if n_events == 0:
+        return origins.head(0), dtimes.head(0)
+
+    # Union-find over contiguous event ids
+    idx1 = np.searchsorted(events, e1)
+    idx2 = np.searchsorted(events, e2)
+    parent = np.arange(n_events, dtype=np.int64)
+    rank = np.zeros(n_events, dtype=np.int8)
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = int(parent[x])
+        return x
+
+    def _union(a: int, b: int) -> None:
+        ra = _find(a)
+        rb = _find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] = np.int8(rank[ra] + 1)
+
+    for a, b in zip(idx1, idx2):
+        _union(int(a), int(b))
+
+    roots = np.array([_find(i) for i in range(n_events)], dtype=np.int64)
+    comp_roots, comp_counts = np.unique(roots, return_counts=True)
+    keep_roots = comp_roots[comp_counts >= int(n_min)]
+
+    if keep_roots.size == 0:
+        info("Component-size filter removed all events.", section="FILTER")
+        return origins.head(0), dtimes.head(0)
+
+    keep_event_mask = np.isin(roots, keep_roots)
+    keep_events = events[keep_event_mask]
+    keep_events_s = pl.Series(name="evid_keep", values=keep_events)
+
+    origins_in = int(origins.shape[0])
+    dtimes_in = int(dtimes.shape[0])
+
+    origins = origins.filter(pl.col("evid").is_in(keep_events_s))
+    dtimes = dtimes.filter(
+        pl.col("evid1").is_in(keep_events_s) & pl.col("evid2").is_in(keep_events_s)
+    )
+
+    info(
+        f"Component-size filter events_in={origins_in} events_out={int(origins.shape[0])} "
+        f"dtimes_in={dtimes_in} dtimes_out={int(dtimes.shape[0])} "
+        f"components_kept={int(keep_roots.size)}/{int(comp_roots.size)}",
+        section="FILTER",
+    )
+    return origins, dtimes
+
+
 def filter_by_pair_station_ratio(
     params: dict,
     dtimes: pl.DataFrame,
@@ -654,6 +750,23 @@ def prepare_input_dfs(params, *, model=None, device=None):
     _min_degree = int(params.get("min_event_degree", 0))
     if _min_degree > 0:
         origins, dtimes = filter_min_event_degree(params, dtimes, origins)
+
+    # Filter by minimum events per connected component.
+    # Keep this at the very end of min_* filters.
+    _min_cluster = int(params.get("min_events_per_cluster", 0))
+    if _min_cluster > 1:
+        origins, dtimes = filter_min_events_per_cluster(params, dtimes, origins)
+
+    # Ensure one origin row per event id (duplicate evid rows create artificial
+    # singleton nodes in downstream graph analysis).
+    n_orig_before_dedup = int(origins.shape[0])
+    origins = origins.unique(subset=["evid"], keep="first")
+    n_orig_after_dedup = int(origins.shape[0])
+    if n_orig_after_dedup < n_orig_before_dedup:
+        info(
+            f"Deduplicated origins by evid: kept {n_orig_after_dedup}/{n_orig_before_dedup} rows.",
+            section="FILTER",
+        )
 
     # Update origins to include only events with differential times
     event_ids = np.concatenate([dtimes["evid1"].to_numpy(), dtimes["evid2"].to_numpy()])

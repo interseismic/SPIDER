@@ -285,6 +285,7 @@ Enable:
       "type": "correlated_gaussian",
       "shared_event_re": {
         "enabled": true,
+        "whitening_only_mode": true,
         "grouping": "station_phase",
         "tau_s": [0.03, 0.04],
         "max_nodes_per_group": 25000,
@@ -305,6 +306,7 @@ Enable:
           "enabled": true,
           "solver": "pcg",
           "pcg_batched": true,
+          "pcg_warm_start": true,
           "pcg_bucket_nodes": [4096, 16384, 25000],
           "pcg_max_iters": 100,
           "pcg_tol": 3e-4,
@@ -329,7 +331,8 @@ Key pieces:
 Shared‑event correlated residual parameters:
 
 - `shared_event_re.enabled`: turn on/off the correlated residual model (required for `type="correlated_gaussian"`).
-- `shared_event_re.grouping`: grouping strategy (`station_phase` is standard).
+- `shared_event_re.whitening_only_mode`: enforce whitening-only execution (default `true`).
+- `shared_event_re.grouping`: grouping strategy (`station_phase` is the only supported value).
 - `shared_event_re.tau_s`: per‑phase shared‑event scales `[P, S]`.
 - `shared_event_re.max_nodes_per_group`: cap group size to control memory/compute.
 - `shared_event_re.max_rows_per_group`: cap total residual rows per group.
@@ -348,6 +351,7 @@ Shared‑event correlated residual parameters:
 - `shared_event_re.whitening.enabled`: enable the whitening preconditioner.
 - `shared_event_re.whitening.solver`: whitening solver (`pcg`).
 - `shared_event_re.whitening.pcg_batched`: batch PCG whitening solves for speed.
+- `shared_event_re.whitening.pcg_warm_start`: reuse previous node solutions to reduce PCG iterations.
 - `shared_event_re.whitening.pcg_bucket_nodes`: bucket sizes for batched whitening.
 - `shared_event_re.whitening.pcg_max_iters`: PCG iteration cap for whitening.
 - `shared_event_re.whitening.pcg_tol`: PCG tolerance for whitening.

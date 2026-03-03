@@ -671,10 +671,6 @@ def compute_quad_gpu(
     if n_groups == 0 or perm.numel() == 0:
         return torch.tensor(0.0, device=idx.device, dtype=resid.dtype), metrics
 
-    if int(n_comp) <= 0 or int(n_sta) <= 0:
-        sigma_perm = sigma.index_select(0, perm).clamp_min(1e-12)
-        quad_sum = _CollapsedQuadNoGrad.apply(resid.index_select(0, perm), resid.index_select(0, perm) / sigma_perm.square().clamp_min(1e-24))
-        return quad_sum, metrics
     try:
         metrics.max_rows_all = int(lengths.max().item()) if lengths.numel() > 0 else 0
         metrics.max_nodes_all = int(n_nodes.max().item()) if n_nodes.numel() > 0 else 0

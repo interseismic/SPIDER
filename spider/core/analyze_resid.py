@@ -619,21 +619,19 @@ def estimate_shared_event_re_tau_logdet(
         sigma_source_used = "params"
 
     # Build grouping keys
-    grouping = str(state.params.get("_shared_event_re_grouping", "phase")).strip().lower()
+    grouping = str(state.params.get("_shared_event_re_grouping", "station_phase")).strip().lower()
     if grouping in {"stationphase", "station-phase"}:
         grouping = "station_phase"
+    if grouping != "station_phase":
+        warn("shared_event_re tau logdet: only station_phase grouping is supported.", section="DIAG")
+        return None
     ph_id = torch.where(is_s, torch.ones_like(r, dtype=torch.int64), torch.zeros_like(r, dtype=torch.int64))
-    if grouping == "station_phase":
-        sta_idx = getattr(state, "row_station_index", None)
-        if not isinstance(sta_idx, torch.Tensor):
-            warn("shared_event_re tau logdet: missing row_station_index; falling back to phase.", section="DIAG")
-            grouping = "phase"
-            keys = ph_id
-        else:
-            sta = sta_idx.index_select(0, rows_t)[finite]
-            keys = (sta.to(dtype=torch.int64) * 2) + ph_id
-    else:
-        keys = ph_id
+    sta_idx = getattr(state, "row_station_index", None)
+    if not isinstance(sta_idx, torch.Tensor):
+        warn("shared_event_re tau logdet: missing row_station_index.", section="DIAG")
+        return None
+    sta = sta_idx.index_select(0, rows_t)[finite]
+    keys = (sta.to(dtype=torch.int64) * 2) + ph_id
 
     # Whitening weights configuration
     edge_weighting = str(state.params.get("_shared_event_re_whitening_edge_weighting", "uniform")).strip().lower()

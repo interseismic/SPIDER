@@ -524,6 +524,7 @@ def _run_epoch(
     if use_event_batches:
         seed0 = int(state.params.get("runtime_seed", 0))
         epoch_seed = int(seed0 + epoch_index)
+        state.params["_runtime_batch_shuffle"] = True
         # Use sgld params by default, fallback to warmup if key missing (Phase 1 uses warmup key)
         # But to simplify, we can look at the phase. Phase 1 sets its own max_edges logic.
         # For unified logic, we'll try sgld key first, then warmup key.
@@ -620,6 +621,12 @@ def _run_epoch(
     except Exception:
         pass
 
+    # Per-epoch whitening instrumentation accumulators.
+    state.params["_shared_event_re_whitening_cache_hit_sum"] = 0
+    state.params["_shared_event_re_whitening_cache_miss_sum"] = 0
+    state.params["_shared_event_re_whitening_cache_build_ms_sum"] = 0.0
+    state.params["_shared_event_re_whitening_solve_ms_sum"] = 0.0
+
     # Best-effort: total batches (works for standard batching / ranges)
     total_batches = None
     try:
@@ -631,6 +638,7 @@ def _run_epoch(
     # Inner Loop
     for bi, batch_item in enumerate(batch_iter):
         optimizer.zero_grad(set_to_none=True)
+        state.params["_runtime_batch_seq"] = int(bi)
         
         # Prepare batch data
         if use_event_batches:
@@ -663,6 +671,7 @@ def _run_epoch(
                     YY_b = state.YY.index_select(0, rows)
                 # Expose stable bucket id to lower-level code (e.g., correlated likelihood caching).
                 # This is an internal implementation detail, not a user-facing config key.
+                state.params["_runtime_batching_mode"] = "event_bucket"
                 state.params["_runtime_bucket_id"] = int(batch_item)
                 # Also expose a bucket "generation" token that changes whenever buckets are rebuilt.
                 # Without this, caches keyed only by bucket_id will collide across rebuilds because
@@ -679,44 +688,15 @@ def _run_epoch(
                 except Exception:
                     state.params["_runtime_bucket_p_count"] = -1
 
-                # If available, provide precomputed per-bucket phase graphs (nodes/u/v) to the likelihood.
-                # This avoids per-batch torch.unique/remapping when grouping='phase'.
-                try:
-                    if reorder_all and getattr(state, "_bucket_nodes_p", None) is not None:
-                        bi = int(batch_item)
-                        state.params["_runtime_bucket_nodes_p"] = state._bucket_nodes_p[bi]
-                        state.params["_runtime_bucket_u_p"] = state._bucket_u_p[bi]
-                        state.params["_runtime_bucket_v_p"] = state._bucket_v_p[bi]
-                        state.params["_runtime_bucket_nodes_s"] = state._bucket_nodes_s[bi]
-                        state.params["_runtime_bucket_u_s"] = state._bucket_u_s[bi]
-                        state.params["_runtime_bucket_v_s"] = state._bucket_v_s[bi]
-                    else:
-                        state.params["_runtime_bucket_nodes_p"] = None
-                        state.params["_runtime_bucket_u_p"] = None
-                        state.params["_runtime_bucket_v_p"] = None
-                        state.params["_runtime_bucket_nodes_s"] = None
-                        state.params["_runtime_bucket_u_s"] = None
-                        state.params["_runtime_bucket_v_s"] = None
-                except Exception:
-                    state.params["_runtime_bucket_nodes_p"] = None
-                    state.params["_runtime_bucket_u_p"] = None
-                    state.params["_runtime_bucket_v_p"] = None
-                    state.params["_runtime_bucket_nodes_s"] = None
-                    state.params["_runtime_bucket_u_s"] = None
-                    state.params["_runtime_bucket_v_s"] = None
-
-                # Preferred: pre-chunked phase blocks (each chunk <= max_nodes), fully deterministic.
-                try:
-                    if reorder_all and getattr(state, "_bucket_chunks_p", None) is not None:
-                        bi = int(batch_item)
-                        state.params["_runtime_bucket_chunks_p"] = state._bucket_chunks_p[bi]
-                        state.params["_runtime_bucket_chunks_s"] = state._bucket_chunks_s[bi]
-                    else:
-                        state.params["_runtime_bucket_chunks_p"] = None
-                        state.params["_runtime_bucket_chunks_s"] = None
-                except Exception:
-                    state.params["_runtime_bucket_chunks_p"] = None
-                    state.params["_runtime_bucket_chunks_s"] = None
+                # Legacy precomputed per-phase graph/chunk structures are disabled in whitening-first mode.
+                state.params["_runtime_bucket_nodes_p"] = None
+                state.params["_runtime_bucket_u_p"] = None
+                state.params["_runtime_bucket_v_p"] = None
+                state.params["_runtime_bucket_nodes_s"] = None
+                state.params["_runtime_bucket_u_s"] = None
+                state.params["_runtime_bucket_v_s"] = None
+                state.params["_runtime_bucket_chunks_p"] = None
+                state.params["_runtime_bucket_chunks_s"] = None
 
                 # Provide per-row station index (stable int id for (network,station)) when available.
                 # on float receiver coordinates.
@@ -759,6 +739,7 @@ def _run_epoch(
                 YY_b = state.YY.index_select(0, batch_item)
                 rows = batch_item # for SSST index select if needed logic? 
                 # Actually SSST logic uses batch_idx directly in fallback loop
+                state.params["_runtime_batching_mode"] = "event_index"
                 state.params["_runtime_bucket_id"] = -1
                 state.params["_runtime_bucket_gen"] = -1
                 state.params["_runtime_bucket_p_count"] = -1
@@ -804,6 +785,7 @@ def _run_epoch(
             state.params["_runtime_bucket_chunks_p"] = None
             state.params["_runtime_bucket_chunks_s"] = None
             # Stable standard batch id (only meaningful when _runtime_batch_shuffle is false).
+            state.params["_runtime_batching_mode"] = "standard"
             state.params["_runtime_batch_id"] = int(batch_item)
             state.params["_runtime_batch_i0"] = int(i_start)
             state.params["_runtime_batch_i1"] = int(i_end)
@@ -817,6 +799,19 @@ def _run_epoch(
             except Exception:
                 state.params["_runtime_bucket_station_index"] = None
             state.params["_runtime_bucket_comp_index"] = None
+
+        # Canonical runtime batch context for cache identity.
+        state.params["_runtime_batch_context"] = {
+            "mode": str(state.params.get("_runtime_batching_mode", "unknown")),
+            "batch_id": int(state.params.get("_runtime_batch_id", -1)),
+            "batch_i0": int(state.params.get("_runtime_batch_i0", -1)),
+            "batch_i1": int(state.params.get("_runtime_batch_i1", -1)),
+            "bucket_id": int(state.params.get("_runtime_bucket_id", -1)),
+            "bucket_gen": int(state.params.get("_runtime_bucket_gen", -1)),
+            "is_shuffled": bool(state.params.get("_runtime_batch_shuffle", True)),
+            "epoch_index": int(state.params.get("_runtime_epoch_index", -1)),
+            "batch_seq": int(state.params.get("_runtime_batch_seq", -1)),
+        }
 
         # --- DDP shard: split *this batch* across ranks (global batch size is the configured batch size) ---
         if ddp_enabled:
@@ -1230,18 +1225,15 @@ def _run_epoch(
                                 torch.zeros_like(YY_b[:, 4], dtype=torch.int64),
                                 torch.ones_like(YY_b[:, 4], dtype=torch.int64),
                             )
-                            grouping = str(state.params.get("_shared_event_re_grouping", "phase")).strip().lower()
+                            grouping = str(state.params.get("_shared_event_re_grouping", "station_phase")).strip().lower()
                             if grouping in {"stationphase", "station-phase"}:
                                 grouping = "station_phase"
-                            if grouping == "station_phase":
-                                sta_idx = state.params.get("_runtime_bucket_station_index", None)
-                                if isinstance(sta_idx, torch.Tensor) and int(sta_idx.numel()) == int(ph_id.numel()):
-                                    keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id
-                                else:
-                                    keys = ph_id
-                                    grouping = "phase"
-                            else:
-                                keys = ph_id
+                            if grouping != "station_phase":
+                                raise ValueError("shared_event_re.grouping must be 'station_phase'")
+                            sta_idx = state.params.get("_runtime_bucket_station_index", None)
+                            if not isinstance(sta_idx, torch.Tensor) or int(sta_idx.numel()) != int(ph_id.numel()):
+                                raise ValueError("missing _runtime_bucket_station_index for station_phase grouping")
+                            keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id
                             keys_sorted, _ = torch.sort(keys)
                             if keys_sorted.numel() > 0:
                                 is_new = torch.ones_like(keys_sorted, dtype=torch.bool)
@@ -1277,7 +1269,7 @@ def _run_epoch(
                     tg = state.params.get("_shared_event_re_tau_s", [0.0, 0.0])
                     log_every = int(state.params.get("_shared_event_re_stats_log_every_epochs", 0) or 0)
                     if log_every > 0 and (epoch_index % log_every == 0):
-                        grouping = str(state.params.get("_shared_event_re_runtime_last_grouping", "phase"))
+                        grouping = str(state.params.get("_shared_event_re_runtime_last_grouping", "station_phase"))
                         info(
                             f"shared_event_re stats epoch={epoch_index} grouping={grouping} "
                             f"groups={g} pcg={g_pcg} fallback={g_fb} "
@@ -2167,6 +2159,10 @@ def _run_epoch(
                 if bool(state.params.get("_shared_event_re_station_phase_enabled", False)):
                     metrics["shared_event_re/station_phase_groups"] = float(int(state.params.get("_shared_event_re_station_phase_last_groups", 0) or 0))
                     metrics["shared_event_re/station_phase_quad"] = float(state.params.get("_shared_event_re_station_phase_last_quad", 0.0) or 0.0)
+                metrics["shared_event_re/whitening_cache_hits"] = float(int(state.params.get("_shared_event_re_whitening_cache_hit_sum", 0) or 0))
+                metrics["shared_event_re/whitening_cache_misses"] = float(int(state.params.get("_shared_event_re_whitening_cache_miss_sum", 0) or 0))
+                metrics["shared_event_re/whitening_cache_build_ms_sum"] = float(state.params.get("_shared_event_re_whitening_cache_build_ms_sum", 0.0) or 0.0)
+                metrics["shared_event_re/whitening_solve_ms_sum"] = float(state.params.get("_shared_event_re_whitening_solve_ms_sum", 0.0) or 0.0)
         except Exception:
             pass
         return metrics

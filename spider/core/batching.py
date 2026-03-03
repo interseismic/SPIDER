@@ -316,72 +316,14 @@ def _prepare_owner_buckets(
     except Exception:
         state._bucket_p_counts = None
 
-    # Precompute per-bucket phase graphs (nodes + (u,v) in local node indexing) once.
-    # This makes the correlated likelihood deterministic and avoids per-batch torch.unique.
-    try:
-        if reorder_all and (state._bucket_II is not None) and (state._bucket_offsets is not None) and (state._bucket_p_counts is not None):
-            nb = int(state._bucket_offsets.numel() - 1)
-            nodes_p: list = []
-            u_p: list = []
-            v_p: list = []
-            nodes_s: list = []
-            u_s: list = []
-            v_s: list = []
-            for bi in range(nb):
-                i0 = int(state._bucket_offsets[bi].item())
-                i1 = int(state._bucket_offsets[bi + 1].item())
-                p = int(state._bucket_p_counts[bi].item())
-                p = max(0, min(p, max(i1 - i0, 0)))
-                # P block
-                mP = int(p)
-                if mP > 0:
-                    IIp = state._bucket_II[i0:i0 + mP, :]
-                    ev_flat = IIp.reshape(-1)
-                    nodes, inv_nodes = torch.unique(ev_flat, return_inverse=True)
-                    u = inv_nodes[:mP]
-                    v = inv_nodes[mP:]
-                else:
-                    nodes = torch.empty((0,), dtype=torch.int64, device=device)
-                    u = torch.empty((0,), dtype=torch.int64, device=device)
-                    v = torch.empty((0,), dtype=torch.int64, device=device)
-                nodes_p.append(nodes)
-                u_p.append(u)
-                v_p.append(v)
-                # S block
-                mS = int(i1 - (i0 + mP))
-                if mS > 0:
-                    IIs = state._bucket_II[i0 + mP:i1, :]
-                    ev_flat = IIs.reshape(-1)
-                    nodes, inv_nodes = torch.unique(ev_flat, return_inverse=True)
-                    u = inv_nodes[:mS]
-                    v = inv_nodes[mS:]
-                else:
-                    nodes = torch.empty((0,), dtype=torch.int64, device=device)
-                    u = torch.empty((0,), dtype=torch.int64, device=device)
-                    v = torch.empty((0,), dtype=torch.int64, device=device)
-                nodes_s.append(nodes)
-                u_s.append(u)
-                v_s.append(v)
-            state._bucket_nodes_p = nodes_p
-            state._bucket_u_p = u_p
-            state._bucket_v_p = v_p
-            state._bucket_nodes_s = nodes_s
-            state._bucket_u_s = u_s
-            state._bucket_v_s = v_s
-        else:
-            state._bucket_nodes_p = None
-            state._bucket_u_p = None
-            state._bucket_v_p = None
-            state._bucket_nodes_s = None
-            state._bucket_u_s = None
-            state._bucket_v_s = None
-    except Exception:
-        state._bucket_nodes_p = None
-        state._bucket_u_p = None
-        state._bucket_v_p = None
-        state._bucket_nodes_s = None
-        state._bucket_u_s = None
-        state._bucket_v_s = None
+    # Whitening-first path uses canonical grouping plans built in shared_event_re_whitening.
+    # Keep legacy bucket phase-graph precomputes disabled to avoid redundant per-epoch work.
+    state._bucket_nodes_p = None
+    state._bucket_u_p = None
+    state._bucket_v_p = None
+    state._bucket_nodes_s = None
+    state._bucket_u_s = None
+    state._bucket_v_s = None
 
     # Residual-correlation chunking removed (no backward compatibility).
     state._bucket_chunks_p = None

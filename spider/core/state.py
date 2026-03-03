@@ -111,15 +111,15 @@ class LocateState:
     _bucket_station_index: Optional[torch.Tensor] = None     # station index reordered by bucket order (device)
     _bucket_comp_index: Optional[torch.Tensor] = None        # component id per row reordered by bucket order (device)
     _bucket_p_counts: Optional[torch.Tensor] = None          # int64 per-bucket P-row counts (when reorder_all=True)
-    # Per-bucket per-phase precomputed event graph maps (when reorder_all=True).
-    # These avoid per-batch torch.unique / remapping in correlated likelihood.
+    # Legacy per-bucket per-phase precomputed event graph maps.
+    # Whitening-first shared_event_re uses canonical grouping plans built at likelihood time.
     _bucket_nodes_p: Optional[list] = None
     _bucket_u_p: Optional[list] = None
     _bucket_v_p: Optional[list] = None
     _bucket_nodes_s: Optional[list] = None
     _bucket_u_s: Optional[list] = None
     _bucket_v_s: Optional[list] = None
-    # Per-bucket pre-chunked phase blocks for correlated likelihood (when grouping='phase').
+    # Per-bucket pre-chunked phase blocks for correlated likelihood (station_phase grouping).
     # Each entry is a list of dicts with keys: i0,i1,nodes,u,v (all relative to bucket slice).
     _bucket_chunks_p: Optional[list] = None
     _bucket_chunks_s: Optional[list] = None

@@ -66,6 +66,7 @@
                 },
                 "shared_event_re": {
                     "enabled": true,
+                    "whitening_only_mode": true,
                     "grouping": "station_phase",
                     "tau_s": [0.033, 0.06],
                     "max_nodes_per_group": 25000,
@@ -82,6 +83,7 @@
                       "enabled": true,
                       "solver": "pcg",
                       "pcg_batched": true,
+                      "pcg_warm_start": true,
                       "pcg_bucket_nodes": [4096, 16384, 25000],
                       "pcg_max_iters": 100,
                       "pcg_tol": 3e-4,

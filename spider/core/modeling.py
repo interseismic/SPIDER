@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from spider.utils.console import info, warn
 
-from spider.core.shared_event_re_whitening import compute_quad_whitening
+from spider.core.shared_event_re_whitening import build_grouping_plan, compute_quad_whitening
 
 
 
@@ -254,15 +254,16 @@ def _station_phase_re_quad(
     Returns (quad_sum, n_groups, grouping_used).
     """
     if resid.numel() == 0:
-        return torch.tensor(0.0, device=resid.device, dtype=resid.dtype), 0, "phase"
+        return torch.tensor(0.0, device=resid.device, dtype=resid.dtype), 0, "station_phase"
     tau_p = float(tau_ps[0]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
     tau_s = float(tau_ps[1]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
 
-    grouping = "station_phase" if isinstance(sta_idx, torch.Tensor) and int(sta_idx.numel()) == int(resid.numel()) else "phase"
-    if grouping == "phase":
-        keys = ph_id
-    else:
-        keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id  # type: ignore[union-attr]
+    if not isinstance(sta_idx, torch.Tensor) or int(sta_idx.numel()) != int(resid.numel()):
+        raise ValueError(
+            "shared_event_re.station_phase_re requires per-row station indices; phase grouping support was removed."
+        )
+    grouping = "station_phase"
+    keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id
 
     keys_sorted, perm = torch.sort(keys)
     resid_s = resid.index_select(0, perm)
@@ -683,9 +684,17 @@ def compute_likelihood_loss(
             # We compute u ≈ Σ^{-1} r per group and return:
             #   mean( 0.5 r^T u ) + mean(log sigma)
             # but with custom autograd so d/dr = u (do not differentiate through the solver).
-            grouping = str(params.get("_shared_event_re_grouping", "phase")).strip().lower()
+            grouping = str(params.get("_shared_event_re_grouping", "station_phase")).strip().lower()
             if grouping in {"stationphase", "station-phase"}:
                 grouping = "station_phase"
+            if grouping == "phase":
+                raise ValueError(
+                    "shared_event_re.grouping='phase' is no longer supported; use grouping='station_phase'."
+                )
+            if grouping != "station_phase":
+                raise ValueError(
+                    f"shared_event_re.grouping must be 'station_phase' (got '{grouping}')."
+                )
             if not bool(params.get("_shared_event_re_sizes_logged", False)):
                 params["_shared_event_re_sizes_logged"] = True
                 _log(
@@ -719,26 +728,16 @@ def compute_likelihood_loss(
 
 
             # Station index is supplied at runtime by the epoch runner when owner-bucket batching is active.
-            sta_idx = None
-            if grouping == "station_phase":
-                sta_idx = params.get("_runtime_bucket_station_index", None)
-                if not isinstance(sta_idx, torch.Tensor) or int(sta_idx.numel()) != int(resid.numel()):
-                    # Fall back quietly to phase-only; warn once.
-                    if not bool(params.get("_shared_event_re_warned_no_station_index", False)):
-                        _log(
-                            "Warning: shared_event_re.grouping='station_phase' requested but no per-row station index "
-                            "was available for this batch. Falling back to grouping='phase'."
-                        )
-                        params["_shared_event_re_warned_no_station_index"] = True
-                    grouping = "phase"
-                    sta_idx = None
+            sta_idx = params.get("_runtime_bucket_station_index", None)
+            if not isinstance(sta_idx, torch.Tensor) or int(sta_idx.numel()) != int(resid.numel()):
+                raise ValueError(
+                    "shared_event_re.grouping='station_phase' requires _runtime_bucket_station_index "
+                    "aligned with the current batch; phase fallback was removed."
+                )
 
             # Build group keys (sorted -> contiguous runs)
             ph_id = torch.where(is_p, torch.zeros_like(resid, dtype=torch.int64), torch.ones_like(resid, dtype=torch.int64))
-            if grouping == "phase":
-                keys = ph_id
-            else:
-                keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id  # type: ignore[union-attr]
+            keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id
 
             # Optional: collapsed station-phase random effects (additive).
             quad_sp = torch.tensor(0.0, device=resid.device, dtype=resid.dtype)
@@ -748,24 +747,16 @@ def compute_likelihood_loss(
                 se_sp_enable = False
             if se_sp_enable:
                 sp_tau_ps = params.get("_shared_event_re_station_phase_tau_s", [0.0, 0.0])
-                sp_sta_idx = params.get("_runtime_bucket_station_index", None)
                 quad_sp, n_sp_groups, sp_grouping = _station_phase_re_quad(
                     resid=resid,
                     sigma=sigma,
                     ph_id=ph_id,
-                    sta_idx=sp_sta_idx,
+                    sta_idx=sta_idx,
                     tau_ps=sp_tau_ps,
                 )
                 params["_shared_event_re_station_phase_last_groups"] = int(n_sp_groups)
                 params["_shared_event_re_station_phase_last_grouping"] = str(sp_grouping)
                 params["_shared_event_re_station_phase_last_quad"] = float(quad_sp.detach().item())
-                if (sp_grouping == "phase") and (not bool(params.get("_shared_event_re_station_phase_warned_no_station_index", False))):
-                    params["_shared_event_re_station_phase_warned_no_station_index"] = True
-                    _log(
-                        "Warning: shared_event_re.station_phase_re enabled but no per-row station index was available; "
-                        "falling back to phase-only station_phase_re.",
-                        flush=True,
-                    )
                 if not bool(params.get("_shared_event_re_station_phase_logged", False)):
                     params["_shared_event_re_station_phase_logged"] = True
                     _log(
@@ -818,40 +809,7 @@ def compute_likelihood_loss(
             # Build a shared grouping cache once so whitening and PCG can reuse it.
             grouping_cache = None
             try:
-                from spider.core import shared_event_re_gpu
-
-                keys_sorted, perm0, starts0, ends0 = shared_event_re_gpu._group_by_keys_gpu(keys)
-                lengths0 = (ends0 - starts0).to(torch.int64)
-                group_ids0, _ = shared_event_re_gpu._build_group_ids(starts0, ends0)
-                idx_perm0 = idx.index_select(0, perm0)
-                u0 = idx_perm0[:, 0].to(torch.int64)
-                v0 = idx_perm0[:, 1].to(torch.int64)
-                if u0.numel() > 0 and v0.numel() > 0:
-                    max_node_id0 = int(torch.max(torch.stack([u0.max(), v0.max()])).item())
-                else:
-                    max_node_id0 = 0
-                local_u0, local_v0, n_nodes0 = shared_event_re_gpu._build_local_node_indices(
-                    u0, v0, group_ids0, int(starts0.numel()), max_node_id=max_node_id0
-                )
-                ph_perm0 = ph_id.index_select(0, perm0) if perm0.numel() > 0 else ph_id.new_zeros((0,))
-                ph_group0 = ph_perm0.index_select(0, starts0) if starts0.numel() > 0 else ph_id.new_zeros((0,))
-                if perm0.numel() > 0:
-                    edge_idx0 = torch.arange(int(perm0.numel()), device=perm0.device, dtype=starts0.dtype)
-                    edge_pos0 = edge_idx0 - starts0.index_select(0, group_ids0)
-                else:
-                    edge_pos0 = torch.zeros((0,), device=perm0.device, dtype=starts0.dtype)
-                grouping_cache = {
-                    "perm": perm0.detach(),
-                    "starts": starts0.detach(),
-                    "ends": ends0.detach(),
-                    "lengths": lengths0.detach(),
-                    "group_ids": group_ids0.detach(),
-                    "local_u": local_u0.detach(),
-                    "local_v": local_v0.detach(),
-                    "n_nodes": n_nodes0.detach(),
-                    "ph_group": ph_group0.detach(),
-                    "edge_pos": edge_pos0.detach(),
-                }
+                grouping_cache = build_grouping_plan(idx=idx, keys=keys, ph_id=ph_id, precomputed=None)
             except Exception:
                 grouping_cache = None
 
@@ -897,6 +855,22 @@ def compute_likelihood_loss(
                 whiten_enable = bool(params.get("_shared_event_re_whitening_enabled", False))
             except Exception:
                 whiten_enable = False
+            try:
+                whitening_only_mode = bool(params.get("_shared_event_re_whitening_only_mode", True))
+            except Exception:
+                whitening_only_mode = True
+            if whitening_only_mode and (not whiten_enable):
+                raise ValueError(
+                    "shared_event_re.whitening_only_mode=true but whitening is disabled. "
+                    "Enable shared_event_re.whitening.enabled."
+                )
+            if (not whiten_enable) and (not bool(params.get("_shared_event_re_whitening_fallback_warned", False))):
+                params["_shared_event_re_whitening_fallback_warned"] = True
+                _log(
+                    "Warning: shared_event_re is running without whitening "
+                    "(compatibility fallback path). This is slower and not the default architecture.",
+                    flush=True,
+                )
             if whiten_enable:
                 # Quick diagnostic: compare whitening quadratic to diagonal quadratic once.
                 quad_diag = None
@@ -928,15 +902,23 @@ def compute_likelihood_loss(
                     if not isinstance(X_event, torch.Tensor) or int(X_event.shape[0]) != int(X_src.shape[0]):
                         X_event = (X_src + ΔX_src)[:, :3].detach().to(device=X_src.device, dtype=X_src.dtype)
                         params["_shared_event_re_whitening_X_event"] = X_event
+                batch_context = params.get("_runtime_batch_context", None)
+                if not isinstance(batch_context, dict):
+                    try:
+                        batch_context = {
+                            "mode": str(params.get("_runtime_batching_mode", "unknown")),
+                            "batch_id": int(params.get("_runtime_batch_id", -1)),
+                            "batch_i0": int(params.get("_runtime_batch_i0", -1)),
+                            "batch_i1": int(params.get("_runtime_batch_i1", -1)),
+                            "bucket_id": int(params.get("_runtime_bucket_id", -1)),
+                            "bucket_gen": int(params.get("_runtime_bucket_gen", -1)),
+                            "is_shuffled": bool(params.get("_runtime_batch_shuffle", True)),
+                            "epoch_index": int(params.get("_runtime_epoch_index", -1)),
+                            "batch_seq": int(params.get("_runtime_batch_seq", -1)),
+                        }
+                    except Exception:
+                        batch_context = None
                 cache_key_extra = None
-                try:
-                    precompute = bool(params.get("_shared_event_re_whitening_precompute", False))
-                    batch_shuffle = bool(params.get("_runtime_batch_shuffle", True))
-                    batch_id = int(params.get("_runtime_batch_id", -1))
-                    if precompute and (not batch_shuffle) and batch_id >= 0:
-                        cache_key_extra = ("batch", int(batch_id))
-                except Exception:
-                    cache_key_extra = None
                 quad_w, metrics_w, cache = compute_quad_whitening(
                     idx=idx,
                     resid=resid,
@@ -960,18 +942,16 @@ def compute_likelihood_loss(
                     edge_weight_eps_km=float(edge_weight_eps_km),
                     edge_weight_power=float(edge_weight_power),
                     edge_weight_scale_km=float(edge_weight_scale_km),
-                        edge_weight_global_scale=float(edge_weight_global_scale),
-                        edge_weight_normalize=bool(edge_weight_normalize),
+                    edge_weight_global_scale=float(edge_weight_global_scale),
+                    edge_weight_normalize=bool(edge_weight_normalize),
                     X_event=X_event,
                     cache=cache,
+                    batch_context=batch_context,
+                    cache_max_entries=int(cache_max),
+                    pcg_warm_start=bool(params.get("_shared_event_re_whitening_pcg_warm_start", False)),
                     grouping_cache=grouping_cache,
                     cache_key_extra=cache_key_extra,
                 )
-                if cache_max > 0 and len(cache) > cache_max:
-                    try:
-                        cache.pop(next(iter(cache)))
-                    except Exception:
-                        pass
                 params["_shared_event_re_whitening_cache"] = cache
                 params["_shared_event_re_whitening_last_groups"] = int(metrics_w.n_groups_total)
                 params["_shared_event_re_whitening_last_groups_chol"] = int(metrics_w.n_groups_chol)
@@ -985,6 +965,14 @@ def compute_likelihood_loss(
                 params["_shared_event_re_whitening_last_pcg_iters_sum"] = int(metrics_w.pcg_iters_sum)
                 params["_shared_event_re_whitening_last_pcg_iters_max"] = int(metrics_w.pcg_iters_max)
                 params["_shared_event_re_whitening_last_pcg_fail"] = int(metrics_w.n_groups_pcg_fail)
+                params["_shared_event_re_whitening_last_cache_hit"] = int(metrics_w.cache_hit)
+                params["_shared_event_re_whitening_last_cache_miss"] = int(metrics_w.cache_miss)
+                params["_shared_event_re_whitening_last_cache_build_ms"] = float(metrics_w.cache_build_ms)
+                params["_shared_event_re_whitening_last_solve_ms"] = float(metrics_w.solve_ms)
+                params["_shared_event_re_whitening_cache_hit_sum"] = int(params.get("_shared_event_re_whitening_cache_hit_sum", 0) or 0) + int(metrics_w.cache_hit)
+                params["_shared_event_re_whitening_cache_miss_sum"] = int(params.get("_shared_event_re_whitening_cache_miss_sum", 0) or 0) + int(metrics_w.cache_miss)
+                params["_shared_event_re_whitening_solve_ms_sum"] = float(params.get("_shared_event_re_whitening_solve_ms_sum", 0.0) or 0.0) + float(metrics_w.solve_ms)
+                params["_shared_event_re_whitening_cache_build_ms_sum"] = float(params.get("_shared_event_re_whitening_cache_build_ms_sum", 0.0) or 0.0) + float(metrics_w.cache_build_ms)
                 # Mirror whitening stats into runtime stats so epoch_runner logs remain consistent.
                 params["_shared_event_re_runtime_last_grouping"] = str(grouping)
                 params["_shared_event_re_runtime_last_groups"] = int(metrics_w.n_groups_total)
@@ -1010,6 +998,8 @@ def compute_likelihood_loss(
                         f"max_nodes={int(metrics_w.max_nodes_seen)} "
                         f"w_mean={float(metrics_w.weight_mean):.3g} "
                         f"w_max={float(metrics_w.weight_max):.3g} "
+                        f"cache_hit={int(metrics_w.cache_hit)} cache_miss={int(metrics_w.cache_miss)} "
+                        f"cache_build_ms={float(metrics_w.cache_build_ms):.2f} solve_ms={float(metrics_w.solve_ms):.2f} "
                         f"solver={str(whiten_solver)}",
                         flush=True,
                     )
@@ -1247,7 +1237,7 @@ def compute_likelihood_loss(
                     # Fall back to the CPU path below.
                     gpu_enable = False
 
-            # --- Optional caching of station_phase/phase grouping (CPU path) ---
+            # --- Optional caching of station_phase grouping (CPU path) ---
             cache_ok = False
             cache_entry = None
             group_n_nodes = None

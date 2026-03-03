@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from collections import OrderedDict
+from typing import Any, Optional, Tuple
 
 import math
+import time
 import torch
 
-from .shared_event_re_gpu import _CollapsedQuadNoGrad
+from .shared_event_re_gpu import _CollapsedQuadNoGrad, _build_group_ids, _build_local_node_indices, _group_by_keys_gpu
 
 
 @dataclass
@@ -25,6 +27,130 @@ class SharedEventReWhiteningMetrics:
     pcg_iters_sum: int = 0
     pcg_iters_max: int = 0
     n_groups_pcg_fail: int = 0
+    cache_hit: int = 0
+    cache_miss: int = 0
+    cache_build_ms: float = 0.0
+    solve_ms: float = 0.0
+
+
+def _extract_batch_context_tuple(batch_context: Optional[dict[str, Any]]) -> tuple:
+    """
+    Produce a stable cache identity component from runtime batch context.
+    """
+    if not isinstance(batch_context, dict):
+        return ("unknown",)
+    mode = str(batch_context.get("mode", "unknown"))
+    is_shuffled = bool(batch_context.get("is_shuffled", True))
+    batch_id = int(batch_context.get("batch_id", -1))
+    batch_i0 = int(batch_context.get("batch_i0", -1))
+    batch_i1 = int(batch_context.get("batch_i1", -1))
+    bucket_id = int(batch_context.get("bucket_id", -1))
+    bucket_gen = int(batch_context.get("bucket_gen", -1))
+    epoch_index = int(batch_context.get("epoch_index", -1))
+    batch_seq = int(batch_context.get("batch_seq", -1))
+    if mode == "standard" and (not is_shuffled) and batch_id >= 0:
+        return ("standard_fixed", int(batch_id), int(batch_i0), int(batch_i1))
+    if mode == "event_bucket" and bucket_id >= 0:
+        return ("event_bucket", int(bucket_id), int(bucket_gen))
+    # Fallback identity for volatile batches.
+    return ("volatile", mode, int(epoch_index), int(batch_seq), int(batch_id), int(bucket_id))
+
+
+def build_grouping_plan(
+    *,
+    idx: torch.Tensor,
+    keys: torch.Tensor,
+    ph_id: torch.Tensor,
+    precomputed: Optional[dict] = None,
+) -> dict:
+    """
+    Canonical station_phase grouping plan used by whitening and batched solvers.
+    """
+    if isinstance(precomputed, dict):
+        perm = precomputed.get("perm", None)
+        starts = precomputed.get("starts", None)
+        ends = precomputed.get("ends", None)
+        lengths = precomputed.get("lengths", None)
+        group_ids = precomputed.get("group_ids", None)
+        local_u = precomputed.get("local_u", None)
+        local_v = precomputed.get("local_v", None)
+        n_nodes = precomputed.get("n_nodes", None)
+        ph_group = precomputed.get("ph_group", None)
+        edge_pos = precomputed.get("edge_pos", None)
+        ok = (
+            isinstance(perm, torch.Tensor)
+            and isinstance(starts, torch.Tensor)
+            and isinstance(ends, torch.Tensor)
+            and isinstance(lengths, torch.Tensor)
+            and isinstance(group_ids, torch.Tensor)
+            and isinstance(local_u, torch.Tensor)
+            and isinstance(local_v, torch.Tensor)
+            and isinstance(n_nodes, torch.Tensor)
+            and isinstance(ph_group, torch.Tensor)
+            and isinstance(edge_pos, torch.Tensor)
+            and perm.ndim == 1
+            and starts.ndim == 1
+            and ends.ndim == 1
+            and lengths.ndim == 1
+            and group_ids.ndim == 1
+            and local_u.ndim == 1
+            and local_v.ndim == 1
+            and n_nodes.ndim == 1
+            and ph_group.ndim == 1
+            and edge_pos.ndim == 1
+            and int(starts.numel()) == int(ends.numel()) == int(lengths.numel()) == int(n_nodes.numel()) == int(ph_group.numel())
+        )
+        if ok:
+            return {
+                "perm": perm,
+                "starts": starts,
+                "ends": ends,
+                "lengths": lengths,
+                "group_ids": group_ids,
+                "local_u": local_u,
+                "local_v": local_v,
+                "n_nodes": n_nodes,
+                "ph_group": ph_group,
+                "edge_pos": edge_pos,
+            }
+
+    _, perm, starts, ends = _group_by_keys_gpu(keys)
+    lengths = (ends - starts).to(torch.int64)
+    group_ids, _ = _build_group_ids(starts, ends)
+
+    idx_perm = idx.index_select(0, perm) if perm.numel() > 0 else idx.new_zeros((0, 2))
+    u = idx_perm[:, 0].to(torch.int64) if idx_perm.numel() > 0 else torch.zeros((0,), device=idx.device, dtype=torch.int64)
+    v = idx_perm[:, 1].to(torch.int64) if idx_perm.numel() > 0 else torch.zeros((0,), device=idx.device, dtype=torch.int64)
+    if u.numel() > 0 and v.numel() > 0:
+        max_node_id = int(torch.max(torch.stack([u.max(), v.max()])).item())
+    else:
+        max_node_id = 0
+    local_u, local_v, n_nodes = _build_local_node_indices(
+        u,
+        v,
+        group_ids,
+        int(starts.numel()),
+        max_node_id=max_node_id,
+    )
+    ph_perm = ph_id.index_select(0, perm) if perm.numel() > 0 else ph_id.new_zeros((0,))
+    ph_group = ph_perm.index_select(0, starts) if starts.numel() > 0 else ph_id.new_zeros((0,))
+    if perm.numel() > 0:
+        edge_idx = torch.arange(int(perm.numel()), device=perm.device, dtype=starts.dtype)
+        edge_pos = edge_idx - starts.index_select(0, group_ids)
+    else:
+        edge_pos = torch.zeros((0,), device=keys.device, dtype=torch.int64)
+    return {
+        "perm": perm,
+        "starts": starts,
+        "ends": ends,
+        "lengths": lengths,
+        "group_ids": group_ids,
+        "local_u": local_u,
+        "local_v": local_v,
+        "n_nodes": n_nodes,
+        "ph_group": ph_group,
+        "edge_pos": edge_pos,
+    }
 
 
 def _edge_to_node(
@@ -130,6 +256,7 @@ def _pcg_solve_whitening_batched(
     max_iters: int,
     tol: float,
     min_iters: int = 0,
+    x0: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Batched PCG for multiple groups with padded edges/nodes.
@@ -168,8 +295,12 @@ def _pcg_solve_whitening_batched(
         out = out_flat.view(B, N)
         return alpha * x + beta * out
 
-    x = torch.zeros_like(b)
-    r = b - _A(x)
+    if isinstance(x0, torch.Tensor) and x0.shape == b.shape:
+        x = x0.to(device=b.device, dtype=b.dtype).clone()
+        r = b - _A(x)
+    else:
+        x = torch.zeros_like(b)
+        r = b - _A(x)
     z = r / diag
     p = z.clone()
     rz = (r * z).sum(dim=1)
@@ -221,57 +352,24 @@ def _build_group_cache(
     X_event: Optional[torch.Tensor],
     grouping_cache: Optional[dict] = None,
 ) -> dict:
-    use_precomputed = False
-    perm = starts = ends = group_ph = None
-    local_u_all = local_v_all = n_nodes_all = None
-    if isinstance(grouping_cache, dict):
-        try:
-            perm = grouping_cache.get("perm", None)
-            starts = grouping_cache.get("starts", None)
-            ends = grouping_cache.get("ends", None)
-            group_ph = grouping_cache.get("ph_group", None)
-            local_u_all = grouping_cache.get("local_u", None)
-            local_v_all = grouping_cache.get("local_v", None)
-            n_nodes_all = grouping_cache.get("n_nodes", None)
-            use_precomputed = (
-                isinstance(perm, torch.Tensor)
-                and isinstance(starts, torch.Tensor)
-                and isinstance(ends, torch.Tensor)
-                and isinstance(local_u_all, torch.Tensor)
-                and isinstance(local_v_all, torch.Tensor)
-                and isinstance(n_nodes_all, torch.Tensor)
-                and perm.ndim == 1
-                and starts.ndim == 1
-                and ends.ndim == 1
-                and local_u_all.ndim == 1
-                and local_v_all.ndim == 1
-                and n_nodes_all.ndim == 1
-            )
-        except Exception:
-            use_precomputed = False
-    if not use_precomputed:
-        keys_sorted, perm = torch.sort(keys)
-        if keys_sorted.numel() > 0:
-            is_new = torch.ones_like(keys_sorted, dtype=torch.bool)
-            is_new[1:] = keys_sorted[1:] != keys_sorted[:-1]
-            starts = torch.nonzero(is_new, as_tuple=False).reshape(-1)
-            ends = torch.cat([starts[1:], torch.tensor([keys_sorted.numel()], device=starts.device, dtype=starts.dtype)])
-        else:
-            starts = torch.zeros((0,), device=keys.device, dtype=torch.int64)
-            ends = torch.zeros((0,), device=keys.device, dtype=torch.int64)
-
-    if not isinstance(group_ph, torch.Tensor):
-        group_ph = ph_id.index_select(0, starts) if starts.numel() > 0 else torch.zeros((0,), device=ph_id.device, dtype=ph_id.dtype)
+    plan = build_grouping_plan(idx=idx, keys=keys, ph_id=ph_id, precomputed=grouping_cache)
+    perm = plan["perm"]
+    starts = plan["starts"]
+    ends = plan["ends"]
+    group_ph = plan["ph_group"]
+    local_u_all = plan["local_u"]
+    local_v_all = plan["local_v"]
+    n_nodes_all = plan["n_nodes"]
     n_groups = int(starts.numel())
     groups = []
+    idx_perm_all = idx.index_select(0, perm) if isinstance(perm, torch.Tensor) and int(perm.numel()) > 0 else idx.new_zeros((0, 2))
     for g in range(n_groups):
         s = int(starts[g].item())
         e = int(ends[g].item())
         if e <= s:
             groups.append(None)
             continue
-        idxs = perm[s:e]
-        idx_g = idx.index_select(0, idxs)
+        idx_g = idx_perm_all[s:e, :]
         e1 = idx_g[:, 0].to(torch.int64)
         e2 = idx_g[:, 1].to(torch.int64)
         ph_g = float(group_ph[g].item()) if group_ph.numel() > 0 else 0.0
@@ -293,11 +391,7 @@ def _build_group_cache(
             )
             continue
 
-        if use_precomputed and isinstance(n_nodes_all, torch.Tensor):
-            n_nodes = int(n_nodes_all[g].item())
-        else:
-            nodes, inv = torch.unique(torch.cat([e1, e2], dim=0), return_inverse=True)
-            n_nodes = int(nodes.numel())
+        n_nodes = int(n_nodes_all[g].item()) if isinstance(n_nodes_all, torch.Tensor) and int(n_nodes_all.numel()) > g else 0
         if (e - s) > int(max_rows_per_group) or n_nodes > int(max_nodes_per_group):
             groups.append(
                 {
@@ -314,12 +408,8 @@ def _build_group_cache(
             continue
 
         m = int(e1.numel())
-        if use_precomputed and isinstance(local_u_all, torch.Tensor) and isinstance(local_v_all, torch.Tensor):
-            local_u = local_u_all[s:e]
-            local_v = local_v_all[s:e]
-        else:
-            local_u = inv[:m]
-            local_v = inv[m:]
+        local_u = local_u_all[s:e] if isinstance(local_u_all, torch.Tensor) else torch.zeros((m,), device=idx.device, dtype=torch.int64)
+        local_v = local_v_all[s:e] if isinstance(local_v_all, torch.Tensor) else torch.zeros((m,), device=idx.device, dtype=torch.int64)
         if edge_weighting in {"distance_rbf", "distance_linear", "distance_power"} and isinstance(X_event, torch.Tensor):
             x_u = X_event.index_select(0, e1)
             x_v = X_event.index_select(0, e2)
@@ -390,6 +480,12 @@ def _build_group_cache(
         "starts": starts,
         "ends": ends,
         "group_ph": group_ph,
+        "lengths": plan["lengths"],
+        "group_ids": plan["group_ids"],
+        "local_u_all": local_u_all,
+        "local_v_all": local_v_all,
+        "n_nodes_all": n_nodes_all,
+        "edge_pos": plan["edge_pos"],
         "groups": groups,
         "edge_weighting": str(edge_weighting),
         "edge_weight_ell_km": float(edge_weight_ell_km),
@@ -411,7 +507,7 @@ def _make_cache_key(
     max_rows_per_group: int,
     max_nodes_per_group: int,
     solver: str,
-    idx_rows: int,
+    batch_context: Optional[dict[str, Any]],
     cache_key_extra: Optional[tuple],
 ) -> tuple:
     return (
@@ -427,7 +523,7 @@ def _make_cache_key(
         int(max_rows_per_group),
         int(max_nodes_per_group),
         str(solver),
-        int(idx_rows),
+        _extract_batch_context_tuple(batch_context),
         cache_key_extra,
     )
 
@@ -507,12 +603,20 @@ def compute_quad_whitening(
     edge_weight_normalize: bool,
     X_event: Optional[torch.Tensor],
     cache: Optional[dict],
+    batch_context: Optional[dict[str, Any]] = None,
+    cache_max_entries: int = 0,
+    pcg_warm_start: bool = False,
     grouping_cache: Optional[dict] = None,
     cache_key_extra: Optional[tuple] = None,
 ) -> Tuple[torch.Tensor, SharedEventReWhiteningMetrics, dict]:
     metrics = SharedEventReWhiteningMetrics()
     if cache is None:
-        cache = {}
+        cache = OrderedDict()
+    elif not isinstance(cache, OrderedDict):
+        try:
+            cache = OrderedDict(cache.items())  # type: ignore[arg-type]
+        except Exception:
+            cache = OrderedDict()
     cache_key = _make_cache_key(
         edge_weighting=edge_weighting,
         edge_weight_ell_km=edge_weight_ell_km,
@@ -526,11 +630,13 @@ def compute_quad_whitening(
         max_rows_per_group=max_rows_per_group,
         max_nodes_per_group=max_nodes_per_group,
         solver=solver,
-        idx_rows=int(idx.shape[0]),
+        batch_context=batch_context,
         cache_key_extra=cache_key_extra,
     )
-    cache_entry = cache.get(cache_key, None)
+    t_build0 = time.perf_counter()
+    cache_entry = cache.get(cache_key, None) if isinstance(cache, (dict, OrderedDict)) else None
     if not isinstance(cache_entry, dict):
+        metrics.cache_miss = 1
         cache_entry = build_whitening_cache_entry(
             idx=idx,
             keys=keys,
@@ -554,6 +660,17 @@ def compute_quad_whitening(
             grouping_cache=grouping_cache,
         )
         cache[cache_key] = cache_entry
+        if int(cache_max_entries) > 0:
+            while len(cache) > int(cache_max_entries):
+                cache.popitem(last=False)
+    else:
+        metrics.cache_hit = 1
+        # LRU touch on hit
+        try:
+            cache.move_to_end(cache_key)
+        except Exception:
+            pass
+    metrics.cache_build_ms = float(1000.0 * (time.perf_counter() - t_build0))
 
     perm = cache_entry["perm"]
     resid_perm = resid.index_select(0, perm)
@@ -613,6 +730,7 @@ def compute_quad_whitening(
                 continue
             pcg_groups.append(
                 {
+                    "group_index": int(g),
                     "r": r_g,
                     "local_u": local_u,
                     "local_v": local_v,
@@ -675,15 +793,17 @@ def compute_quad_whitening(
         u_edge = beta * (r_g - (w_sqrt * ax))
         quad_sum = quad_sum + _CollapsedQuadNoGrad.apply(r_g, u_edge)
 
+    t_solve0 = time.perf_counter()
     if pcg_groups:
         if not isinstance(pcg_bucket_nodes, list) or not pcg_bucket_nodes:
             pcg_bucket_nodes = [512, 1024, 2048, 4096, 8192, 16384, 32768]
         bucket_nodes = sorted({int(x) for x in pcg_bucket_nodes if int(x) > 0})
-        # Assign groups to buckets
-        bucket_map: dict[int, list[int]] = {}
+        # Assign groups to node and edge-size buckets to reduce padding waste.
+        bucket_map: dict[tuple[int, int], list[int]] = {}
         leftovers: list[int] = []
         for gi, gd in enumerate(pcg_groups):
             n = int(gd["n_nodes"])
+            m = max(1, int(gd["r"].numel()))
             bsz = None
             for bn in bucket_nodes:
                 if n <= bn:
@@ -692,13 +812,51 @@ def compute_quad_whitening(
             if bsz is None:
                 leftovers.append(gi)
             else:
-                bucket_map.setdefault(int(bsz), []).append(gi)
+                edge_bin = 1 << int(max(0, int(m - 1)).bit_length())
+                bucket_map.setdefault((int(bsz), int(edge_bin)), []).append(gi)
+
+        # Optional warm-start cache (per-group node solution).
+        use_warm = bool(pcg_warm_start) and isinstance(cache_entry, dict)
+        x0_cache = None
+        if use_warm:
+            try:
+                n_groups_total = int(len(groups))
+                max_nodes_all = 0
+                for gd in groups:
+                    if isinstance(gd, dict):
+                        max_nodes_all = max(max_nodes_all, int(gd.get("n_nodes", 0) or 0))
+                if max_nodes_all <= 0:
+                    use_warm = False
+                else:
+                    x0_cache_raw = cache_entry.get("pcg_x0", None)
+                    ok_x0 = (
+                        isinstance(x0_cache_raw, torch.Tensor)
+                        and x0_cache_raw.ndim == 2
+                        and int(x0_cache_raw.shape[0]) == int(n_groups_total)
+                        and int(x0_cache_raw.shape[1]) >= int(max_nodes_all)
+                    )
+                    if not ok_x0:
+                        x0_cache = torch.zeros(
+                            (n_groups_total, max_nodes_all),
+                            device=resid.device,
+                            dtype=resid.dtype,
+                        )
+                        if isinstance(x0_cache_raw, torch.Tensor) and x0_cache_raw.ndim == 2 and int(x0_cache_raw.shape[0]) == int(n_groups_total):
+                            cp = min(int(x0_cache_raw.shape[1]), int(max_nodes_all))
+                            if cp > 0:
+                                x0_cache[:, :cp] = x0_cache_raw[:, :cp].detach().to(device=resid.device, dtype=resid.dtype)
+                        cache_entry["pcg_x0"] = x0_cache.detach()
+                    else:
+                        x0_cache = x0_cache_raw.detach().to(device=resid.device, dtype=resid.dtype)
+                        cache_entry["pcg_x0"] = x0_cache.detach()
+            except Exception:
+                use_warm = False
+                x0_cache = None
 
         def _solve_bucket(bucket_size: int, group_ids: list[int]) -> None:
             if not group_ids:
                 return
             B = len(group_ids)
-            # Build padded tensors
             max_edges = max(int(pcg_groups[i]["r"].numel()) for i in group_ids)
             max_edges = max(1, max_edges)
             u = torch.zeros((B, max_edges), device=resid.device, dtype=torch.int64)
@@ -713,6 +871,7 @@ def compute_quad_whitening(
             sigma = torch.zeros((B,), device=resid.device, dtype=resid.dtype)
             lengths = torch.zeros((B,), device=resid.device, dtype=torch.int64)
             n_nodes = torch.zeros((B,), device=resid.device, dtype=torch.int64)
+            grp_idx = torch.zeros((B,), device=resid.device, dtype=torch.int64)
 
             for bi, gi in enumerate(group_ids):
                 gd = pcg_groups[gi]
@@ -720,6 +879,7 @@ def compute_quad_whitening(
                 m = int(r_g.numel())
                 lengths[bi] = m
                 n_nodes[bi] = int(gd["n_nodes"])
+                grp_idx[bi] = int(gd.get("group_index", gi))
                 sigma[bi] = gd["sigma"].to(dtype=resid.dtype, device=resid.device)
                 alpha[bi] = float(gd["alpha"])
                 beta[bi] = gd["beta"].to(dtype=resid.dtype, device=resid.device)
@@ -740,10 +900,21 @@ def compute_quad_whitening(
                     deg[bi, : int(gd["n_nodes"])].index_add_(0, u[bi, :m], w[bi, :m])
                     deg[bi, : int(gd["n_nodes"])].index_add_(0, v[bi, :m], w[bi, :m])
 
-                # Build RHS b = B^T D^{-1} r
                 edge_vals = beta[bi] * w_sqrt[bi, :m] * r[bi, :m]
                 b[bi].index_add_(0, u[bi, :m], -edge_vals)
                 b[bi].index_add_(0, v[bi, :m], edge_vals)
+
+            x0_batch = None
+            if use_warm and isinstance(x0_cache, torch.Tensor):
+                try:
+                    x0_batch = torch.zeros((B, bucket_size), device=resid.device, dtype=resid.dtype)
+                    for bi in range(B):
+                        gix = int(grp_idx[bi].item())
+                        nn = int(n_nodes[bi].item())
+                        if nn > 0:
+                            x0_batch[bi, :nn] = x0_cache[gix, :nn].detach()
+                except Exception:
+                    x0_batch = None
 
             x, iters, ok = _pcg_solve_whitening_batched(
                 u=u,
@@ -756,20 +927,30 @@ def compute_quad_whitening(
                 max_iters=int(pcg_max_iters),
                 tol=float(pcg_tol),
                 min_iters=int(pcg_min_iters),
+                x0=x0_batch,
             )
+            if use_warm and isinstance(x0_cache, torch.Tensor):
+                try:
+                    for bi in range(B):
+                        gix = int(grp_idx[bi].item())
+                        nn = int(n_nodes[bi].item())
+                        if nn > 0:
+                            x0_cache[gix, :nn] = x[bi, :nn].detach()
+                    cache_entry["pcg_x0"] = x0_cache.detach()
+                except Exception:
+                    pass
             metrics.n_groups_pcg += int(B)
             metrics.pcg_iters_sum += int(iters.sum().item())
             metrics.pcg_iters_max = max(int(metrics.pcg_iters_max), int(iters.max().item()))
             metrics.n_groups_pcg_fail += int((~ok).sum().item())
             metrics.n_groups_fallback_diag += int((~ok).sum().item())
 
-            # Compute quad per group
             x_flat = x
             ax = x_flat.gather(1, v) - x_flat.gather(1, u)
-            for bi, gi in enumerate(group_ids):
+            for bi in range(B):
                 m = int(lengths[bi].item())
                 r_g = r[bi, :m]
-                if not bool(ok[bi].item()):
+                if not bool(ok[bi]):
                     quad_sum_nonlocal = _CollapsedQuadNoGrad.apply(r_g, r_g / (sigma[bi].square().clamp_min(1e-24)))
                     nonlocal_quad.append(quad_sum_nonlocal)
                     continue
@@ -779,9 +960,8 @@ def compute_quad_whitening(
                 nonlocal_quad.append(quad_sum_nonlocal)
 
         nonlocal_quad: list[torch.Tensor] = []
-        for bsz, group_ids in bucket_map.items():
+        for (bsz, _edge_bin), group_ids in bucket_map.items():
             _solve_bucket(int(bsz), group_ids)
-        # Process leftovers individually
         for gi in leftovers:
             gd = pcg_groups[gi]
             r_g = gd["r"]
@@ -830,6 +1010,7 @@ def compute_quad_whitening(
 
         if nonlocal_quad:
             quad_sum = quad_sum + torch.stack(nonlocal_quad).sum()
+    metrics.solve_ms = float(1000.0 * (time.perf_counter() - t_solve0))
 
     if w_cnt > 0:
         metrics.weight_mean = float(w_sum / w_cnt)
