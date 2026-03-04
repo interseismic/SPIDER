@@ -1252,6 +1252,239 @@ def _resume_or_initialize(state: LocateState):
     return phase, start_epoch, skip_saving_first_epoch, ckpt
 
 
+def _pow2_ceil(v: int) -> int:
+    x = int(v)
+    if x <= 1:
+        return 1
+    return 1 << int((x - 1).bit_length())
+
+
+def _weighted_quantile_from_hist(hist: dict[int, int], q: float) -> int:
+    if not isinstance(hist, dict) or len(hist) == 0:
+        return 1
+    qq = min(max(float(q), 0.0), 1.0)
+    items = sorted((int(k), int(v)) for k, v in hist.items() if int(v) > 0 and int(k) > 0)
+    if not items:
+        return 1
+    total = int(sum(v for _, v in items))
+    if total <= 0:
+        return int(items[-1][0])
+    target = int(max(1, math.ceil(qq * total)))
+    acc = 0
+    for n, c in items:
+        acc += int(c)
+        if acc >= target:
+            return int(n)
+    return int(items[-1][0])
+
+
+def _score_bucket_plan(node_hist: dict[int, int], buckets: list[int], min_bin_groups: int) -> dict[str, float]:
+    b = sorted({int(x) for x in buckets if int(x) > 0})
+    if not b:
+        return {"score": float("inf"), "waste": float("inf"), "leftovers": float("inf"), "underfill": float("inf")}
+    largest = int(b[-1])
+    bucket_counts = {int(x): 0 for x in b}
+    waste = 0.0
+    leftovers = 0.0
+    for n_raw, c_raw in node_hist.items():
+        n = int(n_raw)
+        c = int(c_raw)
+        if c <= 0 or n <= 0:
+            continue
+        if n > largest:
+            leftovers += float(c)
+            continue
+        tgt = None
+        for bn in b:
+            if n <= bn:
+                tgt = int(bn)
+                break
+        if tgt is None:
+            leftovers += float(c)
+            continue
+        bucket_counts[tgt] = int(bucket_counts[tgt] + c)
+        waste += float((tgt - n) * c)
+    underfill = 0.0
+    for bn in b:
+        underfill += float(max(0, int(min_bin_groups) - int(bucket_counts.get(int(bn), 0))))
+    score = float(waste + (float(largest) * leftovers * 4.0) + (underfill * max(1.0, float(largest) / 8.0)))
+    return {
+        "score": float(score),
+        "waste": float(waste),
+        "leftovers": float(leftovers),
+        "underfill": float(underfill),
+    }
+
+
+def _propose_bucket_nodes_from_hist(
+    *,
+    node_hist: dict[int, int],
+    current: list[int],
+    max_nodes_cap: int,
+    max_bins: int,
+    min_bin_groups: int,
+    min_bucket_node: int,
+) -> list[int]:
+    min_node = max(1, int(min_bucket_node))
+    cur = sorted({int(x) for x in current if int(x) >= min_node})
+    if not cur:
+        cur = [512, 1024, 2048, 4096, 8192, 16384, 32768]
+    obs_max = int(max((int(k) for k, v in node_hist.items() if int(v) > 0), default=cur[-1]))
+    hard_cap = int(max(max_nodes_cap, cur[-1]))
+    cand = set(cur)
+    for q in (0.50, 0.75, 0.90, 0.95, 0.98, 0.995):
+        cand.add(_pow2_ceil(_weighted_quantile_from_hist(node_hist, q)))
+    cand.add(_pow2_ceil(obs_max))
+    if hard_cap > 0:
+        cand = {int(min(int(x), hard_cap)) for x in cand if int(x) > 0}
+    bins = sorted({int(x) for x in cand if int(x) >= min_node})
+    if not bins:
+        bins = cur
+    while len(bins) > int(max(1, max_bins)):
+        sc = _score_bucket_plan(node_hist, bins, min_bin_groups=max(1, int(min_bin_groups)))
+        _ = sc
+        counts = {int(x): 0 for x in bins}
+        for n_raw, c_raw in node_hist.items():
+            n = int(n_raw)
+            c = int(c_raw)
+            if c <= 0 or n <= 0:
+                continue
+            for bn in bins:
+                if n <= int(bn):
+                    counts[int(bn)] = int(counts[int(bn)] + c)
+                    break
+        removable = bins[:-1] if len(bins) > 1 else bins
+        drop = min(removable, key=lambda x: int(counts.get(int(x), 0))) if removable else bins[0]
+        bins = [int(x) for x in bins if int(x) != int(drop)]
+        if not bins:
+            bins = cur
+            break
+    # Merge very sparse bins into coarser neighbors, except the largest "whale" bin.
+    while len(bins) > 1:
+        counts = {int(x): 0 for x in bins}
+        for n_raw, c_raw in node_hist.items():
+            n = int(n_raw)
+            c = int(c_raw)
+            if c <= 0 or n <= 0:
+                continue
+            for bn in bins:
+                if n <= int(bn):
+                    counts[int(bn)] = int(counts[int(bn)] + c)
+                    break
+        sparse = [int(bn) for bn in bins[:-1] if int(counts.get(int(bn), 0)) < int(min_bin_groups)]
+        if not sparse:
+            break
+        drop = int(min(sparse, key=lambda x: int(counts.get(int(x), 0))))
+        bins = [int(x) for x in bins if int(x) != int(drop)]
+    return sorted({int(x) for x in bins if int(x) >= min_node})
+
+
+def _maybe_autotune_whitening_bucket_nodes(state: LocateState, epoch: int) -> None:
+    p = state.params
+    try:
+        enabled = bool(p.get("_shared_event_re_enabled", False))
+        solver = str(p.get("_shared_event_re_solver_kind", "pcg")).strip().lower()
+        batched = bool(p.get("_shared_event_re_solver_batched", True))
+    except Exception:
+        return
+    if (not enabled) or (solver != "pcg") or (not batched):
+        return
+    if bool(p.get("_shared_event_re_autotune_done", False)):
+        return
+    if not bool(p.get("_shared_event_re_autotune_enabled", True)):
+        p["_shared_event_re_autotune_done"] = True
+        return
+
+    observe_epochs = max(1, int(p.get("_shared_event_re_autotune_observe_epochs", 1) or 1))
+    latest_epoch = max(observe_epochs, int(p.get("_shared_event_re_autotune_latest_epoch", 2) or 2))
+    e1 = int(epoch + 1)
+    if e1 < observe_epochs:
+        return
+    if e1 > latest_epoch:
+        p["_shared_event_re_autotune_done"] = True
+        return
+
+    node_hist_raw = p.get("_shared_event_re_whitening_epoch_node_hist", None)
+    if not isinstance(node_hist_raw, dict) or len(node_hist_raw) == 0:
+        return
+    node_hist: dict[int, int] = {}
+    for k, v in node_hist_raw.items():
+        try:
+            kk = int(k)
+            vv = int(v)
+            if kk > 0 and vv > 0:
+                node_hist[kk] = int(node_hist.get(kk, 0) + vv)
+        except Exception:
+            continue
+    total_groups = int(sum(int(v) for v in node_hist.values()))
+    min_groups = max(1, int(p.get("_shared_event_re_autotune_min_groups", 128) or 128))
+    if total_groups < min_groups:
+        return
+
+    cur_raw = p.get("_shared_event_re_solver_bucket_nodes", None)
+    if isinstance(cur_raw, list) and len(cur_raw) > 0:
+        cur = sorted({int(x) for x in cur_raw if int(x) > 0})
+    else:
+        cur = [512, 1024, 2048, 4096, 8192, 16384, 32768]
+    cur = sorted({int(x) for x in cur if int(x) > 0})
+    if not cur:
+        cur = [512, 1024, 2048, 4096, 8192, 16384, 32768]
+
+    max_nodes_cap = int(p.get("_shared_event_re_max_nodes_per_group", max(cur)) or max(cur))
+    if bool(p.get("_shared_event_re_autotune_raise_nodes_cap", True)):
+        obs_max = int(max(node_hist.keys()))
+        cap_max = int(p.get("_shared_event_re_autotune_nodes_cap_max", 65536) or 65536)
+        target_cap = int(min(obs_max, cap_max))
+        if target_cap > max_nodes_cap:
+            p["_shared_event_re_max_nodes_per_group"] = int(target_cap)
+            max_nodes_cap = int(target_cap)
+            _log(
+                f"shared_event_re whitening auto-tune: max_nodes_per_group -> {int(target_cap)}",
+                section="LIKELIHOOD",
+            )
+
+    max_bins = max(2, int(p.get("_shared_event_re_autotune_max_bins", 8) or 8))
+    min_bin_groups = max(1, int(p.get("_shared_event_re_autotune_min_bin_groups", 24) or 24))
+    min_bucket_node = max(1, int(p.get("_shared_event_re_autotune_min_bucket_node", 512) or 512))
+    prop = _propose_bucket_nodes_from_hist(
+        node_hist=node_hist,
+        current=cur,
+        max_nodes_cap=max_nodes_cap,
+        max_bins=max_bins,
+        min_bin_groups=min_bin_groups,
+        min_bucket_node=min_bucket_node,
+    )
+    if not prop:
+        return
+    cur_score = _score_bucket_plan(node_hist, cur, min_bin_groups=min_bin_groups)
+    new_score = _score_bucket_plan(node_hist, prop, min_bin_groups=min_bin_groups)
+    gain = float(cur_score["score"] - new_score["score"]) / max(float(cur_score["score"]), 1e-12)
+    min_gain = float(p.get("_shared_event_re_autotune_min_gain", 0.08) or 0.08)
+    if prop != cur and (gain >= min_gain or float(new_score["leftovers"]) < float(cur_score["leftovers"])):
+        p["_shared_event_re_solver_bucket_nodes"] = [int(x) for x in prop]
+        p["_shared_event_re_autotune_done"] = True
+        p["_shared_event_re_autotune_report"] = {
+            "epoch": int(e1),
+            "groups": int(total_groups),
+            "old_buckets": list(cur),
+            "new_buckets": list(prop),
+            "score_old": float(cur_score["score"]),
+            "score_new": float(new_score["score"]),
+            "gain": float(gain),
+            "leftovers_old": float(cur_score["leftovers"]),
+            "leftovers_new": float(new_score["leftovers"]),
+        }
+        _log(
+            "shared_event_re whitening auto-tune buckets "
+            f"epoch={int(e1)} groups={int(total_groups)} "
+            f"old={cur} new={prop} gain={100.0*gain:.1f}% "
+            f"leftovers={int(cur_score['leftovers'])}->{int(new_score['leftovers'])}",
+            section="LIKELIHOOD",
+        )
+    elif e1 >= latest_epoch:
+        p["_shared_event_re_autotune_done"] = True
+
+
 def _phase2_preconditioner(
     state: LocateState, start_epoch: int = 0, skip_saving_first_epoch: bool = False, wandb_logger=None
 ) -> None:
@@ -1291,6 +1524,8 @@ def _phase2_preconditioner(
     for epoch in range(start_epoch, state.params["phase2_epochs"]):
         grad_clip_norm = float(state.params.get("sampler_grad_clip_norm", 0.0))
         metrics = _run_epoch(state, epoch, sampler, noise_scale_factor=0.0, grad_clip_norm=grad_clip_norm)
+        if ddp_main:
+            _maybe_autotune_whitening_bucket_nodes(state, epoch)
         
         # --- per-epoch summary (like phase 3 style) ---
         # Control MAD computation frequency to avoid full-dataset passes
@@ -4178,9 +4413,9 @@ def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
     try:
         if not bool(state.params.get("_shared_event_re_enabled", False)):
             return
-        if not bool(state.params.get("_shared_event_re_whitening_enabled", False)):
+        if not bool(state.params.get("_shared_event_re_enabled", False)):
             return
-        if not bool(state.params.get("_shared_event_re_whitening_precompute", False)):
+        if not bool(state.params.get("_shared_event_re_solver_precompute_enabled", False)):
             return
         event_batches = bool(state.params.get("event_batch_enable", False))
         if (not event_batches) and bool(state.params.get("batch_shuffle", True)):
@@ -4188,7 +4423,7 @@ def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
     except Exception:
         return
 
-    device_pref = str(state.params.get("_shared_event_re_whitening_precompute_device", "gpu")).strip().lower()
+    device_pref = str(state.params.get("_shared_event_re_solver_precompute_device", "gpu")).strip().lower()
     if device_pref not in {"gpu", "cpu"}:
         device_pref = "gpu"
     if device_pref == "cpu":
@@ -4200,7 +4435,7 @@ def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
     if N <= 0:
         return
 
-    cache = state.params.get("_shared_event_re_whitening_cache", None)
+    cache = state.params.get("_shared_event_re_solver_cache", None)
     if not isinstance(cache, dict):
         cache = {}
 
@@ -4218,22 +4453,22 @@ def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
     jitter0 = float(state.params.get("_shared_event_re_jitter0", 1e-8))
     max_rows_per_group = int(state.params.get("_shared_event_re_max_rows_per_group", 200000))
     max_nodes_per_group = int(state.params.get("_shared_event_re_max_nodes_per_group", 512))
-    solver = str(state.params.get("_shared_event_re_whitening_solver", "pcg")).strip().lower()
+    solver = str(state.params.get("_shared_event_re_solver_kind", "pcg")).strip().lower()
 
-    edge_weighting = str(state.params.get("_shared_event_re_whitening_edge_weighting", "uniform")).strip().lower()
-    edge_weight_ell_km = float(state.params.get("_shared_event_re_whitening_edge_weight_ell_km", 1.0))
-    edge_weight_eps_km = float(state.params.get("_shared_event_re_whitening_edge_weight_eps_km", 1e-3))
-    edge_weight_power = float(state.params.get("_shared_event_re_whitening_edge_weight_power", 1.0))
-    edge_weight_scale_km = float(state.params.get("_shared_event_re_whitening_edge_weight_scale_km", 1.0))
-    edge_weight_global_scale = float(state.params.get("_shared_event_re_whitening_edge_weight_global_scale", 1.0))
-    edge_weight_normalize = bool(state.params.get("_shared_event_re_whitening_edge_weight_normalize", False))
+    edge_weighting = str(state.params.get("_shared_event_re_edge_weight_mode", "uniform")).strip().lower()
+    edge_weight_ell_km = float(state.params.get("_shared_event_re_edge_weight_ell_km", 1.0))
+    edge_weight_eps_km = float(state.params.get("_shared_event_re_edge_weight_eps_km", 1e-3))
+    edge_weight_power = float(state.params.get("_shared_event_re_edge_weight_power", 1.0))
+    edge_weight_scale_km = float(state.params.get("_shared_event_re_edge_weight_scale_km", 1.0))
+    edge_weight_global_scale = float(state.params.get("_shared_event_re_edge_weight_global_scale", 1.0))
+    edge_weight_normalize = bool(state.params.get("_shared_event_re_edge_weight_normalize", False))
 
     X_event = None
     if edge_weighting in {"distance_rbf", "distance_linear", "distance_power"}:
-        X_event = state.params.get("_shared_event_re_whitening_X_event", None)
+        X_event = state.params.get("_shared_event_re_edge_weight_X_event", None)
         if not isinstance(X_event, torch.Tensor) or int(X_event.shape[0]) != int(state.X_src.shape[0]):
             X_event = (state.X_src + state.dX_src)[:, :3].detach().to(device=state.device, dtype=torch.float32)
-            state.params["_shared_event_re_whitening_X_event"] = X_event
+            state.params["_shared_event_re_edge_weight_X_event"] = X_event
 
     σp, σs = _current_noise_scales(state)
     σp = σp.to(device=state.device)
@@ -4370,13 +4605,13 @@ def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
         )
         cache[cache_key] = cache_entry
         try:
-            cache_max = int(state.params.get("_shared_event_re_whitening_cache_max_entries", 0) or 0)
+            cache_max = int(state.params.get("_shared_event_re_solver_cache_max_entries", 0) or 0)
             if cache_max > 0 and len(cache) > cache_max:
                 cache.pop(next(iter(cache)))
         except Exception:
             pass
 
-    state.params["_shared_event_re_whitening_cache"] = cache
+    state.params["_shared_event_re_solver_cache"] = cache
 
 
 def locate_all(

@@ -66,37 +66,51 @@
                 },
                 "shared_event_re": {
                     "enabled": true,
-                    "whitening_only_mode": true,
                     "grouping": "station_phase",
                     "tau_s": [0.033, 0.06],
                     "max_nodes_per_group": 25000,
                     "max_rows_per_group": 1500000,
-                    "solver": "pcg_sparse",
-                    "pcg_max_iters": 20,
-                    "pcg_tol": 5e-3,
-                    "cache_max_entries": 32,
-                    "gpu_max_groups_per_batch": 128,
-                    "gpu_max_edges_per_batch": 1500000,
-                    "gpu_reuse_pcg_init": true,
-                    "gpu_profile": true,
-                    "whitening": {
-                      "enabled": true,
-                      "solver": "pcg",
-                      "pcg_batched": true,
-                      "pcg_warm_start": true,
-                      "pcg_bucket_nodes": [4096, 16384, 25000],
-                      "pcg_max_iters": 100,
-                      "pcg_tol": 3e-4,
-                      "pcg_min_iters": 2,
-                      "precompute": true,
-                      "precompute_device": "gpu",
-                      "edge_weighting": "distance_power",
-                      "edge_weight_power": 0.25,
-                      "edge_weight_scale_km": 40.0,
-                      "edge_weight_global_scale": 1.0,
-                      "edge_weight_normalize": true,
-                      "edge_weight_eps_km": 1e-3,
-                      "cache_max_entries": 32
+                    "solver": {
+                        "kind": "pcg",
+                        "max_iters": 100,
+                        "min_iters": 2,
+                        "tol": 3e-4,
+                        "batched": true,
+                        "bucket_nodes": [4096, 16384, 25000],
+                        "warm_start": true,
+                        "cache_max_entries": 32,
+                        "profile_micro_steps": true,
+                        "merge_sparse_edge_bins": true,
+                        "min_groups_per_edge_bin": 32,
+                        "max_edge_bins_per_node": 4,
+                        "precompute": {
+                            "enabled": true,
+                            "device": "gpu"
+                        }
+                    },
+                    "edge_weights": {
+                        "mode": "distance_power",
+                        "power": 0.25,
+                        "scale_km": 40.0,
+                        "global_scale": 1.0,
+                        "normalize": true,
+                        "eps_km": 1e-3
+                    },
+                    "autotune": {
+                        "enabled": true,
+                        "observe_epochs": 1,
+                        "latest_epoch": 2,
+                        "min_groups": 128,
+                        "max_bins": 8,
+                        "min_bin_groups": 24,
+                        "min_bucket_node": 512,
+                        "min_gain": 0.08,
+                        "raise_nodes_cap": true,
+                        "nodes_cap_max": 65536
+                    },
+                    "logging": {
+                        "quiet": true,
+                        "stats_log_every_epochs": 0
                     }
                 }
             }

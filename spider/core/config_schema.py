@@ -754,7 +754,6 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
         "_student_t_nu": float(locate_student_t_nu),
         "_huber_delta": float(locate_huber_delta),
         "_shared_event_re_enabled": False,
-        "_shared_event_re_whitening_enabled": False,
     }
 
     # Validate sample likelihood (correlated Gaussian).
@@ -870,86 +869,100 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
 
     se_cfg = lk.get("shared_event_re", None)
     se_enabled = False
-    se_grouping = "station_phase"  # only supported value
-    se_cluster_mode = "none"  # 'none' or 'dd_khop' or 'component'
+    se_grouping = "station_phase"
+    se_cluster_mode = "none"
     se_cluster_k = 1
-    se_tau_ps = [0.0, 0.0]  # std in seconds for [P,S]; 0 disables (iid)
-    # Optional: hierarchical (cluster + event) random effects
-    se_hier_enabled = False
-    se_tau_event_ps = [0.0, 0.0]
-    se_tau_cluster_ps = [0.0, 0.0]
-    se_joint_ps = False
-    se_rho_ps = 0.0
+    se_tau_ps = [0.0, 0.0]
     se_max_nodes_per_group = 512
     se_max_rows_per_group = 200000
     se_fallback_to_diag = True
     se_abort_on_pcg_fallback = True
     se_jitter0 = 1e-8
     se_jitter_max = 1e-3
-    # Optional: internal runtime controls for station_phase caching/debugging
-    se_cache_max_entries = 4096
-    se_cache_log_every = 0
-    # Optional: GPU path controls (shared_event_re GPU batched PCG prototype)
-    se_gpu_enable = None
-    se_gpu_max_groups_per_batch = 64
-    se_gpu_profile = False
-    se_gpu_debug_max_groups = 0
-    se_gpu_max_edges_per_batch = 0
-    se_gpu_reuse_pcg_init = False
-    # Optional: whitening operator for shared_event_re (static covariance).
-    se_whiten_enabled = True
-    se_whiten_edge_weighting = "uniform"
-    se_whiten_edge_weight_ell_km = 1.0
-    se_whiten_edge_weight_eps_km = 1e-3
-    se_whiten_edge_weight_power = 1.0
-    se_whiten_edge_weight_scale_km = 1.0
-    se_whiten_edge_weight_global_scale = 1.0
-    se_whiten_edge_weight_normalize = False
-    se_whiten_cache_max_entries = 8
-    se_whiten_solver = "pcg"
-    se_whiten_pcg_max_iters = 200
-    se_whiten_pcg_tol = 1e-6
-    se_whiten_pcg_min_iters = 0
-    se_whiten_precompute = False
-    se_whiten_precompute_device = "gpu"
-    se_whiten_pcg_batched = True
-    se_whiten_pcg_warm_start = False
-    se_whitening_only_mode = True
-    se_whiten_pcg_bucket_nodes = [512, 1024, 2048, 4096, 8192, 16384, 32768]
-    # Optional: auto-tune caps if fallbacks occur
-    se_auto_tune_nodes_cap = False
-    se_auto_tune_nodes_max = 20000
-    se_auto_tune_rows_cap = False
-    se_auto_tune_rows_max = 2000000
-    # Optional: solver selection for shared_event_re
-    # Phase A implements `pcg_sparse` (quadratic-only; logdet dropped). A dense/exact solver may be
-    # added later for small groups (Phase B/C work).
-    se_solver = "pcg_sparse"  # 'pcg_sparse' (quadratic-only; logdet dropped)
-    se_drop_logdet = True
-    se_pcg_max_iters = 50
-    se_pcg_tol = 1e-3
-    # Optional: diagnostics logging for shared_event_re (cheap subsample stats for W&B)
-    se_diag_log_every_epochs = 0
-    se_diag_max_groups = 8
-    se_diag_max_rows_per_group = 2048
-    se_diag_max_nodes = 1024
-    se_diag_seed = 0
-    # Optional: console stats logging cadence for shared_event_re
     se_stats_log_every_epochs = 0
-    # Optional: collapsed station-phase random effects (additive)
     se_sp_enabled = False
     se_sp_tau_ps = [0.0, 0.0]
+    # Unified solver contract
+    se_solver_kind = "pcg"
+    se_solver_max_iters = 50
+    se_solver_min_iters = 2
+    se_solver_tol = 1e-3
+    se_solver_batched = True
+    se_solver_bucket_nodes = [512, 1024, 2048, 4096, 8192, 16384, 32768]
+    se_solver_warm_start = False
+    se_solver_cache_max_entries = 8
+    se_solver_profile_micro_steps = False
+    se_solver_merge_sparse_edge_bins = True
+    se_solver_min_groups_per_edge_bin = 32
+    se_solver_max_edge_bins_per_node = 4
+    se_solver_precompute_enabled = False
+    se_solver_precompute_device = "gpu"
+    # Unified edge-weight block
+    se_edge_weight_mode = "uniform"
+    se_edge_weight_ell_km = 1.0
+    se_edge_weight_eps_km = 1e-3
+    se_edge_weight_power = 1.0
+    se_edge_weight_scale_km = 1.0
+    se_edge_weight_global_scale = 1.0
+    se_edge_weight_normalize = False
+    # Unified autotune block
+    se_autotune_enabled = True
+    se_autotune_observe_epochs = 1
+    se_autotune_latest_epoch = 2
+    se_autotune_min_groups = 128
+    se_autotune_max_bins = 8
+    se_autotune_min_bin_groups = 24
+    se_autotune_min_bucket_node = 512
+    se_autotune_min_gain = 0.08
+    se_autotune_raise_nodes_cap = True
+    se_autotune_nodes_cap_max = 65536
+    # Unified logging block
+    se_logging_quiet = True
+
     if isinstance(se_cfg, dict):
         se_enabled = bool(se_cfg.get("enabled", False))
+        legacy_keys = [
+            "whitening_only_mode",
+            "whitening",
+            "pcg_max_iters",
+            "pcg_tol",
+            "drop_logdet",
+            "gpu_enable",
+            "gpu_max_groups_per_batch",
+            "gpu_profile",
+            "gpu_debug_max_groups",
+            "gpu_max_edges_per_batch",
+            "gpu_reuse_pcg_init",
+            "cache_max_entries",
+            "cache_log_every",
+            "auto_tune_nodes_cap",
+            "auto_tune_nodes_max",
+            "auto_tune_rows_cap",
+            "auto_tune_rows_max",
+            "joint_ps",
+            "rho_ps",
+            "hierarchical",
+            "tau_event_s",
+            "tau_cluster_s",
+        ]
+        for k_legacy in legacy_keys:
+            if k_legacy in se_cfg:
+                raise _err(
+                    f"model.likelihood.shared_event_re.{k_legacy}",
+                    "removed; use the unified shared_event_re schema (solver/edge_weights/autotune/logging blocks)",
+                )
+        if "solver" in se_cfg and se_cfg.get("solver", None) is not None and not isinstance(se_cfg.get("solver"), dict):
+            raise _err("model.likelihood.shared_event_re.solver", "must be an object with the unified solver fields")
+        if "edge_weights" in se_cfg and se_cfg.get("edge_weights", None) is not None and not isinstance(se_cfg.get("edge_weights"), dict):
+            raise _err("model.likelihood.shared_event_re.edge_weights", "must be an object")
+        if "autotune" in se_cfg and se_cfg.get("autotune", None) is not None and not isinstance(se_cfg.get("autotune"), dict):
+            raise _err("model.likelihood.shared_event_re.autotune", "must be an object")
+        if "logging" in se_cfg and se_cfg.get("logging", None) is not None and not isinstance(se_cfg.get("logging"), dict):
+            raise _err("model.likelihood.shared_event_re.logging", "must be an object")
         if "grouping" in se_cfg and se_cfg["grouping"] is not None:
             se_grouping = str(se_cfg.get("grouping", "station_phase")).strip().lower()
         if se_grouping in {"stationphase", "station-phase"}:
             se_grouping = "station_phase"
-        if se_grouping == "phase":
-            raise _err(
-                "model.likelihood.shared_event_re.grouping",
-                "'phase' was removed; use 'station_phase'",
-            )
         if se_grouping != "station_phase":
             raise _err("model.likelihood.shared_event_re.grouping", "supported: 'station_phase'")
         if "cluster_mode" in se_cfg and se_cfg["cluster_mode"] is not None:
@@ -964,85 +977,17 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
             se_cluster_k = int(_require_num(se_cfg.get("cluster_k"), "model.likelihood.shared_event_re.cluster_k"))
             if se_cluster_k < 0:
                 raise _err("model.likelihood.shared_event_re.cluster_k", "must be >= 0")
-
         if "tau_s" in se_cfg and se_cfg["tau_s"] is not None:
-            v = se_cfg["tau_s"]
-            if isinstance(v, (int, float)):
-                f = float(v)
-                se_tau_ps = [f, f]
-            elif isinstance(v, list):
-                se_tau_ps = _require_float_list(v, "likelihood.shared_event_re.tau_s", length=2)
+            v_tau = se_cfg["tau_s"]
+            if isinstance(v_tau, (int, float)):
+                f_tau = float(v_tau)
+                se_tau_ps = [f_tau, f_tau]
+            elif isinstance(v_tau, list):
+                se_tau_ps = _require_float_list(v_tau, "likelihood.shared_event_re.tau_s", length=2)
             else:
-                raise _err("model.likelihood.shared_event_re.tau_s", f"expected number or [P,S] list, got {type(v).__name__}")
+                raise _err("model.likelihood.shared_event_re.tau_s", f"expected number or [P,S] list, got {type(v_tau).__name__}")
         if not (se_tau_ps[0] >= 0.0 and se_tau_ps[1] >= 0.0):
             raise _err("model.likelihood.shared_event_re.tau_s", "must be >= 0")
-
-        if "hierarchical" in se_cfg and se_cfg["hierarchical"] is not None:
-            se_hier_enabled = bool(_require_bool(se_cfg.get("hierarchical"), "model.likelihood.shared_event_re.hierarchical"))
-        if "tau_event_s" in se_cfg and se_cfg["tau_event_s"] is not None:
-            v = se_cfg["tau_event_s"]
-            if isinstance(v, (int, float)):
-                f = float(v)
-                se_tau_event_ps = [f, f]
-            elif isinstance(v, list):
-                se_tau_event_ps = _require_float_list(v, "likelihood.shared_event_re.tau_event_s", length=2)
-            else:
-                raise _err("model.likelihood.shared_event_re.tau_event_s", f"expected number or [P,S] list, got {type(v).__name__}")
-        if "tau_cluster_s" in se_cfg and se_cfg["tau_cluster_s"] is not None:
-            v = se_cfg["tau_cluster_s"]
-            if isinstance(v, (int, float)):
-                f = float(v)
-                se_tau_cluster_ps = [f, f]
-            elif isinstance(v, list):
-                se_tau_cluster_ps = _require_float_list(v, "likelihood.shared_event_re.tau_cluster_s", length=2)
-            else:
-                raise _err("model.likelihood.shared_event_re.tau_cluster_s", f"expected number or [P,S] list, got {type(v).__name__}")
-        if se_hier_enabled:
-            if not (se_tau_event_ps[0] >= 0.0 and se_tau_event_ps[1] >= 0.0):
-                raise _err("model.likelihood.shared_event_re.tau_event_s", "must be >= 0")
-            if not (se_tau_cluster_ps[0] >= 0.0 and se_tau_cluster_ps[1] >= 0.0):
-                raise _err("model.likelihood.shared_event_re.tau_cluster_s", "must be >= 0")
-
-        # Optional: station-phase random effects (collapsed)
-        sp_cfg = se_cfg.get("station_phase_re", None)
-        if isinstance(sp_cfg, dict):
-            se_sp_enabled = bool(sp_cfg.get("enabled", False))
-            if "tau_s" in sp_cfg and sp_cfg.get("tau_s", None) is not None:
-                v = sp_cfg.get("tau_s")
-                if isinstance(v, (int, float)):
-                    f = float(v)
-                    se_sp_tau_ps = [f, f]
-                elif isinstance(v, list):
-                    se_sp_tau_ps = _require_float_list(v, "likelihood.shared_event_re.station_phase_re.tau_s", length=2)
-                else:
-                    raise _err(
-                        "model.likelihood.shared_event_re.station_phase_re.tau_s",
-                        f"expected number or [P,S] list, got {type(v).__name__}",
-                    )
-            if se_sp_enabled and (not (se_sp_tau_ps[0] >= 0.0 and se_sp_tau_ps[1] >= 0.0)):
-                raise _err("model.likelihood.shared_event_re.station_phase_re.tau_s", "must be >= 0")
-
-    if lk_correlated:
-        if not isinstance(se_cfg, dict):
-            raise _err(
-                "model.likelihood.shared_event_re",
-                "required when model.likelihood.type is 'correlated'/'correlated_gaussian'",
-            )
-        if not se_enabled:
-            raise _err(
-                "model.likelihood.shared_event_re.enabled",
-                "must be true when model.likelihood.type is 'correlated'/'correlated_gaussian'",
-            )
-        if (not isinstance(se_cfg, dict)) or ("grouping" not in se_cfg):
-            se_grouping = "station_phase"
-
-        if "joint_ps" in se_cfg and se_cfg["joint_ps"] is not None:
-            se_joint_ps = bool(se_cfg.get("joint_ps", False))
-        if "rho_ps" in se_cfg and se_cfg["rho_ps"] is not None:
-            se_rho_ps = float(_require_num(se_cfg["rho_ps"], "model.likelihood.shared_event_re.rho_ps"))
-            if not (-0.999 < se_rho_ps < 0.999):
-                raise _err("model.likelihood.shared_event_re.rho_ps", "must satisfy -0.999 < rho_ps < 0.999")
-
         if "max_nodes_per_group" in se_cfg and se_cfg["max_nodes_per_group"] is not None:
             se_max_nodes_per_group = int(_require_num(se_cfg["max_nodes_per_group"], "model.likelihood.shared_event_re.max_nodes_per_group"))
             if se_max_nodes_per_group < 2:
@@ -1068,213 +1013,155 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
         if se_jitter_max < se_jitter0:
             raise _err("model.likelihood.shared_event_re.jitter_max", "must be >= jitter0")
 
-        if "cache_max_entries" in se_cfg and se_cfg["cache_max_entries"] is not None:
-            se_cache_max_entries = int(_require_num(se_cfg["cache_max_entries"], "model.likelihood.shared_event_re.cache_max_entries"))
-            if se_cache_max_entries < 0:
-                raise _err("model.likelihood.shared_event_re.cache_max_entries", "must be >= 0")
-        if "cache_log_every" in se_cfg and se_cfg["cache_log_every"] is not None:
-            se_cache_log_every = int(_require_num(se_cfg["cache_log_every"], "model.likelihood.shared_event_re.cache_log_every"))
-            if se_cache_log_every < 0:
-                raise _err("model.likelihood.shared_event_re.cache_log_every", "must be >= 0")
-
-        if "gpu_enable" in se_cfg and se_cfg["gpu_enable"] is not None:
-            se_gpu_enable = bool(_require_bool(se_cfg.get("gpu_enable"), "model.likelihood.shared_event_re.gpu_enable"))
-        if "gpu_max_groups_per_batch" in se_cfg and se_cfg["gpu_max_groups_per_batch"] is not None:
-            se_gpu_max_groups_per_batch = int(
-                _require_num(se_cfg.get("gpu_max_groups_per_batch"), "model.likelihood.shared_event_re.gpu_max_groups_per_batch")
-            )
-            if se_gpu_max_groups_per_batch < 1:
-                raise _err("model.likelihood.shared_event_re.gpu_max_groups_per_batch", "must be >= 1")
-        if "gpu_profile" in se_cfg and se_cfg["gpu_profile"] is not None:
-            se_gpu_profile = bool(_require_bool(se_cfg.get("gpu_profile"), "model.likelihood.shared_event_re.gpu_profile"))
-        if "gpu_debug_max_groups" in se_cfg and se_cfg["gpu_debug_max_groups"] is not None:
-            se_gpu_debug_max_groups = int(
-                _require_num(se_cfg.get("gpu_debug_max_groups"), "model.likelihood.shared_event_re.gpu_debug_max_groups")
-            )
-            if se_gpu_debug_max_groups < 0:
-                raise _err("model.likelihood.shared_event_re.gpu_debug_max_groups", "must be >= 0")
-        if "gpu_max_edges_per_batch" in se_cfg and se_cfg["gpu_max_edges_per_batch"] is not None:
-            se_gpu_max_edges_per_batch = int(
-                _require_num(se_cfg.get("gpu_max_edges_per_batch"), "model.likelihood.shared_event_re.gpu_max_edges_per_batch")
-            )
-            if se_gpu_max_edges_per_batch < 0:
-                raise _err("model.likelihood.shared_event_re.gpu_max_edges_per_batch", "must be >= 0")
-        if "gpu_reuse_pcg_init" in se_cfg and se_cfg["gpu_reuse_pcg_init"] is not None:
-            se_gpu_reuse_pcg_init = bool(_require_bool(se_cfg.get("gpu_reuse_pcg_init"), "model.likelihood.shared_event_re.gpu_reuse_pcg_init"))
-        if "stats_log_every_epochs" in se_cfg and se_cfg["stats_log_every_epochs"] is not None:
-            se_stats_log_every_epochs = int(
-                _require_num(se_cfg.get("stats_log_every_epochs"), "model.likelihood.shared_event_re.stats_log_every_epochs")
-            )
-            if se_stats_log_every_epochs < 0:
-                raise _err("model.likelihood.shared_event_re.stats_log_every_epochs", "must be >= 0")
-        if "whitening_only_mode" in se_cfg and se_cfg["whitening_only_mode"] is not None:
-            se_whitening_only_mode = bool(
-                _require_bool(se_cfg.get("whitening_only_mode"), "model.likelihood.shared_event_re.whitening_only_mode")
-            )
-        whiten_cfg = se_cfg.get("whitening", None)
-        if isinstance(whiten_cfg, dict):
-            if "enabled" in whiten_cfg and whiten_cfg.get("enabled", None) is not None:
-                se_whiten_enabled = bool(_require_bool(whiten_cfg.get("enabled"), "model.likelihood.shared_event_re.whitening.enabled"))
-            if "solver" in whiten_cfg and whiten_cfg.get("solver", None) is not None:
-                se_whiten_solver = str(whiten_cfg.get("solver", se_whiten_solver)).strip().lower()
-                if se_whiten_solver not in {"chol", "pcg"}:
+        sp_cfg = se_cfg.get("station_phase_re", None)
+        if isinstance(sp_cfg, dict):
+            se_sp_enabled = bool(sp_cfg.get("enabled", False))
+            if "tau_s" in sp_cfg and sp_cfg.get("tau_s", None) is not None:
+                v_sp = sp_cfg.get("tau_s")
+                if isinstance(v_sp, (int, float)):
+                    f_sp = float(v_sp)
+                    se_sp_tau_ps = [f_sp, f_sp]
+                elif isinstance(v_sp, list):
+                    se_sp_tau_ps = _require_float_list(v_sp, "likelihood.shared_event_re.station_phase_re.tau_s", length=2)
+                else:
                     raise _err(
-                        "model.likelihood.shared_event_re.whitening.solver",
-                        "supported: 'chol', 'pcg'",
+                        "model.likelihood.shared_event_re.station_phase_re.tau_s",
+                        f"expected number or [P,S] list, got {type(v_sp).__name__}",
                     )
-            if "edge_weighting" in whiten_cfg and whiten_cfg.get("edge_weighting", None) is not None:
-                se_whiten_edge_weighting = str(whiten_cfg.get("edge_weighting", se_whiten_edge_weighting)).strip().lower()
-            if se_whiten_edge_weighting not in {"uniform", "distance_rbf", "distance_linear", "distance_power"}:
-                raise _err(
-                    "model.likelihood.shared_event_re.whitening.edge_weighting",
-                    "supported: 'uniform', 'distance_rbf', 'distance_linear', 'distance_power'",
-                )
-            if "edge_weight_ell_km" in whiten_cfg and whiten_cfg.get("edge_weight_ell_km", None) is not None:
-                se_whiten_edge_weight_ell_km = float(
-                    _require_num(whiten_cfg.get("edge_weight_ell_km"), "model.likelihood.shared_event_re.whitening.edge_weight_ell_km")
-                )
-                if not (se_whiten_edge_weight_ell_km > 0.0):
-                    raise _err("model.likelihood.shared_event_re.whitening.edge_weight_ell_km", "must be > 0")
-            if "edge_weight_eps_km" in whiten_cfg and whiten_cfg.get("edge_weight_eps_km", None) is not None:
-                se_whiten_edge_weight_eps_km = float(
-                    _require_num(whiten_cfg.get("edge_weight_eps_km"), "model.likelihood.shared_event_re.whitening.edge_weight_eps_km")
-                )
-                if not (se_whiten_edge_weight_eps_km >= 0.0):
-                    raise _err("model.likelihood.shared_event_re.whitening.edge_weight_eps_km", "must be >= 0")
-            if "edge_weight_power" in whiten_cfg and whiten_cfg.get("edge_weight_power", None) is not None:
-                se_whiten_edge_weight_power = float(
-                    _require_num(whiten_cfg.get("edge_weight_power"), "model.likelihood.shared_event_re.whitening.edge_weight_power")
-                )
-                if not (se_whiten_edge_weight_power > 0.0):
-                    raise _err("model.likelihood.shared_event_re.whitening.edge_weight_power", "must be > 0")
-            if "edge_weight_scale_km" in whiten_cfg and whiten_cfg.get("edge_weight_scale_km", None) is not None:
-                se_whiten_edge_weight_scale_km = float(
-                    _require_num(whiten_cfg.get("edge_weight_scale_km"), "model.likelihood.shared_event_re.whitening.edge_weight_scale_km")
-                )
-                if not (se_whiten_edge_weight_scale_km > 0.0):
-                    raise _err("model.likelihood.shared_event_re.whitening.edge_weight_scale_km", "must be > 0")
-            if "edge_weight_global_scale" in whiten_cfg and whiten_cfg.get("edge_weight_global_scale", None) is not None:
-                se_whiten_edge_weight_global_scale = float(
-                    _require_num(whiten_cfg.get("edge_weight_global_scale"), "model.likelihood.shared_event_re.whitening.edge_weight_global_scale")
-                )
-                if not (se_whiten_edge_weight_global_scale > 0.0):
-                    raise _err("model.likelihood.shared_event_re.whitening.edge_weight_global_scale", "must be > 0")
-            if "edge_weight_normalize" in whiten_cfg and whiten_cfg.get("edge_weight_normalize", None) is not None:
-                se_whiten_edge_weight_normalize = bool(
-                    _require_bool(whiten_cfg.get("edge_weight_normalize"), "model.likelihood.shared_event_re.whitening.edge_weight_normalize")
-                )
-            if "cache_max_entries" in whiten_cfg and whiten_cfg.get("cache_max_entries", None) is not None:
-                se_whiten_cache_max_entries = int(
-                    _require_num(whiten_cfg.get("cache_max_entries"), "model.likelihood.shared_event_re.whitening.cache_max_entries")
-                )
-                if se_whiten_cache_max_entries < 0:
-                    raise _err("model.likelihood.shared_event_re.whitening.cache_max_entries", "must be >= 0")
-            if "precompute" in whiten_cfg and whiten_cfg.get("precompute", None) is not None:
-                se_whiten_precompute = bool(
-                    _require_bool(whiten_cfg.get("precompute"), "model.likelihood.shared_event_re.whitening.precompute")
-                )
-            if "precompute_device" in whiten_cfg and whiten_cfg.get("precompute_device", None) is not None:
-                se_whiten_precompute_device = str(
-                    whiten_cfg.get("precompute_device", se_whiten_precompute_device)
-                ).strip().lower()
-                if se_whiten_precompute_device not in {"gpu", "cpu"}:
-                    raise _err("model.likelihood.shared_event_re.whitening.precompute_device", "must be 'gpu' or 'cpu'")
-            if "pcg_max_iters" in whiten_cfg and whiten_cfg.get("pcg_max_iters", None) is not None:
-                se_whiten_pcg_max_iters = int(
-                    _require_num(whiten_cfg.get("pcg_max_iters"), "model.likelihood.shared_event_re.whitening.pcg_max_iters")
-                )
-                if se_whiten_pcg_max_iters <= 0:
-                    raise _err("model.likelihood.shared_event_re.whitening.pcg_max_iters", "must be > 0")
-            if "pcg_tol" in whiten_cfg and whiten_cfg.get("pcg_tol", None) is not None:
-                se_whiten_pcg_tol = float(
-                    _require_num(whiten_cfg.get("pcg_tol"), "model.likelihood.shared_event_re.whitening.pcg_tol")
-                )
-                if not (se_whiten_pcg_tol > 0.0):
-                    raise _err("model.likelihood.shared_event_re.whitening.pcg_tol", "must be > 0")
-            if "pcg_min_iters" in whiten_cfg and whiten_cfg.get("pcg_min_iters", None) is not None:
-                se_whiten_pcg_min_iters = int(
-                    _require_num(whiten_cfg.get("pcg_min_iters"), "model.likelihood.shared_event_re.whitening.pcg_min_iters")
-                )
-                if se_whiten_pcg_min_iters < 0:
-                    raise _err("model.likelihood.shared_event_re.whitening.pcg_min_iters", "must be >= 0")
-            if "pcg_batched" in whiten_cfg and whiten_cfg.get("pcg_batched", None) is not None:
-                se_whiten_pcg_batched = bool(
-                    _require_bool(whiten_cfg.get("pcg_batched"), "model.likelihood.shared_event_re.whitening.pcg_batched")
-                )
-            if "pcg_warm_start" in whiten_cfg and whiten_cfg.get("pcg_warm_start", None) is not None:
-                se_whiten_pcg_warm_start = bool(
-                    _require_bool(whiten_cfg.get("pcg_warm_start"), "model.likelihood.shared_event_re.whitening.pcg_warm_start")
-                )
-            if "pcg_bucket_nodes" in whiten_cfg and whiten_cfg.get("pcg_bucket_nodes", None) is not None:
-                v = whiten_cfg.get("pcg_bucket_nodes")
-                if not isinstance(v, (list, tuple)) or not v:
-                    raise _err("model.likelihood.shared_event_re.whitening.pcg_bucket_nodes", "must be a non-empty list of ints")
+            if se_sp_enabled and (not (se_sp_tau_ps[0] >= 0.0 and se_sp_tau_ps[1] >= 0.0)):
+                raise _err("model.likelihood.shared_event_re.station_phase_re.tau_s", "must be >= 0")
+
+        solver_cfg = se_cfg.get("solver", None)
+        if isinstance(solver_cfg, dict):
+            if "kind" in solver_cfg and solver_cfg.get("kind", None) is not None:
+                se_solver_kind = str(solver_cfg.get("kind", se_solver_kind)).strip().lower()
+            if se_solver_kind != "pcg":
+                raise _err("model.likelihood.shared_event_re.solver.kind", "supported: 'pcg'")
+            if "max_iters" in solver_cfg and solver_cfg.get("max_iters", None) is not None:
+                se_solver_max_iters = int(_require_num(solver_cfg.get("max_iters"), "model.likelihood.shared_event_re.solver.max_iters"))
+                if se_solver_max_iters <= 0:
+                    raise _err("model.likelihood.shared_event_re.solver.max_iters", "must be > 0")
+            if "min_iters" in solver_cfg and solver_cfg.get("min_iters", None) is not None:
+                se_solver_min_iters = int(_require_num(solver_cfg.get("min_iters"), "model.likelihood.shared_event_re.solver.min_iters"))
+                if se_solver_min_iters < 0:
+                    raise _err("model.likelihood.shared_event_re.solver.min_iters", "must be >= 0")
+            if "tol" in solver_cfg and solver_cfg.get("tol", None) is not None:
+                se_solver_tol = float(_require_num(solver_cfg.get("tol"), "model.likelihood.shared_event_re.solver.tol"))
+                if not (se_solver_tol > 0.0):
+                    raise _err("model.likelihood.shared_event_re.solver.tol", "must be > 0")
+            if "batched" in solver_cfg and solver_cfg.get("batched", None) is not None:
+                se_solver_batched = bool(_require_bool(solver_cfg.get("batched"), "model.likelihood.shared_event_re.solver.batched"))
+            if "bucket_nodes" in solver_cfg and solver_cfg.get("bucket_nodes", None) is not None:
+                v_nodes = solver_cfg.get("bucket_nodes")
+                if not isinstance(v_nodes, (list, tuple)) or not v_nodes:
+                    raise _err("model.likelihood.shared_event_re.solver.bucket_nodes", "must be a non-empty list of ints")
                 try:
-                    se_whiten_pcg_bucket_nodes = [int(x) for x in v]
+                    se_solver_bucket_nodes = [int(x) for x in v_nodes]
                 except Exception:
-                    raise _err("model.likelihood.shared_event_re.whitening.pcg_bucket_nodes", "must be a list of ints")
-                if any(x <= 0 for x in se_whiten_pcg_bucket_nodes):
-                    raise _err("model.likelihood.shared_event_re.whitening.pcg_bucket_nodes", "all values must be > 0")
-        if bool(se_whitening_only_mode) and (not bool(se_whiten_enabled)):
-            raise _err(
-                "model.likelihood.shared_event_re.whitening.enabled",
-                "must be true when model.likelihood.shared_event_re.whitening_only_mode=true",
-            )
-        if "auto_tune_nodes_cap" in se_cfg and se_cfg["auto_tune_nodes_cap"] is not None:
-            se_auto_tune_nodes_cap = bool(_require_bool(se_cfg.get("auto_tune_nodes_cap"), "model.likelihood.shared_event_re.auto_tune_nodes_cap"))
-        if "auto_tune_nodes_max" in se_cfg and se_cfg["auto_tune_nodes_max"] is not None:
-            se_auto_tune_nodes_max = int(
-                _require_num(se_cfg.get("auto_tune_nodes_max"), "model.likelihood.shared_event_re.auto_tune_nodes_max")
-            )
-            if se_auto_tune_nodes_max < 1:
-                raise _err("model.likelihood.shared_event_re.auto_tune_nodes_max", "must be >= 1")
-        if "auto_tune_rows_cap" in se_cfg and se_cfg["auto_tune_rows_cap"] is not None:
-            se_auto_tune_rows_cap = bool(_require_bool(se_cfg.get("auto_tune_rows_cap"), "model.likelihood.shared_event_re.auto_tune_rows_cap"))
-        if "auto_tune_rows_max" in se_cfg and se_cfg["auto_tune_rows_max"] is not None:
-            se_auto_tune_rows_max = int(
-                _require_num(se_cfg.get("auto_tune_rows_max"), "model.likelihood.shared_event_re.auto_tune_rows_max")
-            )
-            if se_auto_tune_rows_max < 1:
-                raise _err("model.likelihood.shared_event_re.auto_tune_rows_max", "must be >= 1")
+                    raise _err("model.likelihood.shared_event_re.solver.bucket_nodes", "must be a list of ints")
+                if any(x <= 0 for x in se_solver_bucket_nodes):
+                    raise _err("model.likelihood.shared_event_re.solver.bucket_nodes", "all values must be > 0")
+            if "warm_start" in solver_cfg and solver_cfg.get("warm_start", None) is not None:
+                se_solver_warm_start = bool(_require_bool(solver_cfg.get("warm_start"), "model.likelihood.shared_event_re.solver.warm_start"))
+            if "cache_max_entries" in solver_cfg and solver_cfg.get("cache_max_entries", None) is not None:
+                se_solver_cache_max_entries = int(
+                    _require_num(solver_cfg.get("cache_max_entries"), "model.likelihood.shared_event_re.solver.cache_max_entries")
+                )
+                if se_solver_cache_max_entries < 0:
+                    raise _err("model.likelihood.shared_event_re.solver.cache_max_entries", "must be >= 0")
+            if "profile_micro_steps" in solver_cfg and solver_cfg.get("profile_micro_steps", None) is not None:
+                se_solver_profile_micro_steps = bool(
+                    _require_bool(solver_cfg.get("profile_micro_steps"), "model.likelihood.shared_event_re.solver.profile_micro_steps")
+                )
+            if "merge_sparse_edge_bins" in solver_cfg and solver_cfg.get("merge_sparse_edge_bins", None) is not None:
+                se_solver_merge_sparse_edge_bins = bool(
+                    _require_bool(solver_cfg.get("merge_sparse_edge_bins"), "model.likelihood.shared_event_re.solver.merge_sparse_edge_bins")
+                )
+            if "min_groups_per_edge_bin" in solver_cfg and solver_cfg.get("min_groups_per_edge_bin", None) is not None:
+                se_solver_min_groups_per_edge_bin = int(
+                    _require_num(solver_cfg.get("min_groups_per_edge_bin"), "model.likelihood.shared_event_re.solver.min_groups_per_edge_bin")
+                )
+                if se_solver_min_groups_per_edge_bin < 1:
+                    raise _err("model.likelihood.shared_event_re.solver.min_groups_per_edge_bin", "must be >= 1")
+            if "max_edge_bins_per_node" in solver_cfg and solver_cfg.get("max_edge_bins_per_node", None) is not None:
+                se_solver_max_edge_bins_per_node = int(
+                    _require_num(solver_cfg.get("max_edge_bins_per_node"), "model.likelihood.shared_event_re.solver.max_edge_bins_per_node")
+                )
+                if se_solver_max_edge_bins_per_node < 1:
+                    raise _err("model.likelihood.shared_event_re.solver.max_edge_bins_per_node", "must be >= 1")
+            pre_cfg = solver_cfg.get("precompute", None)
+            if isinstance(pre_cfg, dict):
+                if "enabled" in pre_cfg and pre_cfg.get("enabled", None) is not None:
+                    se_solver_precompute_enabled = bool(
+                        _require_bool(pre_cfg.get("enabled"), "model.likelihood.shared_event_re.solver.precompute.enabled")
+                    )
+                if "device" in pre_cfg and pre_cfg.get("device", None) is not None:
+                    se_solver_precompute_device = str(pre_cfg.get("device", se_solver_precompute_device)).strip().lower()
+                    if se_solver_precompute_device not in {"gpu", "cpu"}:
+                        raise _err("model.likelihood.shared_event_re.solver.precompute.device", "must be 'gpu' or 'cpu'")
 
-        if "solver" in se_cfg and se_cfg["solver"] is not None:
-            se_solver = str(se_cfg.get("solver", se_solver)).strip().lower()
-        if se_solver in {"pcg", "pcg-sparse", "pcg_sparse"}:
-            se_solver = "pcg_sparse"
-        if se_solver not in {"dense", "pcg_sparse"}:
-            raise _err("model.likelihood.shared_event_re.solver", "supported: 'dense', 'pcg_sparse'")
-        if "drop_logdet" in se_cfg and se_cfg["drop_logdet"] is not None:
-            se_drop_logdet = bool(se_cfg.get("drop_logdet", True))
-        if "pcg_max_iters" in se_cfg and se_cfg["pcg_max_iters"] is not None:
-            se_pcg_max_iters = int(_require_num(se_cfg["pcg_max_iters"], "model.likelihood.shared_event_re.pcg_max_iters"))
-            if se_pcg_max_iters < 1:
-                raise _err("model.likelihood.shared_event_re.pcg_max_iters", "must be >= 1")
-        if "pcg_tol" in se_cfg and se_cfg["pcg_tol"] is not None:
-            se_pcg_tol = float(_require_num(se_cfg["pcg_tol"], "model.likelihood.shared_event_re.pcg_tol"))
-            if not (se_pcg_tol > 0.0):
-                raise _err("model.likelihood.shared_event_re.pcg_tol", "must be > 0")
+        ew_cfg = se_cfg.get("edge_weights", None)
+        if isinstance(ew_cfg, dict):
+            if "mode" in ew_cfg and ew_cfg.get("mode", None) is not None:
+                se_edge_weight_mode = str(ew_cfg.get("mode", se_edge_weight_mode)).strip().lower()
+            if se_edge_weight_mode not in {"uniform", "distance_rbf", "distance_linear", "distance_power"}:
+                raise _err("model.likelihood.shared_event_re.edge_weights.mode", "supported: 'uniform', 'distance_rbf', 'distance_linear', 'distance_power'")
+            if "ell_km" in ew_cfg and ew_cfg.get("ell_km", None) is not None:
+                se_edge_weight_ell_km = float(_require_num(ew_cfg.get("ell_km"), "model.likelihood.shared_event_re.edge_weights.ell_km"))
+                if not (se_edge_weight_ell_km > 0.0):
+                    raise _err("model.likelihood.shared_event_re.edge_weights.ell_km", "must be > 0")
+            if "eps_km" in ew_cfg and ew_cfg.get("eps_km", None) is not None:
+                se_edge_weight_eps_km = float(_require_num(ew_cfg.get("eps_km"), "model.likelihood.shared_event_re.edge_weights.eps_km"))
+                if not (se_edge_weight_eps_km >= 0.0):
+                    raise _err("model.likelihood.shared_event_re.edge_weights.eps_km", "must be >= 0")
+            if "power" in ew_cfg and ew_cfg.get("power", None) is not None:
+                se_edge_weight_power = float(_require_num(ew_cfg.get("power"), "model.likelihood.shared_event_re.edge_weights.power"))
+                if not (se_edge_weight_power > 0.0):
+                    raise _err("model.likelihood.shared_event_re.edge_weights.power", "must be > 0")
+            if "scale_km" in ew_cfg and ew_cfg.get("scale_km", None) is not None:
+                se_edge_weight_scale_km = float(_require_num(ew_cfg.get("scale_km"), "model.likelihood.shared_event_re.edge_weights.scale_km"))
+                if not (se_edge_weight_scale_km > 0.0):
+                    raise _err("model.likelihood.shared_event_re.edge_weights.scale_km", "must be > 0")
+            if "global_scale" in ew_cfg and ew_cfg.get("global_scale", None) is not None:
+                se_edge_weight_global_scale = float(_require_num(ew_cfg.get("global_scale"), "model.likelihood.shared_event_re.edge_weights.global_scale"))
+                if not (se_edge_weight_global_scale > 0.0):
+                    raise _err("model.likelihood.shared_event_re.edge_weights.global_scale", "must be > 0")
+            if "normalize" in ew_cfg and ew_cfg.get("normalize", None) is not None:
+                se_edge_weight_normalize = bool(_require_bool(ew_cfg.get("normalize"), "model.likelihood.shared_event_re.edge_weights.normalize"))
 
-        # Optional diagnostics logging controls
-        if "diag_log_every_epochs" in se_cfg and se_cfg["diag_log_every_epochs"] is not None:
-            se_diag_log_every_epochs = int(_require_num(se_cfg["diag_log_every_epochs"], "model.likelihood.shared_event_re.diag_log_every_epochs"))
-            if se_diag_log_every_epochs < 0:
-                raise _err("model.likelihood.shared_event_re.diag_log_every_epochs", "must be >= 0")
-        if "diag_max_groups" in se_cfg and se_cfg["diag_max_groups"] is not None:
-            se_diag_max_groups = int(_require_num(se_cfg["diag_max_groups"], "model.likelihood.shared_event_re.diag_max_groups"))
-            if se_diag_max_groups < 1:
-                raise _err("model.likelihood.shared_event_re.diag_max_groups", "must be >= 1")
-        if "diag_max_rows_per_group" in se_cfg and se_cfg["diag_max_rows_per_group"] is not None:
-            se_diag_max_rows_per_group = int(_require_num(se_cfg["diag_max_rows_per_group"], "model.likelihood.shared_event_re.diag_max_rows_per_group"))
-            if se_diag_max_rows_per_group < 64:
-                raise _err("model.likelihood.shared_event_re.diag_max_rows_per_group", "must be >= 64")
-        if "diag_max_nodes" in se_cfg and se_cfg["diag_max_nodes"] is not None:
-            se_diag_max_nodes = int(_require_num(se_cfg["diag_max_nodes"], "model.likelihood.shared_event_re.diag_max_nodes"))
-            if se_diag_max_nodes < 16:
-                raise _err("model.likelihood.shared_event_re.diag_max_nodes", "must be >= 16")
-        if "diag_seed" in se_cfg and se_cfg["diag_seed"] is not None:
-            se_diag_seed = int(_require_num(se_cfg["diag_seed"], "model.likelihood.shared_event_re.diag_seed"))
-            if se_diag_seed < 0:
-                raise _err("model.likelihood.shared_event_re.diag_seed", "must be >= 0")
+        at_cfg = se_cfg.get("autotune", None)
+        if isinstance(at_cfg, dict):
+            if "enabled" in at_cfg and at_cfg.get("enabled", None) is not None:
+                se_autotune_enabled = bool(_require_bool(at_cfg.get("enabled"), "model.likelihood.shared_event_re.autotune.enabled"))
+            if "observe_epochs" in at_cfg and at_cfg.get("observe_epochs", None) is not None:
+                se_autotune_observe_epochs = int(_require_num(at_cfg.get("observe_epochs"), "model.likelihood.shared_event_re.autotune.observe_epochs"))
+            if "latest_epoch" in at_cfg and at_cfg.get("latest_epoch", None) is not None:
+                se_autotune_latest_epoch = int(_require_num(at_cfg.get("latest_epoch"), "model.likelihood.shared_event_re.autotune.latest_epoch"))
+            if "min_groups" in at_cfg and at_cfg.get("min_groups", None) is not None:
+                se_autotune_min_groups = int(_require_num(at_cfg.get("min_groups"), "model.likelihood.shared_event_re.autotune.min_groups"))
+            if "max_bins" in at_cfg and at_cfg.get("max_bins", None) is not None:
+                se_autotune_max_bins = int(_require_num(at_cfg.get("max_bins"), "model.likelihood.shared_event_re.autotune.max_bins"))
+            if "min_bin_groups" in at_cfg and at_cfg.get("min_bin_groups", None) is not None:
+                se_autotune_min_bin_groups = int(_require_num(at_cfg.get("min_bin_groups"), "model.likelihood.shared_event_re.autotune.min_bin_groups"))
+            if "min_bucket_node" in at_cfg and at_cfg.get("min_bucket_node", None) is not None:
+                se_autotune_min_bucket_node = int(_require_num(at_cfg.get("min_bucket_node"), "model.likelihood.shared_event_re.autotune.min_bucket_node"))
+            if "min_gain" in at_cfg and at_cfg.get("min_gain", None) is not None:
+                se_autotune_min_gain = float(_require_num(at_cfg.get("min_gain"), "model.likelihood.shared_event_re.autotune.min_gain"))
+            if "raise_nodes_cap" in at_cfg and at_cfg.get("raise_nodes_cap", None) is not None:
+                se_autotune_raise_nodes_cap = bool(_require_bool(at_cfg.get("raise_nodes_cap"), "model.likelihood.shared_event_re.autotune.raise_nodes_cap"))
+            if "nodes_cap_max" in at_cfg and at_cfg.get("nodes_cap_max", None) is not None:
+                se_autotune_nodes_cap_max = int(_require_num(at_cfg.get("nodes_cap_max"), "model.likelihood.shared_event_re.autotune.nodes_cap_max"))
+
+        lg_cfg = se_cfg.get("logging", None)
+        if isinstance(lg_cfg, dict):
+            if "quiet" in lg_cfg and lg_cfg.get("quiet", None) is not None:
+                se_logging_quiet = bool(_require_bool(lg_cfg.get("quiet"), "model.likelihood.shared_event_re.logging.quiet"))
+            if "stats_log_every_epochs" in lg_cfg and lg_cfg.get("stats_log_every_epochs", None) is not None:
+                se_stats_log_every_epochs = int(
+                    _require_num(lg_cfg.get("stats_log_every_epochs"), "model.likelihood.shared_event_re.logging.stats_log_every_epochs")
+                )
+                if se_stats_log_every_epochs < 0:
+                    raise _err("model.likelihood.shared_event_re.logging.stats_log_every_epochs", "must be >= 0")
 
     if lk_correlated and not se_enabled:
         raise _err(
@@ -1300,18 +1187,8 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
                 "(quadratic-only collapsed likelihood currently does not support learning σ; "
                 "this will be supported in a future extension with logdet/SLQ)",
             )
-        if bool(se_joint_ps):
-            # joint_ps requires both phases to have positive tau to be meaningful; allow zeros but warn via runtime behavior.
-            pass
-        # pcg_sparse currently supports only scalar (per-phase) random effects (joint_ps=False).
-        if str(se_solver) == "pcg_sparse" and bool(se_joint_ps):
-            raise _err("model.likelihood.shared_event_re.joint_ps", "must be false when model.likelihood.shared_event_re.solver='pcg_sparse'")
-        if str(se_solver) == "pcg_sparse" and (not bool(se_drop_logdet)):
-            raise _err(
-                "model.likelihood.shared_event_re.drop_logdet",
-                "must be true when model.likelihood.shared_event_re.solver='pcg_sparse' "
-                "(Phase-A implementation drops logdet; Phase-B will add SLQ logdet)",
-            )
+        if str(se_solver_kind).strip().lower() != "pcg":
+            raise _err("model.likelihood.shared_event_re.solver.kind", "supported: 'pcg'")
 
     # ---- filters ----
     flt = _require_dict(_require(model, "filters", "model"), "model.filters")
@@ -1458,59 +1335,54 @@ def validate_and_materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["_shared_event_re_cluster_mode"] = str(se_cluster_mode)
     params["_shared_event_re_cluster_k"] = int(se_cluster_k)
     params["_shared_event_re_tau_s"] = [float(se_tau_ps[0]), float(se_tau_ps[1])]
-    params["_shared_event_re_hierarchical"] = bool(se_hier_enabled)
-    params["_shared_event_re_tau_event_s"] = [float(se_tau_event_ps[0]), float(se_tau_event_ps[1])]
-    params["_shared_event_re_tau_cluster_s"] = [float(se_tau_cluster_ps[0]), float(se_tau_cluster_ps[1])]
-    params["_shared_event_re_rho_ps"] = float(se_rho_ps)
-    params["_shared_event_re_joint_ps"] = bool(se_joint_ps)
+    params["_shared_event_re_hierarchical"] = False
+    params["_shared_event_re_tau_event_s"] = [0.0, 0.0]
+    params["_shared_event_re_tau_cluster_s"] = [0.0, 0.0]
+    params["_shared_event_re_rho_ps"] = 0.0
+    params["_shared_event_re_joint_ps"] = False
     params["_shared_event_re_max_nodes_per_group"] = int(se_max_nodes_per_group)
     params["_shared_event_re_max_rows_per_group"] = int(se_max_rows_per_group)
     params["_shared_event_re_fallback_to_diag"] = bool(se_fallback_to_diag)
     params["_shared_event_re_abort_on_pcg_fallback"] = bool(se_abort_on_pcg_fallback)
     params["_shared_event_re_jitter0"] = float(se_jitter0)
     params["_shared_event_re_jitter_max"] = float(se_jitter_max)
-    params["_shared_event_re_cache_max_entries"] = int(se_cache_max_entries)
-    params["_shared_event_re_cache_log_every"] = int(se_cache_log_every)
-    if se_gpu_enable is not None:
-        params["_shared_event_re_gpu_enable"] = bool(se_gpu_enable)
-    params["_shared_event_re_gpu_max_groups_per_batch"] = int(se_gpu_max_groups_per_batch)
-    params["_shared_event_re_gpu_profile"] = bool(se_gpu_profile)
-    params["_shared_event_re_gpu_debug_max_groups"] = int(se_gpu_debug_max_groups)
-    params["_shared_event_re_gpu_max_edges_per_batch"] = int(se_gpu_max_edges_per_batch)
-    params["_shared_event_re_gpu_reuse_pcg_init"] = bool(se_gpu_reuse_pcg_init)
-    params["_shared_event_re_whitening_enabled"] = bool(se_whiten_enabled)
-    params["_shared_event_re_whitening_edge_weighting"] = str(se_whiten_edge_weighting)
-    params["_shared_event_re_whitening_edge_weight_ell_km"] = float(se_whiten_edge_weight_ell_km)
-    params["_shared_event_re_whitening_edge_weight_eps_km"] = float(se_whiten_edge_weight_eps_km)
-    params["_shared_event_re_whitening_edge_weight_power"] = float(se_whiten_edge_weight_power)
-    params["_shared_event_re_whitening_edge_weight_scale_km"] = float(se_whiten_edge_weight_scale_km)
-    params["_shared_event_re_whitening_edge_weight_global_scale"] = float(se_whiten_edge_weight_global_scale)
-    params["_shared_event_re_whitening_edge_weight_normalize"] = bool(se_whiten_edge_weight_normalize)
-    params["_shared_event_re_whitening_cache_max_entries"] = int(se_whiten_cache_max_entries)
-    params["_shared_event_re_whitening_solver"] = str(se_whiten_solver)
-    params["_shared_event_re_whitening_pcg_max_iters"] = int(se_whiten_pcg_max_iters)
-    params["_shared_event_re_whitening_pcg_tol"] = float(se_whiten_pcg_tol)
-    params["_shared_event_re_whitening_pcg_min_iters"] = int(se_whiten_pcg_min_iters)
-    params["_shared_event_re_whitening_precompute"] = bool(se_whiten_precompute)
-    params["_shared_event_re_whitening_precompute_device"] = str(se_whiten_precompute_device)
-    params["_shared_event_re_whitening_pcg_batched"] = bool(se_whiten_pcg_batched)
-    params["_shared_event_re_whitening_pcg_warm_start"] = bool(se_whiten_pcg_warm_start)
-    params["_shared_event_re_whitening_only_mode"] = bool(se_whitening_only_mode)
-    params["_shared_event_re_whitening_pcg_bucket_nodes"] = list(se_whiten_pcg_bucket_nodes)
+    # Unified solver/edge-weight/autotune/logging namespaces.
+    params["_shared_event_re_solver_kind"] = str(se_solver_kind)
+    params["_shared_event_re_solver_max_iters"] = int(se_solver_max_iters)
+    params["_shared_event_re_solver_min_iters"] = int(se_solver_min_iters)
+    params["_shared_event_re_solver_tol"] = float(se_solver_tol)
+    params["_shared_event_re_solver_batched"] = bool(se_solver_batched)
+    params["_shared_event_re_solver_bucket_nodes"] = list(se_solver_bucket_nodes)
+    params["_shared_event_re_solver_warm_start"] = bool(se_solver_warm_start)
+    params["_shared_event_re_solver_cache_max_entries"] = int(se_solver_cache_max_entries)
+    params["_shared_event_re_solver_profile_micro_steps"] = bool(se_solver_profile_micro_steps)
+    params["_shared_event_re_solver_merge_sparse_edge_bins"] = bool(se_solver_merge_sparse_edge_bins)
+    params["_shared_event_re_solver_min_groups_per_edge_bin"] = int(se_solver_min_groups_per_edge_bin)
+    params["_shared_event_re_solver_max_edge_bins_per_node"] = int(se_solver_max_edge_bins_per_node)
+    params["_shared_event_re_solver_precompute_enabled"] = bool(se_solver_precompute_enabled)
+    params["_shared_event_re_solver_precompute_device"] = str(se_solver_precompute_device)
+
+    params["_shared_event_re_edge_weight_mode"] = str(se_edge_weight_mode)
+    params["_shared_event_re_edge_weight_ell_km"] = float(se_edge_weight_ell_km)
+    params["_shared_event_re_edge_weight_eps_km"] = float(se_edge_weight_eps_km)
+    params["_shared_event_re_edge_weight_power"] = float(se_edge_weight_power)
+    params["_shared_event_re_edge_weight_scale_km"] = float(se_edge_weight_scale_km)
+    params["_shared_event_re_edge_weight_global_scale"] = float(se_edge_weight_global_scale)
+    params["_shared_event_re_edge_weight_normalize"] = bool(se_edge_weight_normalize)
+
+    params["_shared_event_re_autotune_enabled"] = bool(se_autotune_enabled)
+    params["_shared_event_re_autotune_observe_epochs"] = int(se_autotune_observe_epochs)
+    params["_shared_event_re_autotune_latest_epoch"] = int(se_autotune_latest_epoch)
+    params["_shared_event_re_autotune_min_groups"] = int(se_autotune_min_groups)
+    params["_shared_event_re_autotune_max_bins"] = int(se_autotune_max_bins)
+    params["_shared_event_re_autotune_min_bin_groups"] = int(se_autotune_min_bin_groups)
+    params["_shared_event_re_autotune_min_bucket_node"] = int(se_autotune_min_bucket_node)
+    params["_shared_event_re_autotune_min_gain"] = float(se_autotune_min_gain)
+    params["_shared_event_re_autotune_raise_nodes_cap"] = bool(se_autotune_raise_nodes_cap)
+    params["_shared_event_re_autotune_nodes_cap_max"] = int(se_autotune_nodes_cap_max)
+
+    params["_shared_event_re_logging_quiet"] = bool(se_logging_quiet)
     params["_shared_event_re_stats_log_every_epochs"] = int(se_stats_log_every_epochs)
-    params["_shared_event_re_auto_tune_nodes_cap"] = bool(se_auto_tune_nodes_cap)
-    params["_shared_event_re_auto_tune_nodes_max"] = int(se_auto_tune_nodes_max)
-    params["_shared_event_re_auto_tune_rows_cap"] = bool(se_auto_tune_rows_cap)
-    params["_shared_event_re_auto_tune_rows_max"] = int(se_auto_tune_rows_max)
-    params["_shared_event_re_solver"] = str(se_solver)
-    params["_shared_event_re_drop_logdet"] = bool(se_drop_logdet)
-    params["_shared_event_re_pcg_max_iters"] = int(se_pcg_max_iters)
-    params["_shared_event_re_pcg_tol"] = float(se_pcg_tol)
-    params["_shared_event_re_diag_log_every_epochs"] = int(se_diag_log_every_epochs)
-    params["_shared_event_re_diag_max_groups"] = int(se_diag_max_groups)
-    params["_shared_event_re_diag_max_rows_per_group"] = int(se_diag_max_rows_per_group)
-    params["_shared_event_re_diag_max_nodes"] = int(se_diag_max_nodes)
-    params["_shared_event_re_diag_seed"] = int(se_diag_seed)
     params["_shared_event_re_station_phase_enabled"] = bool(se_sp_enabled)
     params["_shared_event_re_station_phase_tau_s"] = [float(se_sp_tau_ps[0]), float(se_sp_tau_ps[1])]
 
@@ -1780,7 +1652,7 @@ def validate_and_materialize_block5(params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Block 5 (hard-break schema): compute + dd-precision preconditioning toggle.
 
-    Required:
+    Optional:
       - inference.compute.devices: list of device specifiers, len>=1
         Supported entries:
           - integer CUDA device id (e.g. 0, 1, 2, ...)
@@ -1809,10 +1681,14 @@ def validate_and_materialize_block5(params: Dict[str, Any]) -> Dict[str, Any]:
         raise _err("compute", "moved; put this under `inference.compute` (top-level `compute` is no longer supported)")
 
     inf = _require_dict(_require(params, "inference", "inference"), "inference")
-    comp = _require_dict(_require(inf, "compute", "inference"), "inference.compute")
-    devs_v = _require(comp, "devices", "inference.compute")
-    if not isinstance(devs_v, list) or len(devs_v) < 1:
-        raise _err("inference.compute.devices", "expected non-empty list of device specifiers")
+    comp_v = inf.get("compute", None)
+    if comp_v is None:
+        comp = {}
+    else:
+        comp = _require_dict(comp_v, "inference.compute")
+    devs_v = comp.get("devices", None)
+    if devs_v is not None and (not isinstance(devs_v, list) or len(devs_v) < 1):
+        raise _err("inference.compute.devices", "expected non-empty list of device specifiers or omit this key")
 
     def _parse_dev(x: Any, path: str) -> int:
         # Canonical internal representation:
@@ -1835,8 +1711,9 @@ def validate_and_materialize_block5(params: Dict[str, Any]) -> Dict[str, Any]:
         raise _err(path, f"expected int or str, got {type(x).__name__}")
 
     devs: List[int] = []
-    for i, x in enumerate(devs_v):
-        devs.append(_parse_dev(x, f"inference.compute.devices[{i}]"))
+    if isinstance(devs_v, list):
+        for i, x in enumerate(devs_v):
+            devs.append(_parse_dev(x, f"inference.compute.devices[{i}]"))
 
     # dd_prec_enable moved under sampler
     dd_prec_enable = None

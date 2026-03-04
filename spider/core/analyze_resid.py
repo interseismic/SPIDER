@@ -634,13 +634,13 @@ def estimate_shared_event_re_tau_logdet(
     keys = (sta.to(dtype=torch.int64) * 2) + ph_id
 
     # Whitening weights configuration
-    edge_weighting = str(state.params.get("_shared_event_re_whitening_edge_weighting", "uniform")).strip().lower()
-    edge_weight_ell_km = float(state.params.get("_shared_event_re_whitening_edge_weight_ell_km", 1.0))
-    edge_weight_eps_km = float(state.params.get("_shared_event_re_whitening_edge_weight_eps_km", 1e-3))
-    edge_weight_power = float(state.params.get("_shared_event_re_whitening_edge_weight_power", 1.0))
-    edge_weight_scale_km = float(state.params.get("_shared_event_re_whitening_edge_weight_scale_km", 1.0))
-    edge_weight_global_scale = float(state.params.get("_shared_event_re_whitening_edge_weight_global_scale", 1.0))
-    edge_weight_normalize = bool(state.params.get("_shared_event_re_whitening_edge_weight_normalize", False))
+    edge_weighting = str(state.params.get("_shared_event_re_edge_weight_mode", "uniform")).strip().lower()
+    edge_weight_ell_km = float(state.params.get("_shared_event_re_edge_weight_ell_km", 1.0))
+    edge_weight_eps_km = float(state.params.get("_shared_event_re_edge_weight_eps_km", 1e-3))
+    edge_weight_power = float(state.params.get("_shared_event_re_edge_weight_power", 1.0))
+    edge_weight_scale_km = float(state.params.get("_shared_event_re_edge_weight_scale_km", 1.0))
+    edge_weight_global_scale = float(state.params.get("_shared_event_re_edge_weight_global_scale", 1.0))
+    edge_weight_normalize = bool(state.params.get("_shared_event_re_edge_weight_normalize", False))
 
     X_event = (state.X_src + dX_use)[:, :3].detach()
 

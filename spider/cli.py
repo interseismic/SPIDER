@@ -249,7 +249,7 @@ def _fail_if_torchrun_env(cmd: str) -> None:
 			f"`{cmd}` no longer supports torchrun/DDP (WORLD_SIZE={ws}). "
 			"Run it as a normal single process: `python -m spider "
 			+ str(cmd).strip()
-			+ " ...` and set inference.compute.devices=[0,1,...] to use DataParallel."
+			+ " ...` and pass explicit CLI device flags (--device / --devices)."
 		)
 
 
@@ -259,20 +259,10 @@ def _cmd_locate_full(args: argparse.Namespace) -> int:
 	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
 	_apply_torch_runtime_settings(params)
 
-	# --- Multi-GPU (DataParallel) mode ---
-	dev_list = list(params.get("devices", []))
-	if not dev_list:
-		raise ValueError("No devices configured. Set inference.compute.devices in the config, or pass --device.")
-
-	use_dp, dp_ids = _maybe_enable_dataparallel(dev_list, args_device=getattr(args, "device", None))
 	if args.device is None:
-		device_id = _parse_device_entry(dev_list[0])
-	else:
-		device_id = int(args.device)
-		params["devices"] = [device_id]
-	if use_dp:
-		info(f"Using DataParallel across devices: {dev_list}", section="RUN")
-		device_id = int(dp_ids[0])
+		raise ValueError("`spider locate-full` requires --device <CUDA_ID> (CLI-only device selection).")
+	device_id = int(args.device)
+	params["devices"] = [device_id]
 
 	# Resolve to an actual torch.device
 	device = _device_from_id(int(device_id))
@@ -285,9 +275,7 @@ def _cmd_locate_full(args: argparse.Namespace) -> int:
 	params["_ddp_world_size"] = 1
 	params["_ddp_rank"] = 0
 	params["_ddp_local_rank"] = 0
-	params["_use_dataparallel"] = bool(use_dp)
-	if use_dp:
-		params["_dp_device_ids"] = list(dp_ids)
+	params["_use_dataparallel"] = False
 
 	# Inject optional shift guard settings into params for core pipeline
 	if getattr(args, "shift_guard", False):
@@ -297,8 +285,6 @@ def _cmd_locate_full(args: argparse.Namespace) -> int:
 
 	# Load model
 	model = _load_model(params, device)
-	if params.get("_use_dataparallel", False):
-		model = torch.nn.DataParallel(model, device_ids=list(params.get("_dp_device_ids", [])))
 
 	info("Preparing input dataset", section="DATA")
 	stations, dtimes, origins = prepare_input_dfs(params, model=model, device=device)
@@ -326,20 +312,10 @@ def _cmd_locate_map(args: argparse.Namespace) -> int:
 	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
 	_apply_torch_runtime_settings(params)
 
-	# --- Multi-GPU (DataParallel) mode ---
-	dev_list = list(params.get("devices", []))
-	if not dev_list:
-		raise ValueError("No devices configured. Set inference.compute.devices in the config, or pass --device.")
-
-	use_dp, dp_ids = _maybe_enable_dataparallel(dev_list, args_device=getattr(args, "device", None))
 	if args.device is None:
-		device_id = _parse_device_entry(dev_list[0])
-	else:
-		device_id = int(args.device)
-		params["devices"] = [device_id]
-	if use_dp:
-		info(f"Using DataParallel across devices: {dev_list}", section="RUN")
-		device_id = int(dp_ids[0])
+		raise ValueError("`spider locate-map` requires --device <CUDA_ID> (CLI-only device selection).")
+	device_id = int(args.device)
+	params["devices"] = [device_id]
 
 	device = _device_from_id(int(device_id))
 	if device.type == "cuda":
@@ -351,9 +327,7 @@ def _cmd_locate_map(args: argparse.Namespace) -> int:
 	params["_ddp_world_size"] = 1
 	params["_ddp_rank"] = 0
 	params["_ddp_local_rank"] = 0
-	params["_use_dataparallel"] = bool(use_dp)
-	if use_dp:
-		params["_dp_device_ids"] = list(dp_ids)
+	params["_use_dataparallel"] = False
 
 	if getattr(args, "shift_guard", False):
 		params["shift_guard_enable"] = True
@@ -361,8 +335,6 @@ def _cmd_locate_map(args: argparse.Namespace) -> int:
 		params["shift_guard_factor"] = float(args.shift_guard_factor)
 
 	model = _load_model(params, device)
-	if params.get("_use_dataparallel", False):
-		model = torch.nn.DataParallel(model, device_ids=list(params.get("_dp_device_ids", [])))
 
 	info("Preparing input dataset", section="DATA")
 	stations, dtimes, origins = prepare_input_dfs(params, model=model, device=device)
@@ -399,20 +371,10 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 	params = _validate_params_all(raw_params, require_priors=True)
 	_apply_torch_runtime_settings(params)
 
-	# --- Multi-GPU (DataParallel) mode ---
-	dev_list = list(params.get("devices", []))
-	if not dev_list:
-		raise ValueError("No devices configured. Set inference.compute.devices in the config, or pass --device.")
-
-	use_dp, dp_ids = _maybe_enable_dataparallel(dev_list, args_device=getattr(args, "device", None))
 	if args.device is None:
-		device_id = _parse_device_entry(dev_list[0])
-	else:
-		device_id = int(args.device)
-		params["devices"] = [device_id]
-	if use_dp:
-		info(f"Using DataParallel across devices: {dev_list}", section="RUN")
-		device_id = int(dp_ids[0])
+		raise ValueError("`spider sample` requires --device <CUDA_ID> (CLI-only device selection).")
+	device_id = int(args.device)
+	params["devices"] = [device_id]
 
 	device = _device_from_id(int(device_id))
 	if device.type == "cuda":
@@ -424,9 +386,7 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 	params["_ddp_world_size"] = 1
 	params["_ddp_rank"] = 0
 	params["_ddp_local_rank"] = 0
-	params["_use_dataparallel"] = bool(use_dp)
-	if use_dp:
-		params["_dp_device_ids"] = list(dp_ids)
+	params["_use_dataparallel"] = False
 
 	if getattr(args, "shift_guard", False):
 		params["shift_guard_enable"] = True
@@ -469,8 +429,6 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 	params["_wandb_runtime_enabled"] = bool(wandb_logger is not None)
 
 	model = _load_model(params, device)
-	if params.get("_use_dataparallel", False):
-		model = torch.nn.DataParallel(model, device_ids=list(params.get("_dp_device_ids", [])))
 
 	info(f"Running SPIDER sampling from bundle={bundle_path}", section="RUN")
 	locate_sample_from_bundle(params=params, bundle_path=bundle_path, model=model, device=device, wandb_logger=wandb_logger)
@@ -485,19 +443,10 @@ def _cmd_analyze_resid(args: argparse.Namespace) -> int:
 	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
 	_apply_torch_runtime_settings(params)
 
-	dev_list = list(params.get("devices", []))
-	if not dev_list:
-		raise ValueError("No devices configured. Set inference.compute.devices in the config, or pass --device.")
 	if args.device is None:
-		if len(dev_list) != 1:
-			raise ValueError(
-				f"Config inference.compute.devices has {len(dev_list)} entries but `spider analyze-resid` is single-device. "
-				"Pass --device to pick one GPU."
-			)
-		device_id = _parse_device_entry(dev_list[0])
-	else:
-		device_id = int(args.device)
-		params["devices"] = [device_id]
+		raise ValueError("`spider analyze-resid` requires --device <CUDA_ID> (CLI-only device selection).")
+	device_id = int(args.device)
+	params["devices"] = [device_id]
 	device = _device_from_id(int(device_id))
 
 	# Load model (needed to compute residuals)
@@ -535,17 +484,14 @@ def _cmd_sample_multi(args: argparse.Namespace) -> int:
 	with open(args.params, "r") as f:
 		base_params = json.load(f)
 
-	# Devices: either provided explicitly, or use inference.compute.devices from params.
+	# Devices must be provided explicitly on CLI.
 	devs = None
 	if getattr(args, "devices", None):
 		devs = [_parse_device_entry(x.strip()) for x in str(args.devices).split(",") if str(x).strip()]
 	else:
-		try:
-			devs = [_parse_device_entry(x) for x in base_params.get("inference", {}).get("compute", {}).get("devices", [])]
-		except Exception:
-			devs = []
+		devs = []
 	if not devs:
-		raise ValueError("sample-multi requires devices (either --devices or inference.compute.devices in params).")
+		raise ValueError("`spider sample-multi` requires --devices <id0,id1,...> (CLI-only device selection).")
 
 	bundle_path = str(getattr(args, "bundle", "") or "").strip()
 	if not bundle_path:
@@ -697,7 +643,9 @@ def _cmd_synth(args: argparse.Namespace) -> int:
 	# Load params
 	params = _validate_params_synth(_load_params_json(args.params))
 	_apply_torch_runtime_settings(params)
-	device_id = int(args.device) if args.device is not None else int(params["devices"][0])
+	if args.device is None:
+		raise ValueError("`spider synth` requires --device <CUDA_ID> (CLI-only device selection).")
+	device_id = int(args.device)
 	if torch.cuda.is_available():
 		device = torch.device(f"cuda:{device_id}")
 	else:
@@ -1071,7 +1019,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	# locate-map subcommand
 	p_map = subparsers.add_parser("locate-map", help="Run Phase 1 (MAP) only and dump a Phase-2 bundle")
 	p_map.add_argument("params", help="Path to parameter JSON file")
-	p_map.add_argument("--device", type=int, default=None, help="CUDA device id to use (single-device)")
+	p_map.add_argument("--device", type=int, required=True, help="CUDA device id to use (required)")
 	p_map.add_argument("--bundle-out", type=str, default=None, help="Output path for Phase-2 bundle (default: <checkpoint_dir>/phase2_bundle.pth)")
 	p_map.add_argument("--shift-guard", action="store_true", help="Abort if any event moves > factor × prior stds; prints offending observations")
 	p_map.add_argument("--shift-guard-factor", type=float, default=None, help="Factor relative to prior_event_std; default 5.0")
@@ -1080,7 +1028,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	# sample subcommand
 	p_samp = subparsers.add_parser("sample", help="Run Phase 2–4 (sampling) starting from a Phase-2 bundle")
 	p_samp.add_argument("params", help="Path to parameter JSON file")
-	p_samp.add_argument("--device", type=int, default=None, help="CUDA device id to use (sample is single-device)")
+	p_samp.add_argument("--device", type=int, required=True, help="CUDA device id to use (required)")
 	p_samp.add_argument("--bundle", type=str, default=None, help="Path to Phase-2 bundle (default: <checkpoint_dir>/phase2_bundle.pth)")
 	p_samp.add_argument("--shift-guard", action="store_true", help="Abort if any event moves > factor × prior stds; prints offending observations")
 	p_samp.add_argument("--shift-guard-factor", type=float, default=None, help="Factor relative to prior_event_std; default 5.0")
@@ -1091,7 +1039,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	p_sm.add_argument("params", help="Path to parameter JSON file")
 	p_sm.add_argument("--bundle", type=str, default=None, help="Path to Phase-2 bundle (default: <checkpoint_dir>/phase2_bundle.pth)")
 	p_sm.add_argument("--chains", type=int, default=None, help="Number of chains to run (default: number of devices)")
-	p_sm.add_argument("--devices", type=str, default=None, help="Comma-separated CUDA device ids (default: inference.compute.devices from params)")
+	p_sm.add_argument("--devices", type=str, required=True, help="Comma-separated CUDA device ids (required)")
 	p_sm.add_argument("--seed0", type=int, default=0, help="Base seed for chain RNG offsets (default: 0)")
 	p_sm.add_argument("--out-dir", type=str, default=None, help="Directory to write chain param files (default: params directory)")
 	p_sm.add_argument("--dry-run", action="store_true", help="Print what would run, but do not start processes")
@@ -1101,7 +1049,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	# analyze-resid subcommand
 	p_ar = subparsers.add_parser("analyze-resid", help="Run residual diagnostics from an existing Phase-2 bundle (no MAP rerun)")
 	p_ar.add_argument("params", help="Path to parameters JSON file")
-	p_ar.add_argument("--device", type=int, default=None, help="CUDA device id to use (single-device)")
+	p_ar.add_argument("--device", type=int, required=True, help="CUDA device id to use (required)")
 	p_ar.add_argument("--bundle", type=str, default=None, help="Path to Phase-2 bundle (.pth). Default: checkpoint_dir/phase2_bundle.pth")
 	p_ar.add_argument(
 		"--use-latest-checkpoint",
@@ -1122,8 +1070,8 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	p_locate.add_argument(
 		"--device",
 		type=int,
-		default=None,
-		help="CUDA device id to use (single-device; required if inference.compute.devices has >1)",
+		required=True,
+		help="CUDA device id to use (required)",
 	)
 	p_locate.add_argument("--shift-guard", action="store_true", help="Abort if any event moves > factor × prior stds; prints offending observations")
 	p_locate.add_argument("--shift-guard-factor", type=float, default=None, help="Factor relative to prior_event_std; default 5.0")
@@ -1134,7 +1082,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	p_multi.add_argument("params", help="Path to parameter JSON file")
 	p_multi.add_argument("--bundle", type=str, default=None, help="Path to Phase-2 bundle (default: <checkpoint_dir>/phase2_bundle.pth)")
 	p_multi.add_argument("--chains", type=int, default=None, help="Number of chains to run (default: number of devices)")
-	p_multi.add_argument("--devices", type=str, default=None, help="Comma-separated CUDA device ids (default: inference.compute.devices from params)")
+	p_multi.add_argument("--devices", type=str, required=True, help="Comma-separated CUDA device ids (required)")
 	p_multi.add_argument("--seed0", type=int, default=0, help="Base seed for chain RNG offsets (default: 0)")
 	p_multi.add_argument("--out-dir", type=str, default=None, help="Directory to write chain param files (default: params directory)")
 	p_multi.add_argument("--dry-run", action="store_true", help="Print what would run, but do not start processes")
@@ -1144,7 +1092,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	# locate-full subcommand (kept for one-shot legacy flows)
 	p_full = subparsers.add_parser("locate-full", help="Run full pipeline (Phase 1 + Phase 2–4) [legacy]")
 	p_full.add_argument("params", help="Path to parameter JSON file")
-	p_full.add_argument("--device", type=int, default=None, help="CUDA device id to use (single-device)")
+	p_full.add_argument("--device", type=int, required=True, help="CUDA device id to use (required)")
 	p_full.add_argument("--shift-guard", action="store_true", help="Abort if any event moves > factor × prior stds; prints offending observations")
 	p_full.add_argument("--shift-guard-factor", type=float, default=None, help="Factor relative to prior_event_std; default 5.0")
 	p_full.set_defaults(func=_cmd_locate_full)
@@ -1152,7 +1100,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	# synth subcommand
 	p_synth = subparsers.add_parser("synth", help="Generate a synthetic differential time dataset matching the current configuration")
 	p_synth.add_argument("params", help="Path to parameter JSON file")
-	p_synth.add_argument("--device", type=int, default=None, help="CUDA device id to use (default: inference.compute.devices[0])")
+	p_synth.add_argument("--device", type=int, required=True, help="CUDA device id to use (required)")
 	p_synth.set_defaults(func=_cmd_synth)
 
 	return parser

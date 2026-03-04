@@ -30,6 +30,15 @@ def _log(*parts, section: str = "RUN", **_kwargs) -> None:
         info(msg, section=section)
 
 
+def _quiet_whitening_logs(params: dict) -> bool:
+    try:
+        return bool(params.get("_shared_event_re_logging_quiet", True)) and bool(
+            params.get("_shared_event_re_enabled", False)
+        )
+    except Exception:
+        return False
+
+
 def _maybe_apply_gauge_projection_for_optimizer(state: LocateState, optimizer: torch.optim.Optimizer) -> None:
     """
     Apply gauge projection (remove translation mode) for optimizers that do NOT implement it internally.
@@ -626,6 +635,19 @@ def _run_epoch(
     state.params["_shared_event_re_whitening_cache_miss_sum"] = 0
     state.params["_shared_event_re_whitening_cache_build_ms_sum"] = 0.0
     state.params["_shared_event_re_whitening_solve_ms_sum"] = 0.0
+    state.params["_shared_event_re_whitening_groups_pcg_candidates_sum"] = 0
+    state.params["_shared_event_re_whitening_groups_leftover_sum"] = 0
+    state.params["_shared_event_re_whitening_epoch_node_hist"] = {}
+    state.params["_shared_event_re_whitening_epoch_row_hist"] = {}
+    state.params["_shared_event_re_whitening_epoch_bucket_hist"] = {}
+    state.params["_shared_event_re_whitening_pcg_bucket_assign_ms_sum"] = 0.0
+    state.params["_shared_event_re_whitening_pcg_bucket_merge_ms_sum"] = 0.0
+    state.params["_shared_event_re_whitening_pcg_pack_ms_sum"] = 0.0
+    state.params["_shared_event_re_whitening_pcg_kernel_ms_sum"] = 0.0
+    state.params["_shared_event_re_whitening_pcg_unpack_ms_sum"] = 0.0
+    state.params["_shared_event_re_whitening_pcg_leftover_ms_sum"] = 0.0
+    state.params["_shared_event_re_whitening_pcg_matvec_ms_sum"] = 0.0
+    state.params["_shared_event_re_whitening_pcg_vecops_ms_sum"] = 0.0
 
     # Best-effort: total batches (works for standard batching / ranges)
     total_batches = None
@@ -1178,11 +1200,16 @@ def _run_epoch(
                         sl_re_t0 = _time.perf_counter()
                     except Exception:
                         sl_re_t0 = None
-                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_prelog", False)):
+                quiet_w_logs = _quiet_whitening_logs(state.params)
+                if (
+                    bool(state.params.get("_shared_event_re_enabled", False))
+                    and (not quiet_w_logs)
+                    and not bool(state.params.get("_shared_event_re_prelog", False))
+                ):
                     state.params["_shared_event_re_prelog"] = True
                     try:
                         n_rows = int(II_b.shape[0]) if isinstance(II_b, torch.Tensor) else 0
-                        solver = str(state.params.get("_shared_event_re_solver", ""))
+                        solver = str(state.params.get("_shared_event_re_solver_kind", ""))
                         grouping = str(state.params.get("_shared_event_re_grouping", ""))
                         # Sentinels to verify shared_event_re block executed.
                         state.params["_shared_event_re_runtime_last_groups"] = -1
@@ -1205,7 +1232,11 @@ def _run_epoch(
                     params=state.params,
                     nuisance_delta=nuisance_delta,
                 )
-                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_postlog", False)):
+                if (
+                    bool(state.params.get("_shared_event_re_enabled", False))
+                    and (not quiet_w_logs)
+                    and not bool(state.params.get("_shared_event_re_postlog", False))
+                ):
                     state.params["_shared_event_re_postlog"] = True
                     g = int(state.params.get("_shared_event_re_runtime_last_groups", -1))
                     g_pcg = int(state.params.get("_shared_event_re_runtime_last_groups_pcg", -1))
@@ -1214,7 +1245,11 @@ def _run_epoch(
                         f"shared_event_re postlog groups={g} pcg={g_pcg} fallback={g_fb}",
                         section="LIKELIHOOD",
                     )
-                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_batch_logged", False)):
+                if (
+                    bool(state.params.get("_shared_event_re_enabled", False))
+                    and (not quiet_w_logs)
+                    and not bool(state.params.get("_shared_event_re_batch_logged", False))
+                ):
                     state.params["_shared_event_re_batch_logged"] = True
                     try:
                         n_rows = int(II_b.shape[0])
@@ -1248,7 +1283,7 @@ def _run_epoch(
                         pass
                         pass
                         info(f"shared_event_re batch log failed: {e}", section="LIKELIHOOD")
-                if not bool(state.params.get("_shared_event_re_flag_logged", False)):
+                if (not quiet_w_logs) and (not bool(state.params.get("_shared_event_re_flag_logged", False))):
                     state.params["_shared_event_re_flag_logged"] = True
                     info(
                         f"shared_event_re flag={bool(state.params.get('_shared_event_re_enabled', False))}",
@@ -1277,7 +1312,7 @@ def _run_epoch(
                             f"max_rows={mr} max_nodes={mn} max_rows_all={mr_all} max_nodes_all={mn_all}",
                             section="LIKELIHOOD",
                         )
-                    if not bool(state.params.get("_shared_event_re_reported", False)):
+                    if (not quiet_w_logs) and (not bool(state.params.get("_shared_event_re_reported", False))):
                         state.params["_shared_event_re_reported"] = True
                         info(
                             f"shared_event_re stats groups={g} pcg={g_pcg} fallback={g_fb} "
@@ -1290,24 +1325,14 @@ def _run_epoch(
                             section="LIKELIHOOD",
                         )
                         if (not ddp_enabled) or ddp_is_main:
-                            if bool(state.params.get("_shared_event_re_auto_tune_nodes_cap", False)) and (g_nodes > 0):
+                            if bool(state.params.get("_shared_event_re_autotune_raise_nodes_cap", True)) and (g_nodes > 0):
                                 cur = int(state.params.get("_shared_event_re_max_nodes_per_group", 0) or 0)
-                                cap = int(state.params.get("_shared_event_re_auto_tune_nodes_max", 0) or 0)
+                                cap = int(state.params.get("_shared_event_re_autotune_nodes_cap_max", 0) or 0)
                                 target = int(min(max(mn_all, cur), cap)) if cap > 0 else int(max(mn_all, cur))
                                 if target > cur and mn_all > 0:
                                     state.params["_shared_event_re_max_nodes_per_group"] = target
                                     info(
                                         f"shared_event_re auto-tune: max_nodes_per_group -> {target}",
-                                        section="LIKELIHOOD",
-                                    )
-                            if bool(state.params.get("_shared_event_re_auto_tune_rows_cap", False)) and (g_rows > 0):
-                                cur = int(state.params.get("_shared_event_re_max_rows_per_group", 0) or 0)
-                                cap = int(state.params.get("_shared_event_re_auto_tune_rows_max", 0) or 0)
-                                target = int(min(max(mr_all, cur), cap)) if cap > 0 else int(max(mr_all, cur))
-                                if target > cur and mr_all > 0:
-                                    state.params["_shared_event_re_max_rows_per_group"] = target
-                                    info(
-                                        f"shared_event_re auto-tune: max_rows_per_group -> {target}",
                                         section="LIKELIHOOD",
                                     )
                     if g > 0 and g_pcg == 0 and g_fb >= g:
@@ -1316,7 +1341,11 @@ def _run_epoch(
                             "increase shared_event_re.max_nodes_per_group or max_rows_per_group",
                             section="LIKELIHOOD",
                         )
-                if bool(state.params.get("_shared_event_re_whitening_enabled", False)) and not bool(state.params.get("_shared_event_re_whitening_reported", False)):
+                if (
+                    bool(state.params.get("_shared_event_re_enabled", False))
+                    and (not quiet_w_logs)
+                    and not bool(state.params.get("_shared_event_re_whitening_reported", False))
+                ):
                     state.params["_shared_event_re_whitening_reported"] = True
                     wg = int(state.params.get("_shared_event_re_whitening_last_groups", 0) or 0)
                     wchol = int(state.params.get("_shared_event_re_whitening_last_groups_chol", 0) or 0)
@@ -1336,7 +1365,11 @@ def _run_epoch(
                             section="LIKELIHOOD",
                         )
                 # One-time debug: compare shared_event_re vs baseline loss on this batch.
-                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_debug_compare_logged", False)):
+                if (
+                    bool(state.params.get("_shared_event_re_enabled", False))
+                    and (not quiet_w_logs)
+                    and not bool(state.params.get("_shared_event_re_debug_compare_logged", False))
+                ):
                     state.params["_shared_event_re_debug_compare_logged"] = True
                     try:
                         with torch.no_grad():
@@ -1375,7 +1408,11 @@ def _run_epoch(
                     except Exception as e:
                         pass
                 # One-time shared_event_re runtime summary after the first loss call.
-                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_runtime_logged", False)):
+                if (
+                    bool(state.params.get("_shared_event_re_enabled", False))
+                    and (not quiet_w_logs)
+                    and not bool(state.params.get("_shared_event_re_runtime_logged", False))
+                ):
                     state.params["_shared_event_re_runtime_logged"] = True
                     try:
                         g = int(state.params.get("_shared_event_re_runtime_last_groups", 0) or 0)
@@ -1484,11 +1521,16 @@ def _run_epoch(
                         sl_re_t0 = _time.perf_counter()
                     except Exception:
                         sl_re_t0 = None
-                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_prelog", False)):
+                quiet_w_logs = _quiet_whitening_logs(state.params)
+                if (
+                    bool(state.params.get("_shared_event_re_enabled", False))
+                    and (not quiet_w_logs)
+                    and not bool(state.params.get("_shared_event_re_prelog", False))
+                ):
                     state.params["_shared_event_re_prelog"] = True
                     try:
                         n_rows = int(II_b.shape[0]) if isinstance(II_b, torch.Tensor) else 0
-                        solver = str(state.params.get("_shared_event_re_solver", ""))
+                        solver = str(state.params.get("_shared_event_re_solver_kind", ""))
                         grouping = str(state.params.get("_shared_event_re_grouping", ""))
                         # Sentinels to verify shared_event_re block executed.
                         state.params["_shared_event_re_runtime_last_groups"] = -1
@@ -1512,7 +1554,11 @@ def _run_epoch(
                     params=state.params,
                     nuisance_delta=nuisance_delta,
                 )
-                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_postlog", False)):
+                if (
+                    bool(state.params.get("_shared_event_re_enabled", False))
+                    and (not quiet_w_logs)
+                    and not bool(state.params.get("_shared_event_re_postlog", False))
+                ):
                     state.params["_shared_event_re_postlog"] = True
                     g = int(state.params.get("_shared_event_re_runtime_last_groups", -1))
                     g_pcg = int(state.params.get("_shared_event_re_runtime_last_groups_pcg", -1))
@@ -1531,7 +1577,7 @@ def _run_epoch(
                     mr = int(state.params.get("_shared_event_re_runtime_last_max_rows", 0) or 0)
                     mn = int(state.params.get("_shared_event_re_runtime_last_max_nodes", 0) or 0)
                     tg = state.params.get("_shared_event_re_tau_s", [0.0, 0.0])
-                    if not bool(state.params.get("_shared_event_re_reported", False)):
+                    if (not quiet_w_logs) and (not bool(state.params.get("_shared_event_re_reported", False))):
                         state.params["_shared_event_re_reported"] = True
                         info(
                             f"shared_event_re stats groups={g} pcg={g_pcg} fallback={g_fb} "
@@ -1544,24 +1590,14 @@ def _run_epoch(
                             section="LIKELIHOOD",
                         )
                         if (not ddp_enabled) or ddp_is_main:
-                            if bool(state.params.get("_shared_event_re_auto_tune_nodes_cap", False)) and (g_nodes > 0):
+                            if bool(state.params.get("_shared_event_re_autotune_raise_nodes_cap", True)) and (g_nodes > 0):
                                 cur = int(state.params.get("_shared_event_re_max_nodes_per_group", 0) or 0)
-                                cap = int(state.params.get("_shared_event_re_auto_tune_nodes_max", 0) or 0)
+                                cap = int(state.params.get("_shared_event_re_autotune_nodes_cap_max", 0) or 0)
                                 target = int(min(max(mn_all, cur), cap)) if cap > 0 else int(max(mn_all, cur))
                                 if target > cur and mn_all > 0:
                                     state.params["_shared_event_re_max_nodes_per_group"] = target
                                     info(
                                         f"shared_event_re auto-tune: max_nodes_per_group -> {target}",
-                                        section="LIKELIHOOD",
-                                    )
-                            if bool(state.params.get("_shared_event_re_auto_tune_rows_cap", False)) and (g_rows > 0):
-                                cur = int(state.params.get("_shared_event_re_max_rows_per_group", 0) or 0)
-                                cap = int(state.params.get("_shared_event_re_auto_tune_rows_max", 0) or 0)
-                                target = int(min(max(mr_all, cur), cap)) if cap > 0 else int(max(mr_all, cur))
-                                if target > cur and mr_all > 0:
-                                    state.params["_shared_event_re_max_rows_per_group"] = target
-                                    info(
-                                        f"shared_event_re auto-tune: max_rows_per_group -> {target}",
                                         section="LIKELIHOOD",
                                     )
                     if g > 0 and g_pcg == 0 and g_fb >= g:
@@ -1570,7 +1606,11 @@ def _run_epoch(
                             "increase shared_event_re.max_nodes_per_group or max_rows_per_group",
                             section="LIKELIHOOD",
                         )
-                if bool(state.params.get("_shared_event_re_enabled", False)) and not bool(state.params.get("_shared_event_re_debug_compare_logged", False)):
+                if (
+                    bool(state.params.get("_shared_event_re_enabled", False))
+                    and (not quiet_w_logs)
+                    and not bool(state.params.get("_shared_event_re_debug_compare_logged", False))
+                ):
                     state.params["_shared_event_re_debug_compare_logged"] = True
                     try:
                         with torch.no_grad():
@@ -2163,6 +2203,14 @@ def _run_epoch(
                 metrics["shared_event_re/whitening_cache_misses"] = float(int(state.params.get("_shared_event_re_whitening_cache_miss_sum", 0) or 0))
                 metrics["shared_event_re/whitening_cache_build_ms_sum"] = float(state.params.get("_shared_event_re_whitening_cache_build_ms_sum", 0.0) or 0.0)
                 metrics["shared_event_re/whitening_solve_ms_sum"] = float(state.params.get("_shared_event_re_whitening_solve_ms_sum", 0.0) or 0.0)
+                metrics["shared_event_re/whitening_pcg_bucket_assign_ms_sum"] = float(state.params.get("_shared_event_re_whitening_pcg_bucket_assign_ms_sum", 0.0) or 0.0)
+                metrics["shared_event_re/whitening_pcg_bucket_merge_ms_sum"] = float(state.params.get("_shared_event_re_whitening_pcg_bucket_merge_ms_sum", 0.0) or 0.0)
+                metrics["shared_event_re/whitening_pcg_pack_ms_sum"] = float(state.params.get("_shared_event_re_whitening_pcg_pack_ms_sum", 0.0) or 0.0)
+                metrics["shared_event_re/whitening_pcg_kernel_ms_sum"] = float(state.params.get("_shared_event_re_whitening_pcg_kernel_ms_sum", 0.0) or 0.0)
+                metrics["shared_event_re/whitening_pcg_unpack_ms_sum"] = float(state.params.get("_shared_event_re_whitening_pcg_unpack_ms_sum", 0.0) or 0.0)
+                metrics["shared_event_re/whitening_pcg_leftover_ms_sum"] = float(state.params.get("_shared_event_re_whitening_pcg_leftover_ms_sum", 0.0) or 0.0)
+                metrics["shared_event_re/whitening_pcg_matvec_ms_sum"] = float(state.params.get("_shared_event_re_whitening_pcg_matvec_ms_sum", 0.0) or 0.0)
+                metrics["shared_event_re/whitening_pcg_vecops_ms_sum"] = float(state.params.get("_shared_event_re_whitening_pcg_vecops_ms_sum", 0.0) or 0.0)
         except Exception:
             pass
         return metrics

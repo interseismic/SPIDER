@@ -650,7 +650,7 @@ def compute_likelihood_loss(
                                     torch.tensor(float(min_s), device=dist.device, dtype=dist.dtype))
             sigma = torch.maximum(sigma, min_sigma)
             # Whitening path currently uses phase-wise sigma scalars; warn once if enabled.
-            if bool(params.get("_shared_event_re_whitening_enabled", False)) and not bool(params.get("_sigma_distance_warned_whiten", False)):
+            if bool(params.get("_shared_event_re_enabled", False)) and not bool(params.get("_sigma_distance_warned_whiten", False)):
                 params["_sigma_distance_warned_whiten"] = True
                 _log(
                     "Warning: sigma_distance_linear enabled, but shared_event_re whitening uses phase-wise sigma only. "
@@ -675,10 +675,14 @@ def compute_likelihood_loss(
     except Exception:
         se_enable = False
     if se_enable:
-        solver = str(params.get("_shared_event_re_solver", "pcg_sparse")).strip().lower()
+        quiet_whiten_logs = bool(params.get("_shared_event_re_logging_quiet", True)) and bool(
+            params.get("_shared_event_re_enabled", False)
+        )
+        solver = str(params.get("_shared_event_re_solver_kind", "pcg")).strip().lower()
         if not bool(params.get("_shared_event_re_solver_logged", False)):
             params["_shared_event_re_solver_logged"] = True
-            _log(f"[shared_event_re] se_enable={se_enable} solver={solver}", flush=True)
+            if not quiet_whiten_logs:
+                _log(f"[shared_event_re] se_enable={se_enable} solver={solver}", flush=True)
         if solver in {"pcg", "pcg_sparse", "pcg-sparse"}:
             # Current Phase-A implementation: quadratic-only (drop_logdet must be true; enforced by schema).
             # We compute u ≈ Σ^{-1} r per group and return:
@@ -697,10 +701,11 @@ def compute_likelihood_loss(
                 )
             if not bool(params.get("_shared_event_re_sizes_logged", False)):
                 params["_shared_event_re_sizes_logged"] = True
-                _log(
-                    f"[shared_event_re] resid_n={int(resid.numel())} idx_n={int(idx.shape[0])} grouping={grouping}",
-                    flush=True,
-                )
+                if not quiet_whiten_logs:
+                    _log(
+                        f"[shared_event_re] resid_n={int(resid.numel())} idx_n={int(idx.shape[0])} grouping={grouping}",
+                        flush=True,
+                    )
             if resid.numel() == 0 or idx.shape[0] == 0:
                 if not bool(params.get("_shared_event_re_empty_batch_logged", False)):
                     params["_shared_event_re_empty_batch_logged"] = True
@@ -720,8 +725,6 @@ def compute_likelihood_loss(
                 tau_c_p = 0.0
                 tau_c_s = 0.0
             jitter0 = float(params.get("_shared_event_re_jitter0", 1e-8))
-            pcg_max_iters = int(params.get("_shared_event_re_pcg_max_iters", 50))
-            pcg_tol = float(params.get("_shared_event_re_pcg_tol", 1e-3))
             max_rows_per_group = int(params.get("_shared_event_re_max_rows_per_group", 200000))
             max_nodes_per_group = int(params.get("_shared_event_re_max_nodes_per_group", 512))
             fallback_to_diag = bool(params.get("_shared_event_re_fallback_to_diag", True))
@@ -804,7 +807,8 @@ def compute_likelihood_loss(
 
             if not bool(params.get("_shared_event_re_entered", False)):
                 params["_shared_event_re_entered"] = True
-                _log(f"[shared_event_re] entered block solver={solver} grouping={grouping}", flush=True)
+                if not quiet_whiten_logs:
+                    _log(f"[shared_event_re] entered block solver={solver} grouping={grouping}", flush=True)
 
             # Build a shared grouping cache once so whitening and PCG can reuse it.
             grouping_cache = None
@@ -815,62 +819,37 @@ def compute_likelihood_loss(
 
             # One-time runtime log so users can confirm activation and grouping.
             # Resolve GPU enable: if unset, default to CUDA availability for this batch.
-            try:
-                gpu_enable_raw = params.get("_shared_event_re_gpu_enable", None)
-            except Exception:
-                gpu_enable_raw = None
-            if gpu_enable_raw is None:
                 gpu_enable = bool(resid.is_cuda)
-            else:
-                gpu_enable = bool(gpu_enable_raw)
 
             if not bool(params.get("_shared_event_re_logged", False)):
                 params["_shared_event_re_logged"] = True
                 try:
-                    wflag = bool(params.get("_shared_event_re_whitening_enabled", False))
-                    wmode = str(params.get("_shared_event_re_whitening_edge_weighting", "none"))
+                    wflag = bool(params.get("_shared_event_re_enabled", False))
+                    wmode = str(params.get("_shared_event_re_edge_weight_mode", "none"))
                 except Exception:
                     wflag = False
                     wmode = "none"
-                if hier_enable:
-                    _log(
-                        f"[shared_event_re] enabled=True grouping={grouping} "
-                        f"tau_event_p={float(tau_p):.4g} tau_event_s={float(tau_s):.4g} "
-                        f"tau_cluster_p={float(tau_c_p):.4g} tau_cluster_s={float(tau_c_s):.4g} "
-                        f"max_rows={int(max_rows_per_group)} max_nodes={int(max_nodes_per_group)} "
-                        f"gpu={gpu_enable} whitening={wflag} weight={wmode}",
-                        flush=True,
-                    )
-                else:
-                    _log(
-                        f"[shared_event_re] enabled=True grouping={grouping} "
-                        f"tau_p={float(tau_p):.4g} tau_s={float(tau_s):.4g} "
-                        f"max_rows={int(max_rows_per_group)} max_nodes={int(max_nodes_per_group)} "
-                        f"gpu={gpu_enable} whitening={wflag} weight={wmode}",
-                        flush=True,
-                    )
+                if not quiet_whiten_logs:
+                    if hier_enable:
+                        _log(
+                            f"[shared_event_re] enabled=True grouping={grouping} "
+                            f"tau_event_p={float(tau_p):.4g} tau_event_s={float(tau_s):.4g} "
+                            f"tau_cluster_p={float(tau_c_p):.4g} tau_cluster_s={float(tau_c_s):.4g} "
+                            f"max_rows={int(max_rows_per_group)} max_nodes={int(max_nodes_per_group)} "
+                            f"gpu={gpu_enable} whitening={wflag} weight={wmode}",
+                            flush=True,
+                        )
+                    else:
+                        _log(
+                            f"[shared_event_re] enabled=True grouping={grouping} "
+                            f"tau_p={float(tau_p):.4g} tau_s={float(tau_s):.4g} "
+                            f"max_rows={int(max_rows_per_group)} max_nodes={int(max_nodes_per_group)} "
+                            f"gpu={gpu_enable} whitening={wflag} weight={wmode}",
+                            flush=True,
+                        )
 
-            # Optional: whitening operator path (static covariance).
-            try:
-                whiten_enable = bool(params.get("_shared_event_re_whitening_enabled", False))
-            except Exception:
-                whiten_enable = False
-            try:
-                whitening_only_mode = bool(params.get("_shared_event_re_whitening_only_mode", True))
-            except Exception:
-                whitening_only_mode = True
-            if whitening_only_mode and (not whiten_enable):
-                raise ValueError(
-                    "shared_event_re.whitening_only_mode=true but whitening is disabled. "
-                    "Enable shared_event_re.whitening.enabled."
-                )
-            if (not whiten_enable) and (not bool(params.get("_shared_event_re_whitening_fallback_warned", False))):
-                params["_shared_event_re_whitening_fallback_warned"] = True
-                _log(
-                    "Warning: shared_event_re is running without whitening "
-                    "(compatibility fallback path). This is slower and not the default architecture.",
-                    flush=True,
-                )
+            # Unified whitening-first path (single solver control surface).
+            whiten_enable = True
             if whiten_enable:
                 # Quick diagnostic: compare whitening quadratic to diagonal quadratic once.
                 quad_diag = None
@@ -879,29 +858,33 @@ def compute_likelihood_loss(
                         quad_diag = 0.5 * (resid.square() / sigma.square().clamp_min(1e-24)).sum()
                 except Exception:
                     quad_diag = None
-                edge_weighting = str(params.get("_shared_event_re_whitening_edge_weighting", "uniform")).strip().lower()
-                edge_weight_ell_km = float(params.get("_shared_event_re_whitening_edge_weight_ell_km", 1.0))
-                edge_weight_eps_km = float(params.get("_shared_event_re_whitening_edge_weight_eps_km", 1e-3))
-                edge_weight_power = float(params.get("_shared_event_re_whitening_edge_weight_power", 1.0))
-                edge_weight_scale_km = float(params.get("_shared_event_re_whitening_edge_weight_scale_km", 1.0))
-                edge_weight_global_scale = float(params.get("_shared_event_re_whitening_edge_weight_global_scale", 1.0))
-                edge_weight_normalize = bool(params.get("_shared_event_re_whitening_edge_weight_normalize", False))
-                whiten_solver = str(params.get("_shared_event_re_whitening_solver", "pcg")).strip().lower()
-                whiten_pcg_max_iters = int(params.get("_shared_event_re_whitening_pcg_max_iters", 200))
-                whiten_pcg_tol = float(params.get("_shared_event_re_whitening_pcg_tol", 1e-6))
-                whiten_pcg_min_iters = int(params.get("_shared_event_re_whitening_pcg_min_iters", 0))
-                whiten_pcg_batched = bool(params.get("_shared_event_re_whitening_pcg_batched", False))
-                whiten_pcg_bucket_nodes = params.get("_shared_event_re_whitening_pcg_bucket_nodes", None)
-                cache = params.get("_shared_event_re_whitening_cache", None)
+                edge_weighting = str(params.get("_shared_event_re_edge_weight_mode", "uniform")).strip().lower()
+                edge_weight_ell_km = float(params.get("_shared_event_re_edge_weight_ell_km", 1.0))
+                edge_weight_eps_km = float(params.get("_shared_event_re_edge_weight_eps_km", 1e-3))
+                edge_weight_power = float(params.get("_shared_event_re_edge_weight_power", 1.0))
+                edge_weight_scale_km = float(params.get("_shared_event_re_edge_weight_scale_km", 1.0))
+                edge_weight_global_scale = float(params.get("_shared_event_re_edge_weight_global_scale", 1.0))
+                edge_weight_normalize = bool(params.get("_shared_event_re_edge_weight_normalize", False))
+                whiten_solver = str(params.get("_shared_event_re_solver_kind", "pcg")).strip().lower()
+                whiten_pcg_max_iters = int(params.get("_shared_event_re_solver_max_iters", 50))
+                whiten_pcg_tol = float(params.get("_shared_event_re_solver_tol", 1e-3))
+                whiten_pcg_min_iters = int(params.get("_shared_event_re_solver_min_iters", 0))
+                whiten_pcg_batched = bool(params.get("_shared_event_re_solver_batched", True))
+                whiten_pcg_bucket_nodes = params.get("_shared_event_re_solver_bucket_nodes", None)
+                whiten_pcg_merge_sparse_edge_bins = bool(params.get("_shared_event_re_solver_merge_sparse_edge_bins", True))
+                whiten_pcg_min_groups_per_edge_bin = int(params.get("_shared_event_re_solver_min_groups_per_edge_bin", 32))
+                whiten_pcg_max_edge_bins_per_node = int(params.get("_shared_event_re_solver_max_edge_bins_per_node", 4))
+                whiten_pcg_profile_micro_steps = bool(params.get("_shared_event_re_solver_profile_micro_steps", False))
+                cache = params.get("_shared_event_re_solver_cache", None)
                 if not isinstance(cache, dict):
                     cache = {}
-                cache_max = int(params.get("_shared_event_re_whitening_cache_max_entries", 0) or 0)
+                cache_max = int(params.get("_shared_event_re_solver_cache_max_entries", 0) or 0)
                 X_event = None
                 if edge_weighting in {"distance_rbf", "distance_linear", "distance_power"}:
-                    X_event = params.get("_shared_event_re_whitening_X_event", None)
+                    X_event = params.get("_shared_event_re_edge_weight_X_event", None)
                     if not isinstance(X_event, torch.Tensor) or int(X_event.shape[0]) != int(X_src.shape[0]):
                         X_event = (X_src + ΔX_src)[:, :3].detach().to(device=X_src.device, dtype=X_src.dtype)
-                        params["_shared_event_re_whitening_X_event"] = X_event
+                        params["_shared_event_re_edge_weight_X_event"] = X_event
                 batch_context = params.get("_runtime_batch_context", None)
                 if not isinstance(batch_context, dict):
                     try:
@@ -948,11 +931,15 @@ def compute_likelihood_loss(
                     cache=cache,
                     batch_context=batch_context,
                     cache_max_entries=int(cache_max),
-                    pcg_warm_start=bool(params.get("_shared_event_re_whitening_pcg_warm_start", False)),
+                    pcg_warm_start=bool(params.get("_shared_event_re_solver_warm_start", False)),
                     grouping_cache=grouping_cache,
                     cache_key_extra=cache_key_extra,
+                    pcg_merge_sparse_edge_bins=bool(whiten_pcg_merge_sparse_edge_bins),
+                    pcg_min_groups_per_edge_bin=int(whiten_pcg_min_groups_per_edge_bin),
+                    pcg_max_edge_bins_per_node=int(whiten_pcg_max_edge_bins_per_node),
+                    pcg_profile_micro_steps=bool(whiten_pcg_profile_micro_steps),
                 )
-                params["_shared_event_re_whitening_cache"] = cache
+                params["_shared_event_re_solver_cache"] = cache
                 params["_shared_event_re_whitening_last_groups"] = int(metrics_w.n_groups_total)
                 params["_shared_event_re_whitening_last_groups_chol"] = int(metrics_w.n_groups_chol)
                 params["_shared_event_re_whitening_last_groups_pcg"] = int(metrics_w.n_groups_pcg)
@@ -969,10 +956,54 @@ def compute_likelihood_loss(
                 params["_shared_event_re_whitening_last_cache_miss"] = int(metrics_w.cache_miss)
                 params["_shared_event_re_whitening_last_cache_build_ms"] = float(metrics_w.cache_build_ms)
                 params["_shared_event_re_whitening_last_solve_ms"] = float(metrics_w.solve_ms)
+                params["_shared_event_re_whitening_last_groups_pcg_candidates"] = int(metrics_w.n_groups_pcg_candidates)
+                params["_shared_event_re_whitening_last_groups_leftover"] = int(metrics_w.n_groups_leftover)
+                params["_shared_event_re_whitening_last_node_size_hist"] = dict(metrics_w.node_size_hist)
+                params["_shared_event_re_whitening_last_row_size_hist"] = dict(metrics_w.row_size_hist)
+                params["_shared_event_re_whitening_last_bucket_group_hist"] = dict(metrics_w.bucket_group_hist)
+                params["_shared_event_re_whitening_last_pcg_bucket_assign_ms"] = float(metrics_w.pcg_bucket_assign_ms)
+                params["_shared_event_re_whitening_last_pcg_bucket_merge_ms"] = float(metrics_w.pcg_bucket_merge_ms)
+                params["_shared_event_re_whitening_last_pcg_pack_ms"] = float(metrics_w.pcg_pack_ms)
+                params["_shared_event_re_whitening_last_pcg_kernel_ms"] = float(metrics_w.pcg_kernel_ms)
+                params["_shared_event_re_whitening_last_pcg_unpack_ms"] = float(metrics_w.pcg_unpack_ms)
+                params["_shared_event_re_whitening_last_pcg_leftover_ms"] = float(metrics_w.pcg_leftover_ms)
+                params["_shared_event_re_whitening_last_pcg_matvec_ms"] = float(metrics_w.pcg_matvec_ms)
+                params["_shared_event_re_whitening_last_pcg_vecops_ms"] = float(metrics_w.pcg_vecops_ms)
                 params["_shared_event_re_whitening_cache_hit_sum"] = int(params.get("_shared_event_re_whitening_cache_hit_sum", 0) or 0) + int(metrics_w.cache_hit)
                 params["_shared_event_re_whitening_cache_miss_sum"] = int(params.get("_shared_event_re_whitening_cache_miss_sum", 0) or 0) + int(metrics_w.cache_miss)
                 params["_shared_event_re_whitening_solve_ms_sum"] = float(params.get("_shared_event_re_whitening_solve_ms_sum", 0.0) or 0.0) + float(metrics_w.solve_ms)
                 params["_shared_event_re_whitening_cache_build_ms_sum"] = float(params.get("_shared_event_re_whitening_cache_build_ms_sum", 0.0) or 0.0) + float(metrics_w.cache_build_ms)
+                params["_shared_event_re_whitening_pcg_bucket_assign_ms_sum"] = float(params.get("_shared_event_re_whitening_pcg_bucket_assign_ms_sum", 0.0) or 0.0) + float(metrics_w.pcg_bucket_assign_ms)
+                params["_shared_event_re_whitening_pcg_bucket_merge_ms_sum"] = float(params.get("_shared_event_re_whitening_pcg_bucket_merge_ms_sum", 0.0) or 0.0) + float(metrics_w.pcg_bucket_merge_ms)
+                params["_shared_event_re_whitening_pcg_pack_ms_sum"] = float(params.get("_shared_event_re_whitening_pcg_pack_ms_sum", 0.0) or 0.0) + float(metrics_w.pcg_pack_ms)
+                params["_shared_event_re_whitening_pcg_kernel_ms_sum"] = float(params.get("_shared_event_re_whitening_pcg_kernel_ms_sum", 0.0) or 0.0) + float(metrics_w.pcg_kernel_ms)
+                params["_shared_event_re_whitening_pcg_unpack_ms_sum"] = float(params.get("_shared_event_re_whitening_pcg_unpack_ms_sum", 0.0) or 0.0) + float(metrics_w.pcg_unpack_ms)
+                params["_shared_event_re_whitening_pcg_leftover_ms_sum"] = float(params.get("_shared_event_re_whitening_pcg_leftover_ms_sum", 0.0) or 0.0) + float(metrics_w.pcg_leftover_ms)
+                params["_shared_event_re_whitening_pcg_matvec_ms_sum"] = float(params.get("_shared_event_re_whitening_pcg_matvec_ms_sum", 0.0) or 0.0) + float(metrics_w.pcg_matvec_ms)
+                params["_shared_event_re_whitening_pcg_vecops_ms_sum"] = float(params.get("_shared_event_re_whitening_pcg_vecops_ms_sum", 0.0) or 0.0) + float(metrics_w.pcg_vecops_ms)
+                params["_shared_event_re_whitening_groups_pcg_candidates_sum"] = int(params.get("_shared_event_re_whitening_groups_pcg_candidates_sum", 0) or 0) + int(metrics_w.n_groups_pcg_candidates)
+                params["_shared_event_re_whitening_groups_leftover_sum"] = int(params.get("_shared_event_re_whitening_groups_leftover_sum", 0) or 0) + int(metrics_w.n_groups_leftover)
+                node_hist_epoch = params.get("_shared_event_re_whitening_epoch_node_hist", None)
+                if not isinstance(node_hist_epoch, dict):
+                    node_hist_epoch = {}
+                for n_sz, cnt in metrics_w.node_size_hist.items():
+                    k = int(n_sz)
+                    node_hist_epoch[k] = int(node_hist_epoch.get(k, 0) or 0) + int(cnt)
+                params["_shared_event_re_whitening_epoch_node_hist"] = node_hist_epoch
+                row_hist_epoch = params.get("_shared_event_re_whitening_epoch_row_hist", None)
+                if not isinstance(row_hist_epoch, dict):
+                    row_hist_epoch = {}
+                for r_sz, cnt in metrics_w.row_size_hist.items():
+                    k = int(r_sz)
+                    row_hist_epoch[k] = int(row_hist_epoch.get(k, 0) or 0) + int(cnt)
+                params["_shared_event_re_whitening_epoch_row_hist"] = row_hist_epoch
+                bucket_hist_epoch = params.get("_shared_event_re_whitening_epoch_bucket_hist", None)
+                if not isinstance(bucket_hist_epoch, dict):
+                    bucket_hist_epoch = {}
+                for b_sz, cnt in metrics_w.bucket_group_hist.items():
+                    k = int(b_sz)
+                    bucket_hist_epoch[k] = int(bucket_hist_epoch.get(k, 0) or 0) + int(cnt)
+                params["_shared_event_re_whitening_epoch_bucket_hist"] = bucket_hist_epoch
                 # Mirror whitening stats into runtime stats so epoch_runner logs remain consistent.
                 params["_shared_event_re_runtime_last_grouping"] = str(grouping)
                 params["_shared_event_re_runtime_last_groups"] = int(metrics_w.n_groups_total)
@@ -988,32 +1019,33 @@ def compute_likelihood_loss(
                 params["_shared_event_re_runtime_last_max_nodes_all"] = int(metrics_w.max_nodes_seen)
                 if not bool(params.get("_shared_event_re_whitening_logged", False)):
                     params["_shared_event_re_whitening_logged"] = True
-                    _log(
-                        "[shared_event_re] whitening "
-                        f"groups={int(metrics_w.n_groups_total)} "
-                        f"chol={int(metrics_w.n_groups_chol)} "
-                        f"pcg={int(metrics_w.n_groups_pcg)} "
-                        f"fallback={int(metrics_w.n_groups_fallback_diag)} "
-                        f"max_rows={int(metrics_w.max_rows_seen)} "
-                        f"max_nodes={int(metrics_w.max_nodes_seen)} "
-                        f"w_mean={float(metrics_w.weight_mean):.3g} "
-                        f"w_max={float(metrics_w.weight_max):.3g} "
-                        f"cache_hit={int(metrics_w.cache_hit)} cache_miss={int(metrics_w.cache_miss)} "
-                        f"cache_build_ms={float(metrics_w.cache_build_ms):.2f} solve_ms={float(metrics_w.solve_ms):.2f} "
-                        f"solver={str(whiten_solver)}",
-                        flush=True,
-                    )
-                    if isinstance(quad_diag, torch.Tensor):
-                        try:
-                            qd = float(quad_diag.detach().cpu().item())
-                            qw = float(quad_w.detach().cpu().item())
-                            ratio = qw / max(qd, 1e-12)
-                            _log(
-                                f"[shared_event_re] whitening quad_diag={qd:.3g} quad_whiten={qw:.3g} ratio={ratio:.3g}",
-                                flush=True,
-                            )
-                        except Exception:
-                            pass
+                    if not quiet_whiten_logs:
+                        _log(
+                            "[shared_event_re] whitening "
+                            f"groups={int(metrics_w.n_groups_total)} "
+                            f"chol={int(metrics_w.n_groups_chol)} "
+                            f"pcg={int(metrics_w.n_groups_pcg)} "
+                            f"fallback={int(metrics_w.n_groups_fallback_diag)} "
+                            f"max_rows={int(metrics_w.max_rows_seen)} "
+                            f"max_nodes={int(metrics_w.max_nodes_seen)} "
+                            f"w_mean={float(metrics_w.weight_mean):.3g} "
+                            f"w_max={float(metrics_w.weight_max):.3g} "
+                            f"cache_hit={int(metrics_w.cache_hit)} cache_miss={int(metrics_w.cache_miss)} "
+                            f"cache_build_ms={float(metrics_w.cache_build_ms):.2f} solve_ms={float(metrics_w.solve_ms):.2f} "
+                            f"solver={str(whiten_solver)}",
+                            flush=True,
+                        )
+                        if isinstance(quad_diag, torch.Tensor):
+                            try:
+                                qd = float(quad_diag.detach().cpu().item())
+                                qw = float(quad_w.detach().cpu().item())
+                                ratio = qw / max(qd, 1e-12)
+                                _log(
+                                    f"[shared_event_re] whitening quad_diag={qd:.3g} quad_whiten={qw:.3g} ratio={ratio:.3g}",
+                                    flush=True,
+                                )
+                            except Exception:
+                                pass
                 try:
                     if not torch.isfinite(quad_w).all():
                         raise ValueError("shared_event_re whitening produced non-finite quad")
@@ -1024,428 +1056,7 @@ def compute_likelihood_loss(
                 _abort_on_pcg_fallback(params, context="whitening")
                 return float(alpha) * loss_like
 
-            # Optional GPU-native prototype path (batched PCG + grouping).
-            perm = None
-            starts = None
-            ends = None
-            if gpu_enable:
-                if not bool(params.get("_shared_event_re_gpu_logged", False)):
-                    params["_shared_event_re_gpu_logged"] = True
-                    _log("[shared_event_re] GPU path enabled", flush=True)
-                try:
-                    from spider.core import shared_event_re_gpu
-                    # Optional GPU-side cache (avoid per-batch grouping/index remap when batch is stable).
-                    cache_ok = False
-                    cache_entry = None
-                    cache_key = None
-                    try:
-                        cache_ok = int(params.get("_shared_event_re_cache_max_entries", 0) or 0) > 0
-                    except Exception:
-                        cache_ok = False
-                    # Prefer stable standard batching; fall back to event-bucket ids if present.
-                    try:
-                        bid = int(params.get("_runtime_batch_id", -1))
-                    except Exception:
-                        bid = -1
-                    try:
-                        bucket_id = int(params.get("_runtime_bucket_id", -1))
-                    except Exception:
-                        bucket_id = -1
-                    try:
-                        bucket_gen = int(params.get("_runtime_bucket_gen", -1))
-                    except Exception:
-                        bucket_gen = -1
-                    if cache_ok:
-                        try:
-                            bsz = int(keys.numel())
-                            if (not bool(params.get("_runtime_batch_shuffle", True))) and bid >= 0:
-                                cache_key = ("shared_event_re_gpu", "batch", str(grouping), int(bsz), int(bid))
-                            elif bucket_id >= 0:
-                                cache_key = ("shared_event_re_gpu", "bucket", str(grouping), int(bsz), int(bucket_id), int(bucket_gen))
-                            if cache_key is not None:
-                                cache = params.setdefault("_shared_event_re_gpu_cache", {})
-                                cache_entry = cache.get(cache_key, None) if isinstance(cache, dict) else None
-                        except Exception:
-                            cache_entry = None
-                    if (cache_entry is None) and isinstance(grouping_cache, dict):
-                        cache_entry = grouping_cache
-                        if cache_ok and cache_key is not None:
-                            try:
-                                cache = params.setdefault("_shared_event_re_gpu_cache", {})
-                                if isinstance(cache, dict):
-                                    cache[cache_key] = cache_entry
-                            except Exception:
-                                pass
-                    if cache_ok and not isinstance(cache_entry, dict):
-                        try:
-                            keys_sorted, perm0, starts0, ends0 = shared_event_re_gpu._group_by_keys_gpu(keys)
-                            lengths0 = (ends0 - starts0).to(torch.int64)
-                            group_ids0, _ = shared_event_re_gpu._build_group_ids(starts0, ends0)
-                            idx_perm0 = idx.index_select(0, perm0)
-                            u0 = idx_perm0[:, 0].to(torch.int64)
-                            v0 = idx_perm0[:, 1].to(torch.int64)
-                            max_node_id0 = int(torch.max(torch.stack([u0.max(), v0.max()])).item()) if u0.numel() > 0 else 0
-                            local_u0, local_v0, n_nodes0 = shared_event_re_gpu._build_local_node_indices(
-                                u0, v0, group_ids0, int(starts0.numel()), max_node_id=max_node_id0
-                            )
-                            ph_perm0 = ph_id.index_select(0, perm0)
-                            ph_group0 = ph_perm0.index_select(0, starts0)
-                            edge_idx0 = torch.arange(int(perm0.numel()), device=perm0.device, dtype=starts0.dtype)
-                            edge_pos0 = edge_idx0 - starts0.index_select(0, group_ids0)
-                            cache_entry = {
-                                "perm": perm0.detach(),
-                                "starts": starts0.detach(),
-                                "ends": ends0.detach(),
-                                "lengths": lengths0.detach(),
-                                "local_u": local_u0.detach(),
-                                "local_v": local_v0.detach(),
-                                "n_nodes": n_nodes0.detach(),
-                                "ph_group": ph_group0.detach(),
-                                "group_ids": group_ids0.detach(),
-                                "edge_pos": edge_pos0.detach(),
-                            }
-                            if cache_ok:
-                                cache = params.setdefault("_shared_event_re_gpu_cache", {})
-                                if isinstance(cache, dict):
-                                    if cache_key is not None:
-                                        cache[cache_key] = cache_entry
-                                    max_entries = int(params.get("_shared_event_re_cache_max_entries", 0) or 0)
-                                    if max_entries > 0 and len(cache) > max_entries:
-                                        cache.pop(next(iter(cache)))
-                        except Exception:
-                            cache_entry = None
-                    t0_gpu = time.perf_counter()
-                    quad, metrics = shared_event_re_gpu.compute_quad_gpu(
-                        idx=idx,
-                        resid=resid,
-                        keys=keys,
-                        ph_id=ph_id,
-                        sigma_p=σ_p,
-                        sigma_s=σ_s,
-                        tau_p=float(tau_p),
-                        tau_s=float(tau_s),
-                        jitter0=float(jitter0),
-                        pcg_max_iters=int(pcg_max_iters),
-                        pcg_tol=float(pcg_tol),
-                        max_rows_per_group=int(max_rows_per_group),
-                        max_nodes_per_group=int(max_nodes_per_group),
-                        fallback_to_diag=bool(fallback_to_diag),
-                        max_groups_per_batch=int(params.get("_shared_event_re_gpu_max_groups_per_batch", 64)),
-                        max_edges_per_batch=int(params.get("_shared_event_re_gpu_max_edges_per_batch", 0) or 0),
-                        enable_profile=bool(params.get("_shared_event_re_gpu_profile", False)),
-                        reuse_pcg_init=bool(params.get("_shared_event_re_gpu_reuse_pcg_init", False)),
-                        precomputed=cache_entry,
-                    )
-                    quad = quad + quad_diag_extra + quad_sp
-                    loss_like = (quad / m_tot_full) + log_sigma_mean
-                    _abort_on_pcg_fallback(params, context="gpu")
-                    if bool(params.get("_shared_event_re_gpu_profile", False)):
-                        dt_ms = float(1000.0 * (time.perf_counter() - t0_gpu))
-                        params["_shared_event_re_gpu_time_ms_sum"] = float(params.get("_shared_event_re_gpu_time_ms_sum", 0.0) or 0.0) + dt_ms
-                        params["_shared_event_re_gpu_time_ms_count"] = int(params.get("_shared_event_re_gpu_time_ms_count", 0) or 0) + 1
-                    try:
-                        params["_shared_event_re_gpu_last_groups"] = int(metrics.n_groups_total)
-                        params["_shared_event_re_gpu_last_groups_pcg"] = int(metrics.n_groups_pcg)
-                        params["_shared_event_re_gpu_last_groups_fallback_diag"] = int(metrics.n_groups_fallback_diag)
-                        params["_shared_event_re_gpu_last_groups_rows_cap"] = int(metrics.n_groups_rows_cap)
-                        params["_shared_event_re_gpu_last_groups_nodes_cap"] = int(metrics.n_groups_nodes_cap)
-                        params["_shared_event_re_gpu_last_groups_tau_zero"] = int(metrics.n_groups_tau_zero)
-                        params["_shared_event_re_gpu_last_max_rows"] = int(metrics.max_rows_seen)
-                        params["_shared_event_re_gpu_last_max_nodes"] = int(metrics.max_nodes_seen)
-                        params["_shared_event_re_gpu_last_max_rows_all"] = int(metrics.max_rows_all)
-                        params["_shared_event_re_gpu_last_max_nodes_all"] = int(metrics.max_nodes_all)
-                        # Mirror to runtime_last_* so epoch_runner logs remain consistent.
-                        params["_shared_event_re_runtime_last_grouping"] = str(grouping)
-                        params["_shared_event_re_runtime_last_groups"] = int(metrics.n_groups_total)
-                        params["_shared_event_re_runtime_last_groups_pcg"] = int(metrics.n_groups_pcg)
-                        params["_shared_event_re_runtime_last_groups_fallback_diag"] = int(metrics.n_groups_fallback_diag)
-                        params["_shared_event_re_runtime_last_groups_rows_cap"] = int(metrics.n_groups_rows_cap)
-                        params["_shared_event_re_runtime_last_groups_nodes_cap"] = int(metrics.n_groups_nodes_cap)
-                        params["_shared_event_re_runtime_last_groups_tau_zero"] = int(metrics.n_groups_tau_zero)
-                        params["_shared_event_re_runtime_last_max_rows"] = int(metrics.max_rows_seen)
-                        params["_shared_event_re_runtime_last_max_nodes"] = int(metrics.max_nodes_seen)
-                        params["_shared_event_re_runtime_last_max_rows_all"] = int(metrics.max_rows_all)
-                        params["_shared_event_re_runtime_last_max_nodes_all"] = int(metrics.max_nodes_all)
-                    except Exception:
-                        pass
-
-                    # Optional parity check: compare GPU vs CPU on a capped number of groups.
-                    debug_cap = int(params.get("_shared_event_re_gpu_debug_max_groups", 0) or 0)
-                    if debug_cap > 0:
-                        quad_dbg, _ = shared_event_re_gpu.compute_quad_gpu(
-                            idx=idx,
-                            resid=resid,
-                            keys=keys,
-                            ph_id=ph_id,
-                            sigma_p=σ_p,
-                            sigma_s=σ_s,
-                            tau_p=float(tau_p),
-                            tau_s=float(tau_s),
-                            jitter0=float(jitter0),
-                            pcg_max_iters=int(pcg_max_iters),
-                            pcg_tol=float(pcg_tol),
-                            max_rows_per_group=int(max_rows_per_group),
-                            max_nodes_per_group=int(max_nodes_per_group),
-                            fallback_to_diag=bool(fallback_to_diag),
-                            max_groups_per_batch=int(params.get("_shared_event_re_gpu_max_groups_per_batch", 64)),
-                            reuse_pcg_init=bool(params.get("_shared_event_re_gpu_reuse_pcg_init", False)),
-                            group_cap=int(debug_cap),
-                        )
-                        # CPU reference on the same capped subset
-                        keys_sorted_dbg, perm_dbg = torch.sort(keys)
-                        is_new_dbg = torch.ones_like(keys_sorted_dbg, dtype=torch.bool)
-                        if keys_sorted_dbg.numel() > 0:
-                            is_new_dbg[1:] = keys_sorted_dbg[1:] != keys_sorted_dbg[:-1]
-                        starts_dbg = torch.nonzero(is_new_dbg, as_tuple=False).reshape(-1)
-                        if starts_dbg.numel() > 0:
-                            ends_dbg = torch.cat(
-                                [starts_dbg[1:], torch.tensor([keys_sorted_dbg.numel()], device=starts_dbg.device, dtype=starts_dbg.dtype)]
-                            )
-                        else:
-                            ends_dbg = torch.zeros((0,), device=resid.device, dtype=torch.int64)
-                        ncap = min(int(debug_cap), int(starts_dbg.numel()))
-                        quad_cpu = torch.tensor(0.0, device=resid.device, dtype=resid.dtype)
-                        for si, ei in zip(starts_dbg[:ncap].tolist(), ends_dbg[:ncap].tolist()):
-                            idxs = perm_dbg[si:ei]
-                            if idxs.numel() == 0:
-                                continue
-                            idx_g = idx.index_select(0, idxs)
-                            resid_g = resid.index_select(0, idxs)
-                            ph_g = int(ph_id.index_select(0, idxs[:1]).item())
-                            tau = tau_p if ph_g == 0 else tau_s
-                            sigma_g = σ_p if ph_g == 0 else σ_s
-                            if not (float(tau) > 0.0):
-                                u_g = resid_g / sigma_g.square().clamp_min(1e-24)
-                            else:
-                                u_g = _shared_event_re_u_pcg(
-                                    idx_g=idx_g,
-                                    resid_g=resid_g,
-                                    sigma=sigma_g.clamp_min(1e-12),
-                                    tau=float(tau),
-                                    jitter0=float(jitter0),
-                                    pcg_max_iters=int(pcg_max_iters),
-                                    pcg_tol=float(pcg_tol),
-                                )
-                            quad_cpu = quad_cpu + _CollapsedQuad.apply(resid_g, u_g)
-                        denom = quad_cpu.abs().clamp_min(1e-12)
-                        params["_shared_event_re_gpu_debug_rel_err"] = float((quad_dbg - quad_cpu).abs().item() / denom.item())
-                        params["_shared_event_re_gpu_debug_groups"] = int(ncap)
-
-                    return float(alpha) * loss_like
-                except Exception as e:
-                    params["_shared_event_re_gpu_failed"] = str(e)
-                    # Fall back to the CPU path below.
-                    gpu_enable = False
-
-            # --- Optional caching of station_phase grouping (CPU path) ---
-            cache_ok = False
-            cache_entry = None
-            group_n_nodes = None
-            cache_key = None
-            try:
-                cache_ok = int(params.get("_shared_event_re_cache_max_entries", 0) or 0) > 0
-            except Exception:
-                cache_ok = False
-            try:
-                bid = int(params.get("_runtime_batch_id", -1))
-            except Exception:
-                bid = -1
-            try:
-                bucket_id = int(params.get("_runtime_bucket_id", -1))
-            except Exception:
-                bucket_id = -1
-            try:
-                bucket_gen = int(params.get("_runtime_bucket_gen", -1))
-            except Exception:
-                bucket_gen = -1
-            if cache_ok:
-                try:
-                    bsz = int(keys.numel())
-                    if (not bool(params.get("_runtime_batch_shuffle", True))) and bid >= 0:
-                        cache_key = ("shared_event_re", "batch", str(grouping), int(bsz), int(bid))
-                    elif bucket_id >= 0:
-                        cache_key = ("shared_event_re", "bucket", str(grouping), int(bsz), int(bucket_id), int(bucket_gen))
-                    if cache_key is not None:
-                        cache = params.setdefault("_shared_event_re_group_cache", {})
-                        cache_entry = cache.get(cache_key, None) if isinstance(cache, dict) else None
-                except Exception:
-                    cache_entry = None
-                    cache_key = None
-
-            if isinstance(cache_entry, dict):
-                perm = cache_entry.get("perm", None)
-                starts = cache_entry.get("starts", None)
-                ends = cache_entry.get("ends", None)
-                group_n_nodes = cache_entry.get("n_nodes", None)
-                ok = (
-                    isinstance(perm, torch.Tensor) and perm.ndim == 1 and int(perm.numel()) == int(keys.numel())
-                    and isinstance(starts, torch.Tensor) and starts.ndim == 1
-                    and isinstance(ends, torch.Tensor) and ends.ndim == 1
-                    and int(starts.numel()) == int(ends.numel())
-                )
-                if not ok:
-                    perm = None
-                    starts = None
-                    ends = None
-                    group_n_nodes = None
-
-            if not (isinstance(perm, torch.Tensor) and isinstance(starts, torch.Tensor) and isinstance(ends, torch.Tensor)):
-                keys_sorted, perm = torch.sort(keys)
-                # Run boundaries
-                if keys_sorted.numel() > 0:
-                    is_new = torch.ones_like(keys_sorted, dtype=torch.bool)
-                    is_new[1:] = keys_sorted[1:] != keys_sorted[:-1]
-                    starts = torch.nonzero(is_new, as_tuple=False).reshape(-1)
-                    ends = torch.cat([starts[1:], torch.tensor([keys_sorted.numel()], device=starts.device, dtype=starts.dtype)])
-                else:
-                    starts = torch.zeros((0,), device=resid.device, dtype=torch.int64)
-                    ends = torch.zeros((0,), device=resid.device, dtype=torch.int64)
-
-                # Precompute node counts per group (one-time per cached batch) to avoid torch.unique later.
-                if cache_ok and isinstance(starts, torch.Tensor) and int(starts.numel()) > 0:
-                    try:
-                        group_n_nodes = []
-                        for si, ei in zip(starts.tolist(), ends.tolist()):
-                            idxs = perm[si:ei]
-                            if idxs.numel() <= 0:
-                                group_n_nodes.append(0)
-                                continue
-                            idx_g = idx.index_select(0, idxs)
-                            group_n_nodes.append(int(torch.unique(idx_g.reshape(-1)).numel()))
-                    except Exception:
-                        group_n_nodes = None
-
-                # Store cache entry (best-effort)
-                if cache_ok and isinstance(cache_key, tuple):
-                    try:
-                        cache = params.setdefault("_shared_event_re_group_cache", {})
-                        if isinstance(cache, dict):
-                            cache[cache_key] = {
-                                "perm": perm.detach(),
-                                "starts": starts.detach(),
-                                "ends": ends.detach(),
-                                "n_nodes": group_n_nodes,
-                            }
-                            max_entries = int(params.get("_shared_event_re_cache_max_entries", 0) or 0)
-                            if max_entries > 0 and len(cache) > max_entries:
-                                cache.pop(next(iter(cache)))
-                    except Exception:
-                        pass
-
-            quad = torch.tensor(0.0, device=resid.device, dtype=resid.dtype)
-            # Optional: lightweight per-call workload summary (used by epoch_runner profiling/logging).
-            # We keep this extremely cheap (just counters) so it can be enabled in long runs.
-            n_groups_total = 0
-            n_groups_pcg = 0
-            n_groups_fallback_diag = 0
-            max_rows_seen = 0
-            max_nodes_seen = 0
-            # Process each group
-            for gi, (si, ei) in enumerate(zip(starts.tolist(), ends.tolist())):
-                idxs = perm[si:ei]
-                m_g = int(idxs.numel())
-                if m_g <= 0:
-                    continue
-                n_groups_total += 1
-                if m_g > max_rows_seen:
-                    max_rows_seen = m_g
-                # Decode phase for this group (0=P, 1=S)
-                ph_g = int(ph_id.index_select(0, idxs[:1]).item())
-                tau = tau_p if ph_g == 0 else tau_s
-                sigma_g = σ_p if ph_g == 0 else σ_s
-
-                if m_g > int(max_rows_per_group):
-                    if not fallback_to_diag:
-                        raise ValueError(
-                            f"shared_event_re: group too large (rows={m_g} > max_rows_per_group={max_rows_per_group}). "
-                            f"Set max_rows_per_group higher or enable fallback_to_diag."
-                        )
-                    n_groups_fallback_diag += 1
-                    u_g = resid.index_select(0, idxs) / sigma_g.square().clamp_min(1e-24)
-                    quad = quad + _CollapsedQuad.apply(resid.index_select(0, idxs), u_g)
-                    continue
-
-                idx_g = idx.index_select(0, idxs)
-                # Enforce node-count limit (avoid pathological buckets)
-                if isinstance(group_n_nodes, list) and gi < len(group_n_nodes):
-                    n_nodes = int(group_n_nodes[gi])
-                else:
-                    try:
-                        n_nodes = int(torch.unique(idx_g.reshape(-1)).numel())
-                    except Exception:
-                        n_nodes = m_g * 2
-                if n_nodes > max_nodes_seen:
-                    max_nodes_seen = n_nodes
-                if n_nodes > int(max_nodes_per_group):
-                    if not fallback_to_diag:
-                        raise ValueError(
-                            f"shared_event_re: group too large (nodes={n_nodes} > max_nodes_per_group={max_nodes_per_group}). "
-                            f"Set max_nodes_per_group higher or enable fallback_to_diag."
-                        )
-                    n_groups_fallback_diag += 1
-                    u_g = resid.index_select(0, idxs) / sigma_g.square().clamp_min(1e-24)
-                    quad = quad + _CollapsedQuad.apply(resid.index_select(0, idxs), u_g)
-                    continue
-
-                resid_g = resid.index_select(0, idxs)
-                u_g = _shared_event_re_u_pcg(
-                    idx_g=idx_g,
-                    resid_g=resid_g,
-                    sigma=sigma_g.clamp_min(1e-12),
-                    tau=float(tau),
-                    jitter0=float(jitter0),
-                    pcg_max_iters=int(pcg_max_iters),
-                    pcg_tol=float(pcg_tol),
-                )
-                if float(tau) > 0.0:
-                    n_groups_pcg += 1
-                quad = quad + _CollapsedQuad.apply(resid_g, u_g)
-
-            # Stash stats for the caller (epoch_runner) to optionally log.
-            # Note: params is a mutable dict shared across calls; we keep keys private/prefixed.
-            try:
-                params["_shared_event_re_runtime_last_grouping"] = str(grouping)
-                params["_shared_event_re_runtime_last_groups"] = int(n_groups_total)
-                params["_shared_event_re_runtime_last_groups_pcg"] = int(n_groups_pcg)
-                params["_shared_event_re_runtime_last_groups_fallback_diag"] = int(n_groups_fallback_diag)
-                params["_shared_event_re_runtime_last_max_rows"] = int(max_rows_seen)
-                params["_shared_event_re_runtime_last_max_nodes"] = int(max_nodes_seen)
-            except Exception:
-                pass
-            if not bool(params.get("_shared_event_re_logged_runtime", False)):
-                params["_shared_event_re_logged_runtime"] = True
-                _log(
-                    f"[shared_event_re] runtime grouping={grouping} groups={int(n_groups_total)} "
-                    f"pcg={int(n_groups_pcg)} fallback={int(n_groups_fallback_diag)} "
-                    f"max_rows={int(max_rows_seen)} max_nodes={int(max_nodes_seen)}",
-                    flush=True,
-                )
-            if not bool(params.get("_shared_event_re_logged_delta", False)):
-                params["_shared_event_re_logged_delta"] = True
-                try:
-                    with torch.no_grad():
-                        sigma_diag = sigma
-                        r = resid
-                        quad_diag = 0.5 * (r * (r / sigma_diag.square().clamp_min(1e-24))).sum()
-                    m_tot = float(max(int(resid.numel()), 1))
-                    loss_re = (quad / m_tot) + torch.log(sigma).mean()
-                    loss_diag = (quad_diag / m_tot) + torch.log(sigma).mean()
-                    delta = float((loss_re - loss_diag).detach().item())
-                    _log(f"[shared_event_re] loss_delta_vs_diag={delta:.6e}", flush=True)
-                except Exception as e:
-                    _log(f"[shared_event_re] loss_delta_vs_diag failed: {e}", flush=True)
-
-            # Mean over observations (to match the rest of SPIDER)
-            quad = quad + quad_diag_extra + quad_sp
-            # Keep the independent log(sigma) term for compatibility (with learn_noise_scale=false it's a constant anyway).
-            loss_like = (quad / m_tot_full) + log_sigma_mean
-            _abort_on_pcg_fallback(params, context="cpu")
-            return float(alpha) * loss_like
-        else:
-            raise NotImplementedError(
-                f"model.likelihood.shared_event_re: solver='{solver}' is not implemented. "
-                f"Supported in Phase-A: solver='pcg_sparse'."
-            )
+            # Legacy non-whitening and prototype GPU branches were removed.
     # 4. Loss Function
     loss_type = str(params.get("likelihood", "huber")).strip().lower()
 

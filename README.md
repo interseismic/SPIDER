@@ -161,8 +161,8 @@ These are commonly used in real configs but not exhaustively listed above:
 ### Likelihood extras (sample)
 
 - `model.likelihoods.sample.sigma_distance_linear`: distance‑dependent sigma (linear in separation)
-- `model.likelihoods.sample.shared_event_re.whitening`: PCG whitening preconditioner options
-- `model.likelihoods.sample.shared_event_re.edge_weighting`: distance‑based weights (`distance_power`)
+- `model.likelihoods.sample.shared_event_re.solver`: whitening-first PCG solver options
+- `model.likelihoods.sample.shared_event_re.edge_weights`: distance‑based edge weighting options
 
 ### Filters
 
@@ -285,34 +285,51 @@ Enable:
       "type": "correlated_gaussian",
       "shared_event_re": {
         "enabled": true,
-        "whitening_only_mode": true,
         "grouping": "station_phase",
         "tau_s": [0.03, 0.04],
         "max_nodes_per_group": 25000,
         "max_rows_per_group": 1500000,
-        "solver": "pcg_sparse",
-        "pcg_max_iters": 20,
-        "pcg_tol": 5e-3,
-        "gpu_max_groups_per_batch": 128,
-        "gpu_max_edges_per_batch": 1500000,
-        "gpu_reuse_pcg_init": true,
-        "edge_weighting": "distance_power",
-        "edge_weight_power": 0.25,
-        "edge_weight_scale_km": 40.0,
-        "edge_weight_global_scale": 1.0,
-        "edge_weight_normalize": true,
-        "edge_weight_eps_km": 1e-3,
-        "whitening": {
+        "solver": {
+          "kind": "pcg",
+          "max_iters": 100,
+          "min_iters": 2,
+          "tol": 3e-4,
+          "batched": true,
+          "bucket_nodes": [4096, 16384, 25000],
+          "warm_start": true,
+          "cache_max_entries": 32,
+          "profile_micro_steps": false,
+          "merge_sparse_edge_bins": true,
+          "min_groups_per_edge_bin": 32,
+          "max_edge_bins_per_node": 4,
+          "precompute": {
+            "enabled": true,
+            "device": "gpu"
+          }
+        },
+        "edge_weights": {
+          "mode": "distance_power",
+          "power": 0.25,
+          "scale_km": 40.0,
+          "global_scale": 1.0,
+          "normalize": true,
+          "eps_km": 1e-3
+        },
+        "autotune": {
           "enabled": true,
-          "solver": "pcg",
-          "pcg_batched": true,
-          "pcg_warm_start": true,
-          "pcg_bucket_nodes": [4096, 16384, 25000],
-          "pcg_max_iters": 100,
-          "pcg_tol": 3e-4,
-          "pcg_min_iters": 2,
-          "precompute": true,
-          "precompute_device": "gpu"
+          "observe_epochs": 1,
+          "latest_epoch": 2,
+          "min_groups": 128,
+          "max_bins": 8,
+          "min_bin_groups": 24,
+          "min_bucket_node": 512,
+          "min_gain": 0.08,
+          "raise_nodes_cap": true,
+          "nodes_cap_max": 65536
+        },
+        "logging": {
+          "quiet": true,
+          "stats_log_every_epochs": 0
         }
       }
     }
@@ -324,42 +341,31 @@ Key pieces:
 
 - **Grouping**: `grouping="station_phase"` groups residuals by station/phase for shared‑event correlations.
 - **Shared‑event scale**: `tau_s` per phase sets the shared‑event random‑effect scale.
-- **PCG solver**: `solver="pcg_sparse"` uses a sparse PCG solve on CPU; GPU batching controls memory.
-- **Whitening (assumed ON)**: `shared_event_re.whitening.*` configures the PCG whitening preconditioner.
+- **PCG solver**: `shared_event_re.solver.*` configures the whitening-first PCG path.
 - **Edge weights**: distance‑based weighting of residual correlations.
 
 Shared‑event correlated residual parameters:
 
 - `shared_event_re.enabled`: turn on/off the correlated residual model (required for `type="correlated_gaussian"`).
-- `shared_event_re.whitening_only_mode`: enforce whitening-only execution (default `true`).
 - `shared_event_re.grouping`: grouping strategy (`station_phase` is the only supported value).
 - `shared_event_re.tau_s`: per‑phase shared‑event scales `[P, S]`.
 - `shared_event_re.max_nodes_per_group`: cap group size to control memory/compute.
 - `shared_event_re.max_rows_per_group`: cap total residual rows per group.
-- `shared_event_re.solver`: linear solver (`pcg_sparse` for CPU PCG).
-- `shared_event_re.pcg_max_iters`: PCG iteration cap for the correlated solve.
-- `shared_event_re.pcg_tol`: PCG tolerance for the correlated solve.
-- `shared_event_re.gpu_max_groups_per_batch`: GPU batching limit for correlated solves.
-- `shared_event_re.gpu_max_edges_per_batch`: GPU edge limit per batch.
-- `shared_event_re.gpu_reuse_pcg_init`: reuse PCG initial guesses to speed repeated solves.
-- `shared_event_re.edge_weighting`: edge‑weight model (`distance_power` for distance‑based scaling).
-- `shared_event_re.edge_weight_power`: power for distance‑based edge weights.
-- `shared_event_re.edge_weight_scale_km`: distance scale (km) for edge weights.
-- `shared_event_re.edge_weight_global_scale`: global multiplier on edge weights.
-- `shared_event_re.edge_weight_normalize`: normalize weights to stabilize scaling across groups.
-- `shared_event_re.edge_weight_eps_km`: epsilon (km) to avoid divide‑by‑zero in weights.
-- `shared_event_re.whitening.enabled`: enable the whitening preconditioner.
-- `shared_event_re.whitening.solver`: whitening solver (`pcg`).
-- `shared_event_re.whitening.pcg_batched`: batch PCG whitening solves for speed.
-- `shared_event_re.whitening.pcg_warm_start`: reuse previous node solutions to reduce PCG iterations.
-- `shared_event_re.whitening.pcg_bucket_nodes`: bucket sizes for batched whitening.
-- `shared_event_re.whitening.pcg_max_iters`: PCG iteration cap for whitening.
-- `shared_event_re.whitening.pcg_tol`: PCG tolerance for whitening.
-- `shared_event_re.whitening.pcg_min_iters`: minimum PCG iterations for whitening.
-- `shared_event_re.whitening.precompute`: precompute whitening factors.
-- `shared_event_re.whitening.precompute_device`: device for precomputation (`gpu` or `cpu`).
-
-If you disable whitening, increase PCG iterations and expect slower/less stable solves.
+- `shared_event_re.solver.kind`: solver kind (`pcg`).
+- `shared_event_re.solver.max_iters` / `min_iters` / `tol`: PCG convergence controls.
+- `shared_event_re.solver.batched`: enable batched group solves.
+- `shared_event_re.solver.bucket_nodes`: node-size buckets for batched PCG.
+- `shared_event_re.solver.warm_start`: reuse previous node solutions.
+- `shared_event_re.solver.cache_max_entries`: max whitening/group cache entries.
+- `shared_event_re.solver.profile_micro_steps`: enable micro-step timing metrics.
+- `shared_event_re.solver.merge_sparse_edge_bins`: merge sparse edge bins to improve occupancy.
+- `shared_event_re.solver.min_groups_per_edge_bin` / `max_edge_bins_per_node`: edge-bin merge aggressiveness.
+- `shared_event_re.solver.precompute.enabled` / `device`: precompute grouping/weights cache.
+- `shared_event_re.edge_weights.mode`: edge‑weight model (`uniform`, `distance_rbf`, `distance_linear`, `distance_power`).
+- `shared_event_re.edge_weights.power` / `scale_km` / `global_scale` / `normalize` / `eps_km` / `ell_km`: edge-weight parameters.
+- `shared_event_re.autotune.*`: warmup bucket autotuner controls.
+- `shared_event_re.logging.quiet`: reduce verbose whitening logs.
+- `shared_event_re.logging.stats_log_every_epochs`: periodic shared-event runtime summary cadence.
 
 ## Samplers
 
