@@ -27,8 +27,56 @@ def _build_initial_state(
 
     evid_to_row = {row["evid"]: idx for idx, row in enumerate(origins0.iter_rows(named=True))}
 
-    evid1_idx = [evid_to_row[x] for x in dtimes["evid1"]]
-    evid2_idx = [evid_to_row[x] for x in dtimes["evid2"]]
+    try:
+        evid1_idx = [evid_to_row[x] for x in dtimes["evid1"]]
+        evid2_idx = [evid_to_row[x] for x in dtimes["evid2"]]
+    except KeyError as e:
+        # Provide a clear consistency error instead of a raw KeyError.
+        # This usually means dtimes references events not present in origins0,
+        # or evid dtypes differ (e.g., int vs string ids).
+        missing_e1_examples: list[object] = []
+        missing_e2_examples: list[object] = []
+        missing_e1_count = 0
+        missing_e2_count = 0
+        for x in dtimes["evid1"]:
+            if x not in evid_to_row:
+                missing_e1_count += 1
+                if len(missing_e1_examples) < 5:
+                    missing_e1_examples.append(x)
+        for x in dtimes["evid2"]:
+            if x not in evid_to_row:
+                missing_e2_count += 1
+                if len(missing_e2_examples) < 5:
+                    missing_e2_examples.append(x)
+
+        origin_evid_type = "unknown"
+        if evid_to_row:
+            try:
+                origin_evid_type = type(next(iter(evid_to_row.keys()))).__name__
+            except Exception:
+                origin_evid_type = "unknown"
+
+        dt_e1_type = "unknown"
+        dt_e2_type = "unknown"
+        try:
+            if dtimes.shape[0] > 0:
+                dt_e1_type = type(dtimes["evid1"][0]).__name__
+                dt_e2_type = type(dtimes["evid2"][0]).__name__
+        except Exception:
+            pass
+
+        missing_value = e.args[0] if len(e.args) > 0 else "<unknown>"
+        raise ValueError(
+            "Inconsistent event ids between origins0 and dtimes while building initial state. "
+            f"Missing evid example={missing_value!r}; "
+            f"missing counts: evid1={missing_e1_count}, evid2={missing_e2_count}; "
+            f"example missing evid1={missing_e1_examples}, evid2={missing_e2_examples}. "
+            f"Observed types: origins0.evid={origin_evid_type}, "
+            f"dtimes.evid1={dt_e1_type}, dtimes.evid2={dt_e2_type}. "
+            "Likely causes: (1) dtimes references events absent from origins0, "
+            "(2) origins0/dtimes came from different filtering steps or bundle files, "
+            "(3) evid dtype mismatch (e.g., int vs string)."
+        ) from e
     dtimes = dtimes.with_columns(
         [
             pl.Series(evid1_idx).alias("evid1_idx"),
