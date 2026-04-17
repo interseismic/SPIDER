@@ -83,21 +83,7 @@ ESS utilities in `spider.analysis.results`:
 
 These are useful for identifying under-mixed events and uneven exploration.
 
-## 4) Calibration against truth
-
-Calibration utility:
-
-- `spider.analysis.calibration.calibrate_event_posteriors_against_truth(...)`
-
-This compares posterior locations to a truth catalog and computes:
-
-- per-event errors (`err_x_km`, `err_y_km`, `err_z_km`, `dr_km`)
-- normalized errors and Mahalanobis diagnostics
-- coverage diagnostics for requested confidence levels
-
-Use when synthetic truth or trusted reference catalogs are available.
-
-## 5) Wasserstein prior-vs-posterior diagnostics
+## 4) Wasserstein prior-vs-posterior diagnostics
 
 Module:
 
@@ -119,56 +105,7 @@ python -m spider.analysis.prior_posterior_wasserstein \
   --dims 0,1,2
 ```
 
-## 6) Sticky-event diagnosis utility
-
-Module:
-
-- `spider.analysis.diagnose_sticky_events`
-
-Purpose:
-
-- Join ESS, posterior spread, and graph degree to highlight suspicious events (high ESS but unusually small posterior spread).
-
-Example:
-
-```bash
-python -m spider.analysis.diagnose_sticky_events \
-  --params SPIDER.json \
-  --burn-in 1000 \
-  --thin 5 \
-  --max-lag 256 \
-  --top 50 \
-  --out-csv sticky_events.csv
-```
-
-## 7) Spatial semivariogram analysis
-
-Module:
-
-- `spider.analysis.spatial`
-
-Key functions:
-
-- `compute_receiver_ratio_semivariograms(...)`
-- `plot_receiver_ratio_semivariograms(...)`
-
-These help inspect receiver-side spatial structure and station-related behavior.
-
-## 8) Graph partition analysis utilities
-
-Module:
-
-- `spider.analysis.graph_partition`
-
-Key functions:
-
-- `partition_graph_greedy_unionfind(...)`
-- `partition_graph_recursive_bisection(...)`
-- `partition_graph_disjoint_blocks(...)`
-
-These are helpful for inspecting and prototyping event-graph partitioning strategies used by shared-event workflows.
-
-## 9) Plotting tools
+## 5) Plotting tools
 
 Main plotting API (`spider.plotting`):
 
@@ -198,7 +135,7 @@ fig, ax = plot_uncertainty_histograms(summary, coords=("X", "Y", "Z", "T"))
 fig, axes = plot_event_marginal_kde2d(samples, event_index=0, coords=("X", "Y", "Z"))
 ```
 
-## 10) Typical post-processing workflow
+## 6) Typical post-processing workflow
 
 1. Read samples with thinning (`read_all_samples`).
 2. Build summary (`compute_cat_dd_and_xyz`) including `X/Y/Z/T` and `cat_dd`.
