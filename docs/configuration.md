@@ -42,3 +42,5 @@ Input/output file paths and checkpoint controls.
 - `inference.sampler.freeze_preconditioner_sampling` should match your Phase 4 policy.
 
 For shared-event PCG setup and convergence checks, see {doc}`pcg-whitening-convergence`.
+
+For a field-by-field schema reference, see {doc}`configuration-reference`.

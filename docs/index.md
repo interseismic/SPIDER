@@ -11,9 +11,12 @@ This documentation is organized for practical run setup first, then deeper techn
 quickstart
 data-formats
 configuration
+configuration-reference
 cli-workflow
 pcg-whitening-convergence
 sampler-health
+diagnostics-catalog
+outputs-and-formats
 troubleshooting
 ```
 
