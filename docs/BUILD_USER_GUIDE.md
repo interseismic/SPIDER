@@ -20,9 +20,9 @@ Open:
 
 ## Build on Read the Docs
 
-- The project root includes `.readthedocs.yml`.
+- The project root includes `.readthedocs.yaml`.
 - RTD uses `docs/conf.py` and `docs/requirements.txt`.
-- Python package install is configured with `pip install -e .`.
+- RTD install is docs-only via `docs/requirements.txt`.
 
 ## Legacy LaTeX guide
 
