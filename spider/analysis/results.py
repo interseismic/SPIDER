@@ -69,6 +69,12 @@ class EventSamplesSummary:
     # Time offset samples ("delta_t" in the HDF5 samples store), centered per event.
     # Units are seconds.
     T: Optional[np.ndarray] = None
+    # Optional per-sample chain identity aligned to centered sample axis.
+    # Values come from read_all_samples(...)[ "_sample_chain_idx" ] after burn-in/thinning.
+    sample_chain_idx: Optional[np.ndarray] = None
+    # Optional chain boundary metadata in centered sample axis.
+    chain_slices: Optional[Dict[str, Any]] = None
+    chain_segments: Optional[Dict[str, Any]] = None
     cat_dd: Optional[Any] = None
 
     @staticmethod
@@ -577,6 +583,40 @@ class EventSamplesSummary:
         if need_T:
             out.T = T_centered_all
 
+        # Propagate chain provenance (if provided by read_all_samples) onto the summary sample axis
+        # after burn-in/thinning so ESS and diagnostics can respect chain boundaries.
+        try:
+            sci_src = event_samples.get("_sample_chain_idx", None) if isinstance(event_samples, dict) else None
+            if sci_src is not None:
+                sci = _as_numpy(sci_src).reshape(-1)
+                if int(sci.shape[0]) == int(n_samples_total):
+                    keep_idx = np.arange(int(start_sample), int(n_samples_total), int(thin), dtype=np.int64)
+                    if int(keep_idx.size) > 0:
+                        sci_kept = np.asarray(sci[keep_idx], dtype=np.int64)
+                        out.sample_chain_idx = sci_kept
+                        # Derive robust run segments in case samples are not strictly chain-contiguous.
+                        segs: list[tuple[int, int, int]] = []
+                        st = 0
+                        cur = int(sci_kept[0])
+                        for i in range(1, int(sci_kept.shape[0])):
+                            ci = int(sci_kept[i])
+                            if ci != cur:
+                                segs.append((int(cur), int(st), int(i)))
+                                st = i
+                                cur = ci
+                        segs.append((int(cur), int(st), int(sci_kept.shape[0])))
+                        chain_segments: Dict[str, Any] = {}
+                        for cid, s0, s1 in segs:
+                            chain_segments.setdefault(str(int(cid)), []).append((int(s0), int(s1)))
+                        out.chain_segments = chain_segments
+                        chain_slices: Dict[str, Any] = {}
+                        for k, vv in chain_segments.items():
+                            if len(vv) == 1:
+                                chain_slices[str(k)] = (int(vv[0][0]), int(vv[0][1]))
+                        out.chain_slices = chain_slices
+        except Exception:
+            pass
+
         if "cat_dd" in include_set:
             evid_src = event_samples["event_ids"]
             evid = evid_src.detach().cpu().numpy() if isinstance(evid_src, torch.Tensor) else np.asarray(evid_src)
@@ -1037,35 +1077,108 @@ def compute_ess_summary(
 
     target_device = _choose_device(device)
 
-    ess_x = np.empty((n_events,), dtype=np.float32)
-    ess_y = np.empty((n_events,), dtype=np.float32)
-    ess_z = np.empty((n_events,), dtype=np.float32)
-    ess_t = np.empty((n_events,), dtype=np.float32)
+    ess_x = np.zeros((n_events,), dtype=np.float32)
+    ess_y = np.zeros((n_events,), dtype=np.float32)
+    ess_z = np.zeros((n_events,), dtype=np.float32)
+    ess_t = np.zeros((n_events,), dtype=np.float32)
 
-    iterator = range(0, n_events, batch_size)
-    if show_progress:
-        total_batches = (n_events + batch_size - 1) // batch_size
-        iterator = tqdm(iterator, total=total_batches, desc="Computing ESS (x,y,z,t)", leave=False)
+    chain_mode = "single_chain"
+    chain_counts: Dict[str, int] = {}
+    sci = getattr(summary, "sample_chain_idx", None)
+    use_chain_split = False
+    chain_ids_ordered: list[int] = []
+    if isinstance(sci, np.ndarray) and sci.ndim == 1 and int(sci.shape[0]) == int(n_samples):
+        vals = np.asarray(sci, dtype=np.int64)
+        uniq_valid = [int(x) for x in np.unique(vals) if int(x) >= 0]
+        if len(uniq_valid) >= 2:
+            use_chain_split = True
+            chain_mode = "multi_chain_sum"
+            # Stable order by first appearance in sample axis.
+            seen = set()
+            for x in vals.tolist():
+                xi = int(x)
+                if xi < 0 or xi in seen:
+                    continue
+                seen.add(xi)
+                chain_ids_ordered.append(xi)
+        elif len(uniq_valid) == 1:
+            chain_counts[str(int(uniq_valid[0]))] = int(np.sum(vals == int(uniq_valid[0])))
 
-    for batch_start in iterator:
-        batch_end = min(batch_start + batch_size, n_events)
-        x_batch = torch.as_tensor(summary.X[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
-        y_batch = torch.as_tensor(summary.Y[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
-        z_batch = torch.as_tensor(summary.Z[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
-        t_batch = torch.as_tensor(summary.T[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
+    if not use_chain_split:
+        iterator = range(0, n_events, batch_size)
+        if show_progress:
+            total_batches = (n_events + batch_size - 1) // batch_size
+            iterator = tqdm(iterator, total=total_batches, desc="Computing ESS (x,y,z,t)", leave=False)
 
-        ex = _compute_ess_batch_torch(x_batch, int(max_lag))
-        ey = _compute_ess_batch_torch(y_batch, int(max_lag))
-        ez = _compute_ess_batch_torch(z_batch, int(max_lag))
-        et = _compute_ess_batch_torch(t_batch, int(max_lag))
+        for batch_start in iterator:
+            batch_end = min(batch_start + batch_size, n_events)
+            x_batch = torch.as_tensor(summary.X[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
+            y_batch = torch.as_tensor(summary.Y[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
+            z_batch = torch.as_tensor(summary.Z[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
+            t_batch = torch.as_tensor(summary.T[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
 
-        ess_x[batch_start:batch_end] = ex.detach().to("cpu").numpy()
-        ess_y[batch_start:batch_end] = ey.detach().to("cpu").numpy()
-        ess_z[batch_start:batch_end] = ez.detach().to("cpu").numpy()
-        ess_t[batch_start:batch_end] = et.detach().to("cpu").numpy()
+            ex = _compute_ess_batch_torch(x_batch, int(max_lag))
+            ey = _compute_ess_batch_torch(y_batch, int(max_lag))
+            ez = _compute_ess_batch_torch(z_batch, int(max_lag))
+            et = _compute_ess_batch_torch(t_batch, int(max_lag))
 
-        if target_device.type == "cuda":
-            torch.cuda.empty_cache()
+            ess_x[batch_start:batch_end] = ex.detach().to("cpu").numpy()
+            ess_y[batch_start:batch_end] = ey.detach().to("cpu").numpy()
+            ess_z[batch_start:batch_end] = ez.detach().to("cpu").numpy()
+            ess_t[batch_start:batch_end] = et.detach().to("cpu").numpy()
+
+            if target_device.type == "cuda":
+                torch.cuda.empty_cache()
+    else:
+        vals = np.asarray(sci, dtype=np.int64)
+        if show_progress:
+            iterator_ch = tqdm(chain_ids_ordered, total=len(chain_ids_ordered), desc="Computing ESS by chain", leave=False)
+        else:
+            iterator_ch = chain_ids_ordered
+
+        for cid in iterator_ch:
+            cols = np.flatnonzero(vals == int(cid))
+            n_chain = int(cols.size)
+            if n_chain <= 0:
+                continue
+            chain_counts[str(int(cid))] = int(n_chain)
+            # Per-chain lag cap from that chain length.
+            lag_chain = min(int(max_lag), max(0, int(n_chain // 4)))
+            cols_t = torch.as_tensor(cols, dtype=torch.int64, device=target_device)
+
+            iterator = range(0, n_events, batch_size)
+            if show_progress:
+                total_batches = (n_events + batch_size - 1) // batch_size
+                iterator = tqdm(
+                    iterator,
+                    total=total_batches,
+                    desc=f"ESS chain {cid}",
+                    leave=False,
+                )
+            for batch_start in iterator:
+                batch_end = min(batch_start + batch_size, n_events)
+                x_full = torch.as_tensor(summary.X[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
+                y_full = torch.as_tensor(summary.Y[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
+                z_full = torch.as_tensor(summary.Z[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
+                t_full = torch.as_tensor(summary.T[batch_start:batch_end, :], dtype=torch.float32, device=target_device)
+
+                x_batch = x_full.index_select(1, cols_t)
+                y_batch = y_full.index_select(1, cols_t)
+                z_batch = z_full.index_select(1, cols_t)
+                t_batch = t_full.index_select(1, cols_t)
+
+                ex = _compute_ess_batch_torch(x_batch, int(lag_chain))
+                ey = _compute_ess_batch_torch(y_batch, int(lag_chain))
+                ez = _compute_ess_batch_torch(z_batch, int(lag_chain))
+                et = _compute_ess_batch_torch(t_batch, int(lag_chain))
+
+                ess_x[batch_start:batch_end] += ex.detach().to("cpu").numpy()
+                ess_y[batch_start:batch_end] += ey.detach().to("cpu").numpy()
+                ess_z[batch_start:batch_end] += ez.detach().to("cpu").numpy()
+                ess_t[batch_start:batch_end] += et.detach().to("cpu").numpy()
+
+                if target_device.type == "cuda":
+                    torch.cuda.empty_cache()
 
     # Preserve the legacy conservative ESS per event: min across spatial dims only.
     ess_xyz_min = np.minimum(np.minimum(ess_x, ess_y), ess_z)
@@ -1092,6 +1205,9 @@ def compute_ess_summary(
         "std_ess": stats_xyz["std"],
         "n_events": int(n_events),
         "n_samples": int(n_samples),
+        "chain_mode": str(chain_mode),
+        "n_chains": int(len(chain_counts)) if chain_counts else 1,
+        "chain_sample_counts": dict(chain_counts),
 
         # Per-dimension ESS arrays
         "ess_per_event_x": ess_x,

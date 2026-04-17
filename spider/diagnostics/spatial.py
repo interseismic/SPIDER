@@ -29,7 +29,7 @@ def _standardized_residuals(state) -> torch.Tensor:
 
     bs = max(int(state.batch_size_warmup or state.batch_size_sgld or 1024), 1)
     resid = compute_residuals_full(
-        state.II, state.YY, state.X_src, state.dX_src, state.model, bs, state.N
+        state.II, state.YY, state.X_src, state.dX_src, state.model, bs, state.N, params=state.params
     )  # observed - predicted
 
     # Build per-row σ from fixed phase_unc (noise learning removed).

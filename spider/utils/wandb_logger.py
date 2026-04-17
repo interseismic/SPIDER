@@ -263,9 +263,9 @@ def create_wandb_config(params: Dict[str, Any]) -> Dict[str, Any]:
 
 def init_wandb_if_enabled(params: Dict[str, Any]) -> Optional[WandbLogger]:
     """Initialize wandb logger if enabled in parameters."""
-    # Strict: `validate_and_materialize_block1` must have been run
+    # Strict: config materialization must populate legacy wandb runtime keys.
     if "use_wandb" not in params or "wandb_project_name" not in params or "wandb_run_name" not in params:
-        raise KeyError("Missing wandb configuration (expected nested `wandb` block validated by validate_and_materialize_block1).")
+        raise KeyError("Missing wandb configuration (expected materialized keys: use_wandb, wandb_project_name, wandb_run_name).")
     if not params["use_wandb"]:
         return None
     

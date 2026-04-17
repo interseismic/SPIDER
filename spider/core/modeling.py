@@ -2,7 +2,7 @@ import numpy as np
 
 import polars as pl
 import time
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -359,7 +359,7 @@ def _shared_event_re_u_pcg(
 # Core Physics / Travel Time Logic
 # -----------------------------------------------------------------------------
 
-def compute_travel_times(idx, y, X_src, ΔX_src, model):
+def compute_travel_times(idx, y, X_src, ΔX_src, model, params: Optional[dict[str, Any]] = None):
     """
     Compute predicted differential travel times.
     
@@ -373,49 +373,46 @@ def compute_travel_times(idx, y, X_src, ΔX_src, model):
     Returns:
         dt_pred: Predicted differential times [B]
     """
-    # 1. Get source positions for pairs
-    # idx[:, 0] is ID of first event, idx[:, 1] is ID of second
-    # X_src is (x, y, z, t)
-    src1 = X_src[idx[:, 0]] + ΔX_src[idx[:, 0]]
-    src2 = X_src[idx[:, 1]] + ΔX_src[idx[:, 1]]
-    
-    # 2. Extract receiver coordinates
-    # y is (dt, x_rec, y_rec, z_rec, phase)
-    X_rec = y[:, 1:4] # (x, y, z)
-    phase = y[:, 4:5] # (phase)
-    
-    # 3. Prepare batch for EikoNet
-    # Input format: (x_src, y_src, z_src, x_rec, y_rec, z_rec, phase)
-    # We stack both sources to run one large batch through the model
-    # src[:, :3] is spatial (x,y,z)
-    coords1 = torch.cat([src1[:, :3], X_rec, phase], dim=1)
-    coords2 = torch.cat([src2[:, :3], X_rec, phase], dim=1)
-    
-    batch_input = torch.cat([coords1, coords2], dim=0)
-    
-    # 4. Model Forward Pass
+    # 1. Gather paired events.
+    i0 = idx[:, 0].to(torch.int64)
+    i1 = idx[:, 1].to(torch.int64)
+    src1 = X_src.index_select(0, i0) + ΔX_src.index_select(0, i0)
+    src2 = X_src.index_select(0, i1) + ΔX_src.index_select(0, i1)
+
+    # 2. Receiver coordinates and phase.
+    X_rec = y[:, 1:4]
+    phase = y[:, 4:5]
+
+    # 3. Build one contiguous model input [2B, 7] to reduce cat/allocation churn.
+    n = int(src1.shape[0])
+    batch_input = torch.empty((2 * n, 7), device=src1.device, dtype=src1.dtype)
+    batch_input[:n, 0:3] = src1[:, :3]
+    batch_input[:n, 3:6] = X_rec
+    batch_input[:n, 6:7] = phase
+    batch_input[n:, 0:3] = src2[:, :3]
+    batch_input[n:, 3:6] = X_rec
+    batch_input[n:, 6:7] = phase
+
+    # 4. Model Forward Pass (EikoNet)
     T_pred_all = model(batch_input).squeeze()
-    
     # Split back into T1 and T2
-    n = src1.shape[0]
     T1 = T_pred_all[:n]
     T2 = T_pred_all[n:]
-    
-    # 5. Differential Time: (T2 + t2) - (T1 + t1)
-    # src[:, 3] is origin time correction
+
+    # 5. Differential Time: (T2 + t2) - (T1 + t1), where src[:,3] is origin-time correction.
     dt_pred = (T2 + src2[:, 3]) - (T1 + src1[:, 3])
     
     return dt_pred
 
 
-def compute_residuals(idx, y, X_src, ΔX_src, model):
+def compute_residuals(idx, y, X_src, ΔX_src, model, params: Optional[dict[str, Any]] = None):
     """Compute simple residuals (Observed - Predicted)."""
-    dt_pred = compute_travel_times(idx, y, X_src, ΔX_src, model)
+    dt_pred = compute_travel_times(idx, y, X_src, ΔX_src, model, params=params)
     dt_obs = y[:, 0]
     return dt_obs - dt_pred
 
 
-def compute_residuals_full(II, YY, X_src, ΔX_src, model, bs, N):
+def compute_residuals_full(II, YY, X_src, ΔX_src, model, bs, N, params: Optional[dict[str, Any]] = None):
     """Compute residuals for the entire dataset in batches."""
     residuals = torch.zeros_like(YY[:, 0])
     if N == 0:
@@ -432,7 +429,7 @@ def compute_residuals_full(II, YY, X_src, ΔX_src, model, bs, N):
             i_end = min(i + eval_bs, N)
             idx_b = II[i:i_end]
             y_b = YY[i:i_end]
-            residuals[i:i_end] = compute_residuals(idx_b, y_b, X_src, ΔX_src, model)
+            residuals[i:i_end] = compute_residuals(idx_b, y_b, X_src, ΔX_src, model, params=params)
     return residuals
 
 
@@ -615,7 +612,7 @@ def compute_likelihood_loss(
     alpha = 1.0
 
     # 1. Predict
-    dt_pred = compute_travel_times(idx, y, X_src, ΔX_src, model)
+    dt_pred = compute_travel_times(idx, y, X_src, ΔX_src, model, params=params)
     if nuisance_delta is not None:
         dt_pred = dt_pred + nuisance_delta
         
@@ -627,39 +624,6 @@ def compute_likelihood_loss(
     is_p = (phase < 0.5)
     sigma = torch.where(is_p, σ_p, σ_s)
 
-    # Optional: distance-dependent sigma (linear in event-pair separation).
-    try:
-        if bool(params.get("_sigma_distance_enable", False)):
-            slope_ps = params.get("_sigma_distance_slope_ps", [0.0, 0.0])
-            min_ps = params.get("_sigma_distance_min_sigma_ps", [0.0, 0.0])
-            max_km = params.get("_sigma_distance_max_dist_km", None)
-            slope_p = float(slope_ps[0]) if isinstance(slope_ps, (list, tuple)) and len(slope_ps) >= 2 else float(slope_ps)
-            slope_s = float(slope_ps[1]) if isinstance(slope_ps, (list, tuple)) and len(slope_ps) >= 2 else float(slope_ps)
-            min_p = float(min_ps[0]) if isinstance(min_ps, (list, tuple)) and len(min_ps) >= 2 else float(min_ps)
-            min_s = float(min_ps[1]) if isinstance(min_ps, (list, tuple)) and len(min_ps) >= 2 else float(min_ps)
-            # Event pair distance in km (XYZ already in km)
-            x1 = (X_src + ΔX_src).index_select(0, idx[:, 0])[:, :3]
-            x2 = (X_src + ΔX_src).index_select(0, idx[:, 1])[:, :3]
-            dist = torch.linalg.norm(x2 - x1, dim=1)
-            if isinstance(max_km, (int, float)) and float(max_km) > 0.0:
-                dist = dist.clamp_max(float(max_km))
-            slope = torch.where(is_p, torch.tensor(float(slope_p), device=dist.device, dtype=dist.dtype),
-                                torch.tensor(float(slope_s), device=dist.device, dtype=dist.dtype))
-            sigma = sigma + slope * dist
-            min_sigma = torch.where(is_p, torch.tensor(float(min_p), device=dist.device, dtype=dist.dtype),
-                                    torch.tensor(float(min_s), device=dist.device, dtype=dist.dtype))
-            sigma = torch.maximum(sigma, min_sigma)
-            # Whitening path currently uses phase-wise sigma scalars; warn once if enabled.
-            if bool(params.get("_shared_event_re_enabled", False)) and not bool(params.get("_sigma_distance_warned_whiten", False)):
-                params["_sigma_distance_warned_whiten"] = True
-                _log(
-                    "Warning: sigma_distance_linear enabled, but shared_event_re whitening uses phase-wise sigma only. "
-                    "Distance-dependent sigma is ignored in whitening logdet approximation.",
-                    flush=True,
-                )
-    except Exception:
-        pass
-    
     # 3. Standardized Residuals
     # Clamp sigma to avoid division by zero
     sigma = sigma.clamp_min(1e-12)
@@ -810,12 +774,15 @@ def compute_likelihood_loss(
                 if not quiet_whiten_logs:
                     _log(f"[shared_event_re] entered block solver={solver} grouping={grouping}", flush=True)
 
-            # Build a shared grouping cache once so whitening and PCG can reuse it.
+            # Optional prefetch: build grouping plan once here and pass into whitening.
+            # Default off: avoids extra sort/group work when cache lookups already hit.
             grouping_cache = None
-            try:
-                grouping_cache = build_grouping_plan(idx=idx, keys=keys, ph_id=ph_id, precomputed=None)
-            except Exception:
-                grouping_cache = None
+            prefetch_grouping = bool(params.get("_shared_event_re_solver_prefetch_grouping", False))
+            if prefetch_grouping:
+                try:
+                    grouping_cache = build_grouping_plan(idx=idx, keys=keys, ph_id=ph_id, precomputed=None)
+                except Exception:
+                    grouping_cache = None
 
             # One-time runtime log so users can confirm activation and grouping.
             # Resolve GPU enable: if unset, default to CUDA availability for this batch.
@@ -851,13 +818,15 @@ def compute_likelihood_loss(
             # Unified whitening-first path (single solver control surface).
             whiten_enable = True
             if whiten_enable:
-                # Quick diagnostic: compare whitening quadratic to diagonal quadratic once.
+                # Optional one-time diagnostic: compare whitening quadratic to diagonal quadratic.
                 quad_diag = None
-                try:
-                    with torch.no_grad():
-                        quad_diag = 0.5 * (resid.square() / sigma.square().clamp_min(1e-24)).sum()
-                except Exception:
-                    quad_diag = None
+                need_quad_diag_log = (not quiet_whiten_logs) and (not bool(params.get("_shared_event_re_whitening_logged", False)))
+                if need_quad_diag_log:
+                    try:
+                        with torch.no_grad():
+                            quad_diag = 0.5 * (resid.square() / sigma.square().clamp_min(1e-24)).sum()
+                    except Exception:
+                        quad_diag = None
                 edge_weighting = str(params.get("_shared_event_re_edge_weight_mode", "uniform")).strip().lower()
                 edge_weight_ell_km = float(params.get("_shared_event_re_edge_weight_ell_km", 1.0))
                 edge_weight_eps_km = float(params.get("_shared_event_re_edge_weight_eps_km", 1e-3))

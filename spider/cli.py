@@ -23,14 +23,10 @@ from spider.utils.console import info, warn
 
 from spider.core.data import prepare_stations
 from spider.core.analyze_resid import analyze_resid_from_bundle
-from spider.core.config_schema import (
-    validate_and_materialize_block1,
-    validate_and_materialize_block2,
-    validate_and_materialize_block3,
-    validate_and_materialize_block4,
-    validate_and_materialize_block5,
-)
-from spider.core.priors_config import validate_and_materialize_priors
+from spider.core.config_v2 import ConfigError as ConfigV2Error
+from spider.core.config_v2 import load_config as load_config_v2
+from spider.core.config_v2 import load_config_file as load_config_file_v2
+from spider.core.config_v2 import to_legacy_runtime_params
 
 
 # Standardized stdout helper
@@ -49,21 +45,20 @@ def _load_params_json(path: str) -> dict:
 		return json.load(f)
 
 
-def _validate_params_all(params: dict, *, require_priors: bool = True) -> dict:
+def _validate_params_all(params: dict, *, require_priors: bool = True, mode: Optional[str] = None) -> dict:
 	"""
-	Validate/materialize the strict nested-config schema used by the CLI.
+	Validate/materialize params for runtime commands.
 
-	This is intentionally centralized because many subcommands used to duplicate
-	the same block1..5 + priors validation sequence.
+	Input is strict config_v2 canonical JSON shape.
+	Internally we bridge via config_v2.legacy_bridge while runtime modules
+	are still being migrated away from legacy materialized keys.
 	"""
-	params = validate_and_materialize_block1(params)
-	params = validate_and_materialize_block2(params)
-	params = validate_and_materialize_block3(params)
-	params = validate_and_materialize_block4(params)
-	params = validate_and_materialize_block5(params)
-	if require_priors:
-		params = validate_and_materialize_priors(params)
-	return params
+	resolved_v2 = load_config_v2(params, mode=mode)
+	return to_legacy_runtime_params(
+		resolved_v2,
+		profile="all",
+		require_priors=bool(require_priors),
+	)
 
 
 def _validate_params_synth(params: dict) -> dict:
@@ -72,10 +67,36 @@ def _validate_params_synth(params: dict) -> dict:
 
 	Synth intentionally does not require priors and does not require all inference blocks.
 	"""
-	params = validate_and_materialize_block1(params)
-	params = validate_and_materialize_block3(params)
-	params = validate_and_materialize_block5(params)
-	return params
+	resolved_v2 = load_config_v2(params, mode="synth")
+	return to_legacy_runtime_params(resolved_v2, profile="synth", require_priors=False)
+
+
+def _cmd_validate_config(args: argparse.Namespace) -> int:
+	"""
+	Validate a config against the canonical config_v2 schema.
+
+	This command intentionally validates only config_v2 (no legacy compatibility layer).
+	"""
+	try:
+		resolved = load_config_file_v2(args.params, mode=args.mode)
+	except ConfigV2Error as e:
+		warn(str(e), section="CFGv2")
+		return 1
+	except Exception as e:
+		warn(f"Unexpected config load error: {e}", section="CFGv2")
+		return 1
+
+	info(f"Config v2 validation OK: {args.params}", section="CFGv2")
+	if resolved.defaults_applied:
+		for d in resolved.defaults_applied:
+			info(f"default applied: {d}", section="CFGv2")
+	else:
+		info("No defaults applied.", section="CFGv2")
+
+	if getattr(args, "print_resolved", False):
+		print(json.dumps(resolved.runtime, indent=2))
+
+	return 0
 
 
 def _apply_torch_runtime_settings(params: dict) -> None:
@@ -91,6 +112,11 @@ def _apply_torch_runtime_settings(params: dict) -> None:
 	      torch:
 	        allow_tf32: bool
 	        matmul_precision: "highest"|"high"|"medium"
+	        compile_eikonet: bool
+	        compile_mode: optional str (e.g. "default", "reduce-overhead", "max-autotune")
+	        compile_backend: optional str (default torch backend)
+	        compile_dynamic: optional bool
+	        compile_fullgraph: optional bool
 	"""
 	try:
 		inf = params.get("inference", None)
@@ -117,6 +143,57 @@ def _apply_torch_runtime_settings(params: dict) -> None:
 				pass
 	except Exception:
 		return
+
+
+def _maybe_compile_eikonet_model(params: dict, model: torch.nn.Module) -> torch.nn.Module:
+	"""
+	Optionally wrap EikoNet with torch.compile based on inference.runtime.torch config.
+	"""
+	try:
+		inf = params.get("inference", None)
+		rt = inf.get("runtime", None) if isinstance(inf, dict) else None
+		tc = rt.get("torch", None) if isinstance(rt, dict) else None
+		if not isinstance(tc, dict):
+			return model
+		enabled = bool(tc.get("compile_eikonet", False))
+		if not enabled:
+			return model
+	except Exception:
+		return model
+
+	if not hasattr(torch, "compile"):
+		warn("torch.compile requested but not available in this PyTorch build; continuing without compile.", section="RUN")
+		params["_torch_compile_eikonet_enabled"] = False
+		return model
+
+	kwargs = {}
+	try:
+		if tc.get("compile_mode", None) is not None:
+			kwargs["mode"] = str(tc.get("compile_mode"))
+		if tc.get("compile_backend", None) is not None:
+			kwargs["backend"] = str(tc.get("compile_backend"))
+		if tc.get("compile_dynamic", None) is not None:
+			kwargs["dynamic"] = bool(tc.get("compile_dynamic"))
+		if tc.get("compile_fullgraph", None) is not None:
+			kwargs["fullgraph"] = bool(tc.get("compile_fullgraph"))
+	except Exception:
+		pass
+
+	try:
+		model = torch.compile(model, **kwargs)  # type: ignore[attr-defined]
+		params["_torch_compile_eikonet_enabled"] = True
+		info(
+			"Enabled torch.compile for EikoNet"
+			+ (f" with options={kwargs}" if kwargs else ""),
+			section="RUN",
+		)
+	except Exception as e:
+		params["_torch_compile_eikonet_enabled"] = False
+		warn(
+			f"torch.compile requested for EikoNet but failed ({e}); continuing without compile.",
+			section="RUN",
+		)
+	return model
 
 
 def _device_from_id(device_id: int) -> torch.device:
@@ -167,7 +244,9 @@ def _load_model(params: dict, device: int | str) -> torch.nn.Module:
 	"""
 	Load and place the neural network model as configured by 'model_file'.
 	"""
-	return load_eikonet_model(params=params, device=device)
+	model = load_eikonet_model(params=params, device=device)
+	model = _maybe_compile_eikonet_model(params=params, model=model)
+	return model
 
 
 def _remap_cuda_device_ids_for_visible_devices(device_ids: list[int]) -> list[int]:
@@ -256,7 +335,7 @@ def _fail_if_torchrun_env(cmd: str) -> None:
 def _cmd_locate_full(args: argparse.Namespace) -> int:
 	"""Legacy: run the full pipeline (Phase 1 + Phase 2–4)."""
 	_fail_if_torchrun_env("locate-full")
-	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
+	params = _validate_params_all(_load_params_json(args.params), require_priors=True, mode="locate-full")
 	_apply_torch_runtime_settings(params)
 
 	if args.device is None:
@@ -309,7 +388,7 @@ def _cmd_locate_full(args: argparse.Namespace) -> int:
 def _cmd_locate_map(args: argparse.Namespace) -> int:
 	"""Run Phase 1 only, then dump a Phase-2 bundle."""
 	_fail_if_torchrun_env("locate-map")
-	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
+	params = _validate_params_all(_load_params_json(args.params), require_priors=True, mode="locate-map")
 	_apply_torch_runtime_settings(params)
 
 	if args.device is None:
@@ -368,7 +447,7 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 	"""Run Phase 2–4 starting from a Phase-2 bundle (skips Phase 1)."""
 	_fail_if_torchrun_env("sample")
 	raw_params = _load_params_json(args.params)
-	params = _validate_params_all(raw_params, require_priors=True)
+	params = _validate_params_all(raw_params, require_priors=True, mode="sample")
 	_apply_torch_runtime_settings(params)
 
 	if args.device is None:
@@ -395,7 +474,8 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 
 	# Shared-event RE visibility check (helps verify activation).
 	try:
-		lk = raw_params.get("model", {}).get("likelihood", {}) if isinstance(raw_params, dict) else {}
+		lk_groups = raw_params.get("model", {}).get("likelihoods", {}) if isinstance(raw_params, dict) else {}
+		lk = lk_groups.get("sample", {}) if isinstance(lk_groups, dict) else {}
 		shared_re_cfg = lk.get("shared_event_re", None) if isinstance(lk, dict) else None
 		if shared_re_cfg is not None:
 			enabled = bool(params.get("_shared_event_re_enabled", False))
@@ -440,7 +520,7 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 
 def _cmd_analyze_resid(args: argparse.Namespace) -> int:
 	"""Run post-Phase1 residual diagnostics from an existing Phase-2 bundle (no MAP rerun)."""
-	params = _validate_params_all(_load_params_json(args.params), require_priors=True)
+	params = _validate_params_all(_load_params_json(args.params), require_priors=True, mode="analyze-resid")
 	_apply_torch_runtime_settings(params)
 
 	if args.device is None:
@@ -497,12 +577,7 @@ def _cmd_sample_multi(args: argparse.Namespace) -> int:
 	if not bundle_path:
 		# Infer default bundle path from base checkpoint_dir
 		try:
-			p0 = validate_and_materialize_block1(json.loads(json.dumps(base_params)))
-			p0 = validate_and_materialize_block2(p0)
-			p0 = validate_and_materialize_block3(p0)
-			p0 = validate_and_materialize_block4(p0)
-			p0 = validate_and_materialize_block5(p0)
-			p0 = validate_and_materialize_priors(p0)
+			p0 = _validate_params_all(json.loads(json.dumps(base_params)), require_priors=True, mode="sample-multi")
 			ckpt_dir = str(p0.get("checkpoint_dir", p0.get("io", {}).get("checkpoint_dir", "")) or "")
 			if ckpt_dir:
 				bundle_path = os.path.join(ckpt_dir, "phase2_bundle.pth")
@@ -551,9 +626,9 @@ def _cmd_sample_multi(args: argparse.Namespace) -> int:
 		p["io"]["checkpoint_dir"] = os.path.join(ck, f"chain{ci}")
 
 		# Unique wandb run name if enabled
-		if isinstance(p.get("wandb", None), dict):
-			rn = str(p["wandb"].get("run_name", "spider"))
-			p["wandb"]["run_name"] = f"{rn}_chain{ci}"
+		if isinstance(p.get("observability", None), dict) and isinstance(p["observability"].get("wandb", None), dict):
+			rn = str(p["observability"]["wandb"].get("run_name", "spider"))
+			p["observability"]["wandb"]["run_name"] = f"{rn}_chain{ci}"
 
 		fd, tmp_path = tempfile.mkstemp(prefix=f"spider_chain{ci}_", suffix=".json", dir=out_dir)
 		os.close(fd)
@@ -897,7 +972,7 @@ def _cmd_synth(args: argparse.Namespace) -> int:
 					np.column_stack([X_col[i0:i1], Y_col[i0:i1], Z_col[i0:i1], PH_col[i0:i1]]).astype(np.float32),
 					device=device, dtype=torch.float32
 				)
-				dt_pred[i0:i1] = compute_travel_times(II_chunk, Y_chunk, X_src, dX_src, model).detach().cpu().numpy().astype(np.float32)
+				dt_pred[i0:i1] = compute_travel_times(II_chunk, Y_chunk, X_src, dX_src, model, params=params).detach().cpu().numpy().astype(np.float32)
 
 			dt_syn = dt_pred.astype(np.float32).copy()
 			if amp > 0.0:
@@ -971,7 +1046,7 @@ def _cmd_synth(args: argparse.Namespace) -> int:
 				]).astype(np.float32),
 				device=device, dtype=torch.float32,
 			)
-			dt_pred = compute_travel_times(II_chunk, Y_chunk, X_src, dX_src, model).detach().cpu().numpy().astype(np.float32)
+			dt_pred = compute_travel_times(II_chunk, Y_chunk, X_src, dX_src, model, params=params).detach().cpu().numpy().astype(np.float32)
 			dt_syn = dt_pred.copy()
 
 			# Optional correlated path term per station-phase
@@ -1102,6 +1177,23 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	p_synth.add_argument("params", help="Path to parameter JSON file")
 	p_synth.add_argument("--device", type=int, required=True, help="CUDA device id to use (required)")
 	p_synth.set_defaults(func=_cmd_synth)
+
+	# validate-config subcommand (config_v2 only)
+	p_val = subparsers.add_parser("validate-config", help="Validate params against canonical config_v2 schema (breaking, no compatibility layer)")
+	p_val.add_argument("params", help="Path to parameter JSON file")
+	p_val.add_argument(
+		"--mode",
+		type=str,
+		default=None,
+		choices=["locate-map", "sample", "sample-multi", "analyze-resid", "locate-full", "synth"],
+		help="Optional command mode for mode-specific validation checks.",
+	)
+	p_val.add_argument(
+		"--print-resolved",
+		action="store_true",
+		help="Print resolved runtime config JSON after validation.",
+	)
+	p_val.set_defaults(func=_cmd_validate_config)
 
 	return parser
 

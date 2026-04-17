@@ -123,9 +123,10 @@ SPIDER reads CSVs via Polars. Required columns:
 
 ## Configuration
 
-SPIDER uses a strict **nested JSON** schema. The validator is implemented in:
+SPIDER uses a strict **nested JSON** schema. The canonical validator/loader is implemented in:
 
-- `spider/core/config_schema.py`
+- `spider/core/config_v2/validate.py`
+- `spider/core/config_v2/load.py`
 - `spider/core/priors_config.py`
 
 Key sections:
@@ -152,7 +153,19 @@ Paths and output settings:
 - `compute.devices`: list of GPU device ids
 - `sampler`: backend and hyperparameters
 - `batching`: batch sizes and optional event‑batching
-- `diagnostics`: logging and post‑hoc diagnostics
+- `runtime.torch` (optional): torch runtime/perf controls, including:
+  - `allow_tf32`: bool
+  - `matmul_precision`: `"highest" | "high" | "medium"`
+  - `compile_eikonet`: bool (enable `torch.compile` on EikoNet model)
+  - `compile_mode`: optional compile mode (`"default"`, `"reduce-overhead"`, `"max-autotune"`, etc.)
+  - `compile_backend`: optional compile backend (e.g., `"inductor"`)
+  - `compile_dynamic`: optional bool
+  - `compile_fullgraph`: optional bool
+
+### `observability`
+
+- `wandb`: run enable/project/name
+- `diagnostics`: metric grouping and online diagnostics toggles
 
 ## Additional configuration blocks
 
@@ -160,7 +173,6 @@ These are commonly used in real configs but not exhaustively listed above:
 
 ### Likelihood extras (sample)
 
-- `model.likelihoods.sample.sigma_distance_linear`: distance‑dependent sigma (linear in separation)
 - `model.likelihoods.sample.shared_event_re.solver`: whitening-first PCG solver options
 - `model.likelihoods.sample.shared_event_re.edge_weights`: distance‑based edge weighting options
 
@@ -202,12 +214,8 @@ These are commonly used in real configs but not exhaustively listed above:
 
 ### Diagnostics
 
-- `inference.diagnostics.wandb.groups`: metric group switches
-- `inference.diagnostics.shared_event_legcorr2d`: correlated‑residual diagnostics
-- `inference.diagnostics.resid_distribution`: residual histograms/QQ
-- `inference.diagnostics.shared_event_re_tau`: tau grid search
-- `inference.diagnostics.resid_scalar_metrics`: binned residual metrics
-- `inference.diagnostics.truth_catalog`: optional truth catalog for eval
+- `observability.diagnostics.wandb.groups`: metric group switches
+- `observability.diagnostics.ess_online`: optional online ESS/IACT diagnostics
 
 ### Runtime and safety
 
@@ -236,6 +244,9 @@ spider locate-full my_params.json --device 0
 
 # Multi‑GPU independent chains
 spider sample-multi my_params.json --devices 0,1,2,3
+
+# Validate config schema (canonical config_v2)
+spider validate-config my_params.json --mode sample
 ```
 
 ## Likelihoods and correlated residuals
@@ -248,7 +259,6 @@ The correlated Gaussian likelihood uses per‑phase noise (for `model.likelihood
 
 - `model.likelihoods.sample.type`: residual distribution (use `correlated_gaussian`).
 - `phase_unc`: per‑phase noise standard deviation `[P, S]` applied to residuals.
-- `sigma_distance_linear`: optional distance‑dependent sigma (linear in event‑pair separation) to broaden uncertainty for wide pairs.
 
 ## Priors
 
@@ -285,23 +295,37 @@ Enable:
       "type": "correlated_gaussian",
       "shared_event_re": {
         "enabled": true,
-        "grouping": "station_phase",
-        "tau_s": [0.03, 0.04],
-        "max_nodes_per_group": 25000,
-        "max_rows_per_group": 1500000,
+        "model": {
+          "group_by": "station_phase",
+          "tau_s": [0.03, 0.04],
+          "cluster": { "mode": "none", "k": 1 }
+        },
+        "limits": {
+          "max_nodes": 25000,
+          "max_rows": 1500000
+        },
+        "fallback": {
+          "to_diag": true,
+          "abort_on_pcg_fallback": false
+        },
+        "numerics": {
+          "jitter0": 1e-8,
+          "jitter_max": 1e-3
+        },
         "solver": {
           "kind": "pcg",
           "max_iters": 100,
           "min_iters": 2,
           "tol": 3e-4,
           "batched": true,
-          "bucket_nodes": [4096, 16384, 25000],
+          "node_bin_edges": [4096, 16384, 25000],
           "warm_start": true,
           "cache_max_entries": 32,
+          "prefetch_grouping": false,
           "profile_micro_steps": false,
-          "merge_sparse_edge_bins": true,
-          "min_groups_per_edge_bin": 32,
-          "max_edge_bins_per_node": 4,
+          "merge_sparse_node_bins": true,
+          "min_groups_per_node_bin": 32,
+          "max_node_bins_per_node": 4,
           "precompute": {
             "enabled": true,
             "device": "gpu"
@@ -320,9 +344,9 @@ Enable:
           "observe_epochs": 1,
           "latest_epoch": 2,
           "min_groups": 128,
-          "max_bins": 8,
-          "min_bin_groups": 24,
-          "min_bucket_node": 512,
+          "max_node_bins": 8,
+          "min_groups_per_node_bin": 24,
+          "min_node_bin": 512,
           "min_gain": 0.08,
           "raise_nodes_cap": true,
           "nodes_cap_max": 65536
@@ -339,33 +363,139 @@ Enable:
 
 Key pieces:
 
-- **Grouping**: `grouping="station_phase"` groups residuals by station/phase for shared‑event correlations.
-- **Shared‑event scale**: `tau_s` per phase sets the shared‑event random‑effect scale.
+- **Model term**: `shared_event_re.model.group_by` defines how residuals are grouped (currently `station_phase`), and `shared_event_re.model.tau_s` sets per-phase shared-event scale.
+- **Limits**: `limits.max_nodes` / `limits.max_rows` cap group sizes and directly control fallback risk.
 - **PCG solver**: `shared_event_re.solver.*` configures the whitening-first PCG path.
 - **Edge weights**: distance‑based weighting of residual correlations.
 
-Shared‑event correlated residual parameters:
+### PCG whitening setup guide
 
-- `shared_event_re.enabled`: turn on/off the correlated residual model (required for `type="correlated_gaussian"`).
-- `shared_event_re.grouping`: grouping strategy (`station_phase` is the only supported value).
-- `shared_event_re.tau_s`: per‑phase shared‑event scales `[P, S]`.
-- `shared_event_re.max_nodes_per_group`: cap group size to control memory/compute.
-- `shared_event_re.max_rows_per_group`: cap total residual rows per group.
-- `shared_event_re.solver.kind`: solver kind (`pcg`).
-- `shared_event_re.solver.max_iters` / `min_iters` / `tol`: PCG convergence controls.
-- `shared_event_re.solver.batched`: enable batched group solves.
-- `shared_event_re.solver.bucket_nodes`: node-size buckets for batched PCG.
-- `shared_event_re.solver.warm_start`: reuse previous node solutions.
-- `shared_event_re.solver.cache_max_entries`: max whitening/group cache entries.
-- `shared_event_re.solver.profile_micro_steps`: enable micro-step timing metrics.
-- `shared_event_re.solver.merge_sparse_edge_bins`: merge sparse edge bins to improve occupancy.
-- `shared_event_re.solver.min_groups_per_edge_bin` / `max_edge_bins_per_node`: edge-bin merge aggressiveness.
-- `shared_event_re.solver.precompute.enabled` / `device`: precompute grouping/weights cache.
-- `shared_event_re.edge_weights.mode`: edge‑weight model (`uniform`, `distance_rbf`, `distance_linear`, `distance_power`).
-- `shared_event_re.edge_weights.power` / `scale_km` / `global_scale` / `normalize` / `eps_km` / `ell_km`: edge-weight parameters.
-- `shared_event_re.autotune.*`: warmup bucket autotuner controls.
-- `shared_event_re.logging.quiet`: reduce verbose whitening logs.
-- `shared_event_re.logging.stats_log_every_epochs`: periodic shared-event runtime summary cadence.
+Use this sequence when standing up a new run:
+
+1. Set `model.likelihoods.sample.type` to `correlated_gaussian` and `shared_event_re.enabled=true`.
+2. Keep `shared_event_re.model.group_by="station_phase"` and provide physically sensible `tau_s`.
+3. Start with conservative limits (`limits.max_nodes`, `limits.max_rows`) and allow fallback (`fallback.to_diag=true`) while tuning.
+4. Use PCG (`solver.kind="pcg"`) and keep `solver.batched=true` unless debugging.
+5. Enable warmup autotune (`autotune.enabled=true`) so node caps/bins can adjust early.
+6. Turn on periodic stats (`logging.stats_log_every_epochs`) and inspect fallback/convergence counters.
+
+### Parameter reference and tuning intent
+
+`shared_event_re.model`:
+
+- `group_by`: grouping strategy. Current supported value is `station_phase`.
+- `tau_s`: per-phase RE scale `[P, S]`. Too small can force near-diagonal behavior (`tau_zero` fallbacks); too large can worsen conditioning.
+- `cluster.mode`, `cluster.k`: optional grouping controls for cluster-aware behavior.
+
+`shared_event_re.limits`:
+
+- `max_nodes`: hard cap on group node count. Groups above this cap can fall back to diagonal.
+- `max_rows`: hard cap on per-group row count. Groups above this cap can fall back to diagonal.
+- Tune these first when you see many fallback reasons `rows_cap` / `nodes_cap`.
+
+`shared_event_re.fallback`:
+
+- `to_diag`: if `true`, problematic groups gracefully use diagonal approximation.
+- `abort_on_pcg_fallback`: if `true`, raises immediately when fallback occurs; use for strict debugging/CI, usually `false` in production tuning.
+
+`shared_event_re.numerics`:
+
+- `jitter0`: base stabilizer added to the node-space system.
+- `jitter_max`: upper bound for jitter escalation in robust solve paths.
+- If you see non-finite/unstable solves, increase `jitter0` modestly before relaxing other controls.
+
+`shared_event_re.solver` (core PCG controls):
+
+- `kind`: keep as `pcg`.
+- `max_iters`: upper bound on PCG iterations. Raise if convergence is consistently truncated.
+- `min_iters`: force a minimum iteration count (helps avoid over-optimistic early exits on noisy batches).
+- `tol`: convergence tolerance. Smaller is more accurate but slower.
+- `batched`: enables grouped batched PCG (recommended).
+- `node_bin_edges`: bucket edges used by batched PCG. Keep this consistent with observed group sizes so groups stay on the PCG path.
+- `warm_start`: can help iterative stability across repeated group structures, but is optional for correctness.
+- `cache_max_entries`: cache budget for whitening state. Too small may reduce warm-start reuse.
+- `merge_sparse_node_bins`, `min_groups_per_node_bin`, `max_node_bins_per_node`: control sparse-bin consolidation for batched solves.
+- `precompute.enabled`, `precompute.device`: optional precompute of whitening structures; does not change target distribution.
+
+`shared_event_re.edge_weights`:
+
+- `mode`: `uniform`, `distance_rbf`, `distance_linear`, or `distance_power`.
+- `ell_km`: RBF length scale.
+- `scale_km`: scale parameter for distance-power/linear formulations.
+- `power`: exponent for `distance_power`.
+- `eps_km`: distance floor for numerical safety.
+- `global_scale`: global multiplier.
+- `normalize`: normalize weights inside each group.
+
+`shared_event_re.autotune` (warmup bucket optimizer):
+
+- `enabled`: turns on one-shot warmup tuning.
+- `observe_epochs` / `latest_epoch`: window where tuning is allowed.
+- `min_groups`: minimum observed groups before making changes.
+- `max_node_bins`: upper bound on node bins in proposed plan.
+- `min_groups_per_node_bin`: sparsity threshold used by autotuner scoring.
+- `min_node_bin`: smallest allowed node bin edge.
+- `min_gain`: required score improvement to accept new bins.
+- `raise_nodes_cap`: allows increasing `limits.max_nodes` when observed groups exceed current cap.
+- `nodes_cap_max`: hard ceiling for autotuned `max_nodes`.
+
+`shared_event_re.logging`:
+
+- `quiet`: suppresses extra one-off whitening prints.
+- `stats_log_every_epochs`: emits periodic per-epoch whitening stats and fallback reasons.
+
+### Recommended convergence-first preset
+
+For most large real-data runs, start with:
+
+- `solver.max_iters: 50-100`
+- `solver.tol: 1e-3 to 3e-4`
+- `solver.min_iters: 2`
+- `solver.batched: true`
+- `limits.max_nodes: 25k-100k` depending on memory
+- `limits.max_rows: 1.5M-4M`
+- `numerics.jitter0: 1e-8` (increase gradually if solves are brittle)
+- `autotune.enabled: true` with early window (`observe_epochs: 1`, `latest_epoch: 2`)
+
+Optional operational knobs (`node_bin_edges`, cache, precompute, sparse-bin merge) can be tuned after convergence/fallback behavior is stable.
+
+### How to verify PCG convergence and no-fallback behavior
+
+Enable periodic logging and track these counters:
+
+- `shared_event_re/groups_pcg_mean`
+- `shared_event_re/groups_fallback_diag_mean`
+- `shared_event_re/max_rows_max`, `shared_event_re/max_nodes_max`
+- periodic console fallback summary: `rows_cap`, `nodes_cap`, `tau_zero`
+
+Healthy signs:
+
+- `groups_pcg_mean > 0`.
+- `groups_fallback_diag_mean ~ 0` (or very close to zero).
+- No repeated warnings that all groups fell back to diagonal.
+- Fallback reason counters (`rows_cap`, `nodes_cap`, `tau_zero`) remain zero in steady state.
+
+### Convergence/fallback troubleshooting
+
+`fallback_diag` is high:
+
+- Increase `limits.max_nodes` and/or `limits.max_rows`.
+- Check `tau_s` is strictly positive for both phases.
+- Temporarily set `fallback.abort_on_pcg_fallback=true` to force immediate failure and inspect causes.
+
+All groups are falling back to diagonal:
+
+- Raise `limits.max_nodes` until `max_nodes_max` is comfortably below the limit.
+- Raise `limits.max_rows` until `max_rows_max` is comfortably below the limit.
+- Verify `tau_s` has no zeros and is not effectively collapsed by config mistakes.
+- Keep `solver.kind="pcg"` and `solver.batched=true`.
+
+PCG convergence appears weak or brittle:
+
+- Raise `max_iters`.
+- Tighten `tol` if you need stricter convergence; relax only if solves become numerically fragile.
+- Increase `jitter0` modestly for stability.
+- Keep `fallback.abort_on_pcg_fallback=true` during debugging to catch failures early.
 
 ## Samplers
 
@@ -385,7 +515,8 @@ Common settings:
 - `beta`: RMSProp/EMA decay for preconditioning statistics.
 - `sghmc_alpha`: friction term for SGHMC (only used when `backend="sghmc"`).
 - `preconditioning.enabled`: toggle RMSProp‑style preconditioning.
-- `preconditioning.type`: preconditioner type (e.g., `rmsprop`).
+- `preconditioning.type`: preconditioner type (`rmsprop` or `lrd`).
+- `preconditioning.lrd.rank` / `mode` / `update_every` / `buffer_size`: LRD controls.
 
 ## Batching and performance
 
@@ -411,11 +542,9 @@ Optional event‑level batching:
 
 ## Diagnostics
 
-`inference.diagnostics` controls:
+`observability.diagnostics` controls:
 
 - W&B logging groups
-- Residual distribution diagnostics
-- Shared‑event correlation diagnostics (`shared_event_legcorr2d`)
 - Online ESS (optional)
 
 ## WandB outputs
@@ -423,14 +552,16 @@ Optional event‑level batching:
 Enable W&B with:
 
 ```json
-"wandb": {
-  "enabled": true,
-  "project_name": "spider_runs",
-  "run_name": "my_run"
+"observability": {
+  "wandb": {
+    "enabled": true,
+    "project_name": "spider_runs",
+    "run_name": "my_run"
+  }
 }
 ```
 
-Metric groups are controlled by `inference.diagnostics.wandb.groups`. Common groups:
+Metric groups are controlled by `observability.diagnostics.wandb.groups`. Common groups:
 
 - `core`: total loss, likelihood, priors
 - `noise`: phase noise and variance‑related metrics
@@ -439,7 +570,7 @@ Metric groups are controlled by `inference.diagnostics.wandb.groups`. Common gro
 - `resid_rms`: residual RMS by phase
 - `corr_error`: correlated‑residual diagnostics (shared‑event RE)
 
-If you do not see a group, check `inference.diagnostics.wandb.groups` in your config.
+If you do not see a group, check `observability.diagnostics.wandb.groups` in your config.
 
 ## Learning rate tuning (variance ratio)
 
@@ -515,13 +646,14 @@ fig, ax = plot_uncertainty_histograms(summary, coords=("X", "Y", "Z", "T"))
 If you use SPIDER in your research, please cite:
 
 ```bibtex
-@misc{ross2026spiderscalableprobabilisticinference,
-  title={SPIDER: Scalable Probabilistic Inference for Differential Earthquake Relocation},
-  author={Zachary E. Ross and John D. Wilding and Kamyar Azizzadenesheli and Aitaro Kato},
+@article{ross2026spider,
+  title={SPIDER: Scalable probabilistic inference for differential earthquake relocation},
+  author={Ross, Zachary E and Wilding, John D and Azizzadenesheli, Kamyar and Kato, Aitaro},
+  journal={Journal of Geophysical Research: Solid Earth},
+  volume={131},
+  number={3},
+  pages={e2025JB032769},
   year={2026},
-  eprint={2508.12117},
-  archivePrefix={arXiv},
-  primaryClass={physics.geo-ph},
-  url={https://arxiv.org/abs/2508.12117}
+  publisher={Wiley Online Library}
 }
 ```

@@ -330,95 +330,6 @@ def _get_diagnostics_cfg(params: dict) -> dict:
         raise KeyError("Missing required config block: inference.diagnostics")
     return d
 
-def _update_svrg_snapshot(state: LocateState, batch_size: int, optimizer: torch.optim.Optimizer) -> None:
-    """
-    Compute full gradient at current parameters and store as snapshot.
-    This is an expensive O(N) operation.
-    """
-    _log("SVRG: Updating full gradient snapshot...")
-    
-    # Store snapshot of parameters
-    state.svrg_dX_snapshot = state.dX_src.detach().clone()
-    
-    # Compute full gradient as an *average-gradient* consistent with our minibatch convention.
-    # IMPORTANT:
-    # - Do NOT call posterior_loss in a per-batch loop: it includes the prior term scaled by 1/N,
-    #   which would get counted multiple times.
-    # - Instead: add the prior ONCE, and add likelihood contributions as a weighted sum of batch means.
-    from spider.core.modeling import compute_likelihood_loss, compute_prior_loss
-    
-    # Clear any existing grads
-    optimizer.zero_grad(set_to_none=True)
-    if state.dX_src.grad is not None:
-        state.dX_src.grad.zero_()
-    
-    N = int(state.N)
-    bs = max(int(batch_size), 10000)  # use a large batch for efficiency if possible
-    
-    # Current noise scales (constant during this snapshot computation)
-    σp, σs = _current_noise_scales(state)
-    
-    # 1. Prior
-    l_prior = compute_prior_loss(
-        ΔX_src=state.dX_src,
-        prior_event=state.prior_event,
-        prior_centroid=state.prior_centroid,
-        σ_p=σp,
-        σ_s=σs,
-        N_total=state.N,
-        params=state.params,
-        cluster_ids=state.cluster_ids,
-        cluster_counts=state.cluster_counts,
-        event_precision_matrix=state.event_precision_matrix,
-    )
-    l_prior.backward()
-    
-    # 2. Likelihood
-    for i in range(0, N, bs):
-        i_end = min(i + bs, N)
-        bs_curr = i_end - i
-        
-        II_b = state.II[i:i_end]
-        YY_b = state.YY[i:i_end]
-             
-        # Compute mean NLL for this batch
-        nll_batch = compute_likelihood_loss(
-            idx=II_b,
-            y=YY_b,
-            X_src=state.X_src,
-            ΔX_src=state.dX_src,
-            model=state.model,
-            σ_p=σp,
-            σ_s=σs,
-            params=state.params,
-            nuisance_delta=None
-        )
-        
-        # Scale by fraction of total data to contribute to global mean
-        loss_chunk = nll_batch * (bs_curr / N)
-        loss_chunk.backward()
-        
-    # Store result
-    state.svrg_grad_full = state.dX_src.grad.detach().clone()
-    
-    # Zero out again to leave clean state
-    state.dX_src.grad.zero_()
-    
-    # Scale adjustment if user wants Total Gradient logic
-    # (Check if optimizer scales by N_obs)
-    # The optimizer wrapper usually handles scaling.
-    # However, if we feed this into the SVRG correction formula:
-    # v = g_batch - g_snap + g_full
-    # All terms must be consistently scaled.
-    # Our batches in _run_epoch produce gradients from posterior_loss().
-    # posterior_loss() returns Average Posterior NLL.
-    # So g_batch is Average Gradient.
-    # Our g_full computation above produces Average Gradient.
-    # So they match! 
-    # (The optimizer might multiply by N later, but that applies to the sum v, which is fine).
-    
-    _log(f"SVRG: Snapshot updated. Grad norm: {state.svrg_grad_full.norm().item():.3e}")
-
 def _set_backend_noise(optimizer: torch.optim.Optimizer, *, enabled: bool, scale: float) -> None:
     """Set noise flags consistently for any sampler backend."""
     if not hasattr(optimizer, "param_groups"):
@@ -590,15 +501,6 @@ def _run_epoch(
     # Noise setup (generic sampler backend)
     # If noise_scale_factor > 0, enable noise; else disable (e.g., Phase 2). Phase 3 ramps it.
     _set_backend_noise(optimizer, enabled=(noise_scale_factor > 0.0), scale=float(noise_scale_factor))
-    # SVRG Snapshot Update (only if SVRG enabled and we are sampling)
-    svrg_enabled = state.svrg_enable and is_sampling
-    if ddp_enabled and svrg_enabled:
-        raise ValueError("SVRG is not supported in torchrun/DDP mode (it requires extra full-gradient bookkeeping). Disable inference.diagnostics.svrg.enabled.")
-    if svrg_enabled:
-        # Check if we need to update snapshot (e.g. every epoch)
-        # For simplicity, update at start of every epoch for now if enabled
-        _update_svrg_snapshot(state, batch_size=batch_size, optimizer=optimizer)
-
     try:
         diag0 = _get_diagnostics_cfg(state.params)
         # Optional profiling: collapsed shared_event_re likelihood (PCG) cost + workload stats.
@@ -1320,10 +1222,19 @@ def _run_epoch(
                             section="LIKELIHOOD",
                         )
                     if g_fb > 0:
-                        info(
-                            f"shared_event_re fallback reasons rows_cap={g_rows} nodes_cap={g_nodes} tau_zero={g_tau0}",
-                            section="LIKELIHOOD",
-                        )
+                        # Avoid per-batch log spam; emit fallback reason summary once per epoch.
+                        try:
+                            ep_rt = int(state.params.get("_runtime_epoch_index", -1))
+                            ep_last = int(state.params.get("_shared_event_re_fallback_logged_epoch", -10**9))
+                        except Exception:
+                            ep_rt = -1
+                            ep_last = -10**9
+                        if ep_rt != ep_last:
+                            state.params["_shared_event_re_fallback_logged_epoch"] = int(ep_rt)
+                            info(
+                                f"shared_event_re fallback reasons rows_cap={g_rows} nodes_cap={g_nodes} tau_zero={g_tau0}",
+                                section="LIKELIHOOD",
+                            )
                         if (not ddp_enabled) or ddp_is_main:
                             if bool(state.params.get("_shared_event_re_autotune_raise_nodes_cap", True)) and (g_nodes > 0):
                                 cur = int(state.params.get("_shared_event_re_max_nodes_per_group", 0) or 0)
@@ -1576,6 +1487,8 @@ def _run_epoch(
                     g_tau0 = int(state.params.get("_shared_event_re_runtime_last_groups_tau_zero", 0) or 0)
                     mr = int(state.params.get("_shared_event_re_runtime_last_max_rows", 0) or 0)
                     mn = int(state.params.get("_shared_event_re_runtime_last_max_nodes", 0) or 0)
+                    mr_all = int(state.params.get("_shared_event_re_runtime_last_max_rows_all", mr) or mr)
+                    mn_all = int(state.params.get("_shared_event_re_runtime_last_max_nodes_all", mn) or mn)
                     tg = state.params.get("_shared_event_re_tau_s", [0.0, 0.0])
                     if (not quiet_w_logs) and (not bool(state.params.get("_shared_event_re_reported", False))):
                         state.params["_shared_event_re_reported"] = True
@@ -1585,10 +1498,19 @@ def _run_epoch(
                             section="LIKELIHOOD",
                         )
                     if g_fb > 0:
-                        info(
-                            f"shared_event_re fallback reasons rows_cap={g_rows} nodes_cap={g_nodes} tau_zero={g_tau0}",
-                            section="LIKELIHOOD",
-                        )
+                        # Avoid per-batch log spam; emit fallback reason summary once per epoch.
+                        try:
+                            ep_rt = int(state.params.get("_runtime_epoch_index", -1))
+                            ep_last = int(state.params.get("_shared_event_re_fallback_logged_epoch", -10**9))
+                        except Exception:
+                            ep_rt = -1
+                            ep_last = -10**9
+                        if ep_rt != ep_last:
+                            state.params["_shared_event_re_fallback_logged_epoch"] = int(ep_rt)
+                            info(
+                                f"shared_event_re fallback reasons rows_cap={g_rows} nodes_cap={g_nodes} tau_zero={g_tau0}",
+                                section="LIKELIHOOD",
+                            )
                         if (not ddp_enabled) or ddp_is_main:
                             if bool(state.params.get("_shared_event_re_autotune_raise_nodes_cap", True)) and (g_nodes > 0):
                                 cur = int(state.params.get("_shared_event_re_max_nodes_per_group", 0) or 0)
@@ -1800,53 +1722,6 @@ def _run_epoch(
                     )
             except Exception:
                 pass
-
-        # SVRG Correction
-        if svrg_enabled and state.svrg_grad_full is not None and state.svrg_dX_snapshot is not None:
-            # 1. Compute grad at snapshot location for THIS batch
-            # We need to temporarily swap dX_src to snapshot
-            # Detach current grad first
-            grad_batch_current = state.dX_src.grad.clone()
-            
-            # Swap params
-            dX_current_data = state.dX_src.data.clone()
-            state.dX_src.data.copy_(state.svrg_dX_snapshot)
-            if state.dX_src.grad is not None:
-                state.dX_src.grad.zero_()
-                
-            # Compute loss at snapshot
-            loss_snap = posterior_loss(
-                idx=II_b,
-                y=YY_b,
-                X_src=state.X_src,
-                ΔX_src=state.dX_src, # Now holding snapshot
-                model=state.model,
-                prior_event=state.prior_event,
-                prior_centroid=state.prior_centroid,
-                σ_p=σp,
-                σ_s=σs,
-                N_total=state.N,
-                params=state.params,
-                nuisance_delta=nuisance_delta,
-                cluster_ids=state.cluster_ids,
-                cluster_counts=state.cluster_counts,
-                event_precision_matrix=state.event_precision_matrix,
-            )
-            loss_snap.backward()
-            grad_batch_snapshot = state.dX_src.grad
-            
-            # Restore current params
-            state.dX_src.data.copy_(dX_current_data)
-            
-            # Apply Correction: g = g_curr - g_snap + g_full
-            # Note: We must handle potential None grads or shape mismatches carefully
-            if grad_batch_snapshot is not None:
-                # Corrected gradient
-                corrected_grad = grad_batch_current - grad_batch_snapshot + state.svrg_grad_full
-                state.dX_src.grad.copy_(corrected_grad)
-            else:
-                # Fallback: restore original
-                state.dX_src.grad.copy_(grad_batch_current)
 
         # Grad Checks
         if state.dX_src.grad is not None and not torch.isfinite(state.dX_src.grad).all():

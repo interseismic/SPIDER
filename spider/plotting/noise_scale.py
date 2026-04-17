@@ -10,8 +10,8 @@ import torch
 import json
 import h5py
 
-from spider.core.config_schema import validate_and_materialize_block1
-from spider.core.priors_config import validate_and_materialize_priors
+from spider.core.config_v2 import load_config as load_config_v2
+from spider.core.config_v2 import to_legacy_runtime_params
 
 
 
@@ -147,13 +147,11 @@ def plot_noise_scale_posterior_vs_prior(
             _log(f"plot_noise_scale_posterior_vs_prior: failed to read params from '{params}': {e}")
             return False
 
-    # If params is a nested config dict (new schema), materialize legacy flat keys for this plot.
-    # Do NOT attempt to re-validate if the caller already passed a materialized dict (which contains
-    # legacy flat keys and would be rejected by strict validators).
+    # If params is a canonical config_v2 dict (nested), materialize runtime keys for this plot.
     if isinstance(params, dict) and ("io" in params) and ("dtime_file" not in params):
         try:
-            params = validate_and_materialize_block1(params)
-            params = validate_and_materialize_priors(params)
+            resolved = load_config_v2(params, mode="sample")
+            params = to_legacy_runtime_params(resolved, profile="all", require_priors=True)
         except Exception as e:
             _log(f"plot_noise_scale_posterior_vs_prior: invalid params config: {e}")
             return False

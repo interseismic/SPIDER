@@ -6,23 +6,26 @@
         "catalog_outfile": "./SPIDER_out.cat",
         "samples_outfile": "./SPIDER_samples.h5",
         "checkpoint_dir": "./checkpoints/",
-        "checkpoint_interval": 100,
+        "checkpoint_interval": 1000,
         "save_every_n": 10,
         "write_samples": true
     },
-    "wandb": {
-        "enabled": true,
-        "project_name": "spider_paper",
-        "run_name": "ridgecrest_syn"
-    },
     "model": {
-        "model_file": "./model_state_dict.pt",
+        "model_file": "/home/zross/git/SPIDER/cahuilla/experiments/eikonet_compact_hybrid_test/model_state_dict.pt",
+        "eikonet": {
+            "n_hidden": 16,
+            "n_blocks": 4,
+            "n_fourier": 4,
+            "phase_emb_dim": 6,
+            "use_fourier": true,
+            "t2_log_scale": 0.1
+        },
         "domain": {
             "lon_min": -119.6127,
             "lat_min": 33.8856,
-            "z_min": -2.0,
-            "z_max": 30.0,
-            "scale": 400.0
+            "z_min": -5.0,
+            "z_max": 80.0,
+            "scale": 500.0
         },
         "priors": {
             "event": {
@@ -53,36 +56,59 @@
         "likelihoods": {
             "locate_map": {
                 "type": "laplace",
-                "phase_unc": [0.02, 0.03]
+                "phase_unc": [
+                    0.02,
+                    0.03
+                ]
             },
             "sample": {
                 "type": "correlated_gaussian",
-                "phase_unc": [0.02, 0.03],
-                "sigma_distance_linear": {
-                    "enabled": false,
-                    "slope_s_per_km": [0.0028, 0.0093],
-                    "min_sigma_s": [0.0, 0.0],
-                    "max_dist_km": 200.0
-                },
+                "phase_unc": [
+                    0.02,
+                    0.03
+                ],
                 "shared_event_re": {
                     "enabled": true,
-                    "grouping": "station_phase",
-                    "tau_s": [0.033, 0.06],
-                    "max_nodes_per_group": 25000,
-                    "max_rows_per_group": 1500000,
+                    "model": {
+                        "group_by": "station_phase",
+                        "tau_s": [
+                            0.033,
+                            0.06
+                        ],
+                        "cluster": {
+                            "mode": "none",
+                            "k": 1
+                        }
+                    },
+                    "limits": {
+                        "max_nodes": 25000,
+                        "max_rows": 1500000
+                    },
+                    "fallback": {
+                        "to_diag": true,
+                        "abort_on_pcg_fallback": false
+                    },
+                    "numerics": {
+                        "jitter0": 1e-08,
+                        "jitter_max": 0.001
+                    },
                     "solver": {
                         "kind": "pcg",
                         "max_iters": 100,
                         "min_iters": 2,
-                        "tol": 3e-4,
+                        "tol": 0.0003,
                         "batched": true,
-                        "bucket_nodes": [4096, 16384, 25000],
-                        "warm_start": true,
+                        "node_bin_edges": [
+                            4096,
+                            16384,
+                            25000
+                        ],
+                        "warm_start": false,
                         "cache_max_entries": 32,
                         "profile_micro_steps": true,
-                        "merge_sparse_edge_bins": true,
-                        "min_groups_per_edge_bin": 32,
-                        "max_edge_bins_per_node": 4,
+                        "merge_sparse_node_bins": true,
+                        "min_groups_per_node_bin": 32,
+                        "max_node_bins_per_node": 4,
                         "precompute": {
                             "enabled": true,
                             "device": "gpu"
@@ -90,20 +116,21 @@
                     },
                     "edge_weights": {
                         "mode": "distance_power",
+                        "ell_km": 1.0,
                         "power": 0.25,
                         "scale_km": 40.0,
                         "global_scale": 1.0,
                         "normalize": true,
-                        "eps_km": 1e-3
+                        "eps_km": 0.001
                     },
                     "autotune": {
                         "enabled": true,
                         "observe_epochs": 1,
                         "latest_epoch": 2,
                         "min_groups": 128,
-                        "max_bins": 8,
-                        "min_bin_groups": 24,
-                        "min_bucket_node": 512,
+                        "max_node_bins": 8,
+                        "min_groups_per_node_bin": 24,
+                        "min_node_bin": 512,
                         "min_gain": 0.08,
                         "raise_nodes_cap": true,
                         "nodes_cap_max": 65536
@@ -149,116 +176,39 @@
         }
     },
     "inference": {
-        "compute": {
-            "devices": [
-                6
-            ]
-        },
         "sampler": {
             "backend": "psgld",
-            "epochs_per_phase": [1000, 100,100, 100000],
-            "lr": [1e-3, 1e-2, 1e-2, 1e-2],
-            "dt_lr_mult": 0.2,
+            "epochs_per_phase": [
+                10000,
+                2000,
+                1000,
+                100000
+            ],
+            "lr": [
+                0.001,
+                5e-4,
+                5e-4,
+                5e-4
+            ],
+            "dt_lr_mult": 0.05,
             "temperature": 1.0,
-            "eps": 1e-5,
-            "sghmc_alpha": 1e-1,
+            "eps": 1e-05,
+            "sghmc_alpha": null,
             "preconditioning": {
                 "enabled": true,
-                "type": "rmsprop",
-                "include_gamma": false
-            },
-            "beta": 0.99,
-            "freeze_preconditioner_sampling": false,
-            "dd_prec_enable": false
-        },
-        "diagnostics": {
-            "pair_count_stats_enable": true,
-            "sgld_log_gnoise": false,
-            "sgld_log_temperature": false,
-            "display_precond_every": 50,
-            "wandb": {
-                "enabled": true,
-                "groups": {
-                    "core": true,
-                    "noise": true,
-                    "ess_online": true,
-                    "sampler": true,
-                    "precond": true,
-                    "fixed_eval": false,
-                    "resid_rms": true,
-                    "priors": false,
-                    "latent_field": false,
-                    "profile_shared_event_re": true,
-                    "corr_error": true,
-                    "sgnht": true
+                "type": "lrd",
+                "include_gamma": false,
+                "lrd": {
+                    "rank": 32,
+                    "mode": "oja",
+                    "update_every": 20,
+                    "buffer_size": 64,
+                    "eta": 0.02,
+                    "diag_floor": 1e-4
                 }
             },
-            "fim": {
-                "enable_phase2": false,
-                "filter_threshold": 1.0
-            },
-            "svrg": {
-                "enabled": false
-            },
-            "shared_event_legcorr2d": {
-                "enabled": true,
-                "n_rows": 200000000,
-                "batch_size": 50000000,
-                "max_leg_km": 1.5,
-                "n_bins": 50,
-                "log_bins": true,
-                "max_pairs_per_event": 10000,
-                "max_pairs_total": 4000000000,
-                "min_pairs_cell": 300,
-                "aggregate_phases": false,
-                "standardize_by_sigma": true,
-                "locations_at": "map"
-            },
-            "resid_distribution": {
-                "enabled": true,
-                "residuals_at": "map",
-                "make_plots": true,
-                "histogram": true,
-                "hist_bins": 200,
-                "hist_range_s": [-0.2, 0.2],
-                "histogram_initial_only": true
-            },
-            "shared_event_re_tau": {
-                "enabled": true,
-                "station_phase_re": true,
-                "residuals_at": "truth",
-                "n_rows": 2000000,
-                "batch_size": 50000,
-                "seed": 0,
-                "sigma_source": "none",
-                "sigma_quantile": 0.2,
-                "hierarchical": false,
-                "method": "logdet",
-                "tau_grid_min": 0.005,
-                "tau_grid_max": 0.2,
-                "tau_grid_n": 16,
-                "logdet_max_nodes": 800,
-                "logdet_max_edges": 40000,
-                "logdet_max_groups": 8
-            },
-            "truth_catalog": {
-                "path": "./true_cat_from_yifan.csv",
-                "time_source": "map",
-                "time_ref": "min",
-                "require_all": false
-              },
-            "resid_scalar_metrics": {
-                "enabled": true,
-                "residuals_at": "truth",
-                "n_rows": 1000000,
-                "batch_size": 50000,
-                "sigma_source": "params",
-                "sigma_quantile": 0.2,
-                "min_rows_per_group": 200,
-                "min_rows_per_event": 20,
-                "dist_bins": 8,
-                "min_rows_per_bin": 50
-            }
+            "beta": 0.99,
+            "freeze_preconditioner_sampling": true
         },
         "batching": {
             "standard": {
@@ -283,11 +233,6 @@
             ]
         },
         "runtime": {
-            "phase_mads_interval": {
-                "phase2": 0,
-                "phase3": 0,
-                "phase4": 0
-            },
             "cuda_empty_cache_every": 0,
             "reset_batch_numbers": true,
             "clear_samples_on_reset": true,
@@ -305,6 +250,41 @@
                 ],
                 "apply_noise": true,
                 "apply_momentum": true
+            }
+        }
+    },
+    "observability": {
+        "wandb": {
+            "enabled": true,
+            "project_name": "spider_paper",
+            "run_name": "ridgecrest_syn"
+        },
+        "diagnostics": {
+            "pair_count_stats_enable": true,
+            "sgld_log_gnoise": false,
+            "sgld_log_temperature": false,
+            "display_precond_every": 50,
+            "profile_shared_event_re": false,
+            "wandb": {
+                "enabled": true,
+                "groups": {
+                    "core": true,
+                    "noise": true,
+                    "ess_online": true,
+                    "sampler": true,
+                    "precond": true,
+                    "fixed_eval": false,
+                    "resid_rms": true,
+                    "priors": false,
+                    "latent_field": false,
+                    "corr_error": true
+                }
+            },
+            "truth_catalog": {
+                "path": "./true_cat_from_yifan.csv",
+                "time_source": "map",
+                "time_ref": "min",
+                "require_all": false
             }
         }
     }

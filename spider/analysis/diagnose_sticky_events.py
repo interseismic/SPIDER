@@ -1,15 +1,3 @@
-from spider.utils.console import info, warn
-
-
-# Standardized stdout helper
-def _log(*parts, section: str = "ANALYSIS", **_kwargs) -> None:
-    msg = " ".join(str(p) for p in parts)
-    low = msg.strip().lower()
-    if low.startswith("warning") or low.startswith("error"):
-        warn(msg, section=section)
-    else:
-        info(msg, section=section)
-
 """
 Diagnose "sticky" events: suspiciously high ESS and unrealistically low uncertainty.
 
@@ -35,29 +23,26 @@ from typing import Dict, Any, Optional
 import numpy as np
 import polars as pl
 
+from spider.utils.console import info, warn
+from spider.core.config_v2 import load_config as load_config_v2
+from spider.core.config_v2 import to_legacy_runtime_params
+
+
+# Standardized stdout helper
+def _log(*parts, section: str = "ANALYSIS", **_kwargs) -> None:
+    msg = " ".join(str(p) for p in parts)
+    low = msg.strip().lower()
+    if low.startswith("warning") or low.startswith("error"):
+        warn(msg, section=section)
+    else:
+        info(msg, section=section)
+
 
 def _materialize_params(params_path: str) -> Dict[str, Any]:
-    from spider.core.config_schema import (
-        validate_and_materialize_block1,
-        validate_and_materialize_block2,
-        validate_and_materialize_block3,
-        validate_and_materialize_block4,
-        validate_and_materialize_block5,
-    )
-    from spider.core.priors_config import validate_and_materialize_priors
-
     with open(params_path, "r") as f:
         p = json.load(f)
-    for fn in (
-        validate_and_materialize_block1,
-        validate_and_materialize_block2,
-        validate_and_materialize_block3,
-        validate_and_materialize_block4,
-        validate_and_materialize_block5,
-        validate_and_materialize_priors,
-    ):
-        p = fn(p)
-    return p
+    resolved = load_config_v2(p, mode="sample")
+    return to_legacy_runtime_params(resolved, profile="all", require_priors=True)
 
 
 def _degree_table_from_dtimes(dtimes: pl.DataFrame) -> pl.DataFrame:

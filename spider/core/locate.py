@@ -44,7 +44,6 @@ from spider.core.shared_event_re_whitening import build_whitening_cache_entry, _
 from spider.core.state import (
     LocateState,
     _clamp_dX_inplace,
-    _attach_dd_preconditioner_metric,
     _current_noise_scales,
 )
 
@@ -201,22 +200,6 @@ def _sampler_extra_metrics(optimizer: Optional[torch.optim.Optimizer]) -> Dict[s
         pass
 
     return metrics
-
-
-
-
-def _compute_phase_mads(
-    state: LocateState, batch_size: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    residuals = compute_residuals_full(
-        state.II, state.YY, state.X_src, state.dX_src, state.model, batch_size, state.N
-    )
-    idx_p = torch.nonzero(state.YY[:, 4] < 0.5)
-    idx_s = torch.nonzero(state.YY[:, 4] > 0.5)
-    mad_p = med_abs_dev_torch(residuals[idx_p])
-    mad_s = med_abs_dev_torch(residuals[idx_s])
-    return mad_p, mad_s
-
 @torch.no_grad()
 def _summarize_nuisance_amplitude(state: LocateState) -> None:
     """
@@ -302,7 +285,9 @@ def _shift_guard_check(state: LocateState, *, context: str = "") -> None:
     except Exception:
         bs = 1
     zero_dX = torch.zeros_like(state.dX_src, device=state.dX_src.device)
-    res_init = compute_residuals_full(state.II, state.YY, state.X_src, zero_dX, state.model, bs, state.N)
+    res_init = compute_residuals_full(
+        state.II, state.YY, state.X_src, zero_dX, state.model, bs, state.N, params=state.params
+    )
     res_np = res_init.detach().cpu().numpy()
     dt_with_resid = state.dtimes.with_columns(pl.Series("resid_init", res_np))
     # Print details for each offending event
@@ -414,13 +399,13 @@ def _pre_filter_outlier_residuals(state: LocateState, *, use_current_dX: bool = 
     with torch.no_grad():
         if use_current_dX:
             residuals = compute_residuals_full(
-                state.II, state.YY, state.X_src, state.dX_src, state.model, bs, state.N
+                state.II, state.YY, state.X_src, state.dX_src, state.model, bs, state.N, params=state.params
             )
         else:
             # Evaluate residuals at ΔX=0 (i.e., current X_src + 0)
             zero_dX = torch.zeros_like(state.dX_src, device=state.dX_src.device)
             residuals = compute_residuals_full(
-                state.II, state.YY, state.X_src, zero_dX, state.model, bs, state.N
+                state.II, state.YY, state.X_src, zero_dX, state.model, bs, state.N, params=state.params
             )
         # Build keep mask
         abs_thr = abs_max if (abs_max is not None and float(abs_max) > 0.0) else float("inf")
@@ -547,7 +532,7 @@ def _print_initial_residual_stats(state: LocateState) -> None:
     # Evaluate residuals at ΔX=0 (i.e., current X_src + 0)
     zero_dX = torch.zeros_like(state.dX_src, device=state.dX_src.device)
     residuals = compute_residuals_full(
-        II, YY, state.X_src, zero_dX, state.model, bs, N_eval
+        II, YY, state.X_src, zero_dX, state.model, bs, N_eval, params=state.params
     )
     idx_p = torch.nonzero(YY[:, 4] < 0.5).squeeze(-1)
     idx_s = torch.nonzero(YY[:, 4] > 0.5).squeeze(-1)
@@ -658,20 +643,6 @@ def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=No
         
         # Log metrics to wandb if enabled
         if wandb_logger:
-            # metrics dict already has dx_mean etc. But logger expects "mad_p" etc?
-            # _run_epoch returns simplified metrics dict.
-            # Original code computed MADs explicitly.
-            # We need to compute MADs if not in _run_epoch.
-            # For simplicity, _run_epoch does NOT compute MADs by default to save time.
-            # We can add it there or do it here. 
-            # The original code did it: if epoch % 10 == 0 or last epoch.
-            # We'll replicate that here.
-            mad_p_val: Optional[float] = None
-            mad_s_val: Optional[float] = None
-            if epoch % 10 == 0 or epoch == state.params["phase1_epochs"] - 1:
-                 mp, ms = _compute_phase_mads(state, state.batch_size_warmup)
-                 mad_p_val, mad_s_val = mp.item(), ms.item()
-            
             wandb_metrics = {k:v for k,v in metrics.items()}
             # Noise scales (learned or fixed)
             try:
@@ -684,12 +655,6 @@ def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=No
                 })
             except Exception:
                 pass
-            # Only include MADs when computed to avoid periodic zero spikes
-            if mad_p_val is not None and mad_s_val is not None:
-                wandb_metrics.update({
-                    "mad_p": mad_p_val,
-                    "mad_s": mad_s_val,
-                })
             wandb_metrics.update({
                 "learning_rate": state.optimizer.param_groups[0]['lr']
             })
@@ -1187,7 +1152,6 @@ def _resume_or_initialize(state: LocateState):
 
     # adopt tensors and stats from checkpoint
     state.dX_src = ckpt["ΔX_src"]  # type: ignore[assignment]
-    _attach_dd_preconditioner_metric(state)
     # Ensure the optimizer (used in phase1) points at the resumed tensor
     try:
         state.optimizer.param_groups[0]['params'][0] = state.dX_src  # type: ignore[index]
@@ -1508,8 +1472,8 @@ def _phase2_preconditioner(
         if 'noise_scale' in g:
             g['noise_scale'] = 0.0
 
-        # include blockdiag_fisher (alias: matrix_ema) and non-diagonal metrics as valid Phase 2 preconditioners
-        if user_preconditioning and user_precond_type in {"rmsprop", "blockdiag_fisher", "matrix_ema", "monge", "shampoo"}:
+        # Only keep preconditioners currently supported in runtime.
+        if user_preconditioning and user_precond_type in {"rmsprop", "lrd"}:
             g['preconditioner'] = user_precond_type
             g['preconditioning'] = True
             g['freeze_preconditioner'] = False
@@ -1527,15 +1491,6 @@ def _phase2_preconditioner(
         if ddp_main:
             _maybe_autotune_whitening_bucket_nodes(state, epoch)
         
-        # --- per-epoch summary (like phase 3 style) ---
-        # Control MAD computation frequency to avoid full-dataset passes
-        phase2_interval = int(state.params.get("phase2_mads_interval", 0 if state.event_batch_enable else 10))
-        mad_p_val: Optional[float] = None
-        mad_s_val: Optional[float] = None
-        if phase2_interval > 0 and (epoch % phase2_interval == 0 or epoch == state.params["phase2_epochs"] - 1):
-            mp, ms = _compute_phase_mads(state, state.batch_size_sgld)
-            mad_p_val, mad_s_val = mp.item(), ms.item()
-
         # NOTE:
         # - We intentionally do NOT log drift_ratio_* metrics (removed; too noisy/expensive).
         # - We DO log SGHMC grad_noise_to_langevin + t_eff_var_over_target when SGHMC noise is enabled
@@ -1562,11 +1517,6 @@ def _phase2_preconditioner(
                     })
             except Exception:
                 pass
-            if mad_p_val is not None and mad_s_val is not None:
-                wandb_metrics.update({
-                    "mad_p": mad_p_val,
-                    "mad_s": mad_s_val,
-                })
             
             # Hierarchical prior stats are logged centrally in epoch_runner; avoid duplicating here.
 
@@ -1638,135 +1588,6 @@ def _phase2_preconditioner(
             event_precision_matrix=state.event_precision_matrix,
         )
     
-    # Compute FIM diagnostics and/or install FIM Preconditioner
-    try:
-        # Check standard config parameter for preconditioner type
-        precond_type = str(state.params["sampler_preconditioner"]).lower()
-        # Full-dataset FIM workflow is only enabled explicitly via 'fim'.
-        # (User-facing preconditioner type 'matrix' was removed; use 'blockdiag_fisher' (alias: 'matrix_ema')
-        # for online 4x4 block-diagonal preconditioning.)
-        use_fim = (precond_type in {"fim"})
-        
-        # Also run diagnostics if explicitly requested, even if not using it for sampling
-        run_diag = bool(state.params.get("fim_enable_phase2", False))
-        
-        if run_diag or use_fim:
-            from spider.diagnostics.fim import compute_block_fim, analyze_fim_stability, filter_unstable_events
-            _log("\n--- Fisher Information Matrix Diagnostics (End of Phase 2) ---")
-            
-            # Compute only diagonal blocks if we just want to filter (much faster)
-            # Only compute sparse if we are actually using matrix preconditioner
-            # Or if user debug requested
-            # NOTE: Current block-diagonal implementation only uses fim_diag.
-            # Sparse is only needed if we implement SVRG-2nd-order or similar.
-            need_sparse = False 
-            
-            fim_diag, fim_sparse = compute_block_fim(state, batch_size=4096, return_sparse=need_sparse)
-            
-            # Run stability analysis on diagonal blocks
-            analyze_fim_stability(fim_diag)
-            
-            # Filter Unstable Events if configured
-            # This physically removes them from the state before Phase 3
-            filter_thr = float(state.params.get("fim_filter_threshold", 0.0))
-            if filter_thr > 0.0:
-                n_dropped = filter_unstable_events(state, fim_diag, threshold=filter_thr)
-                if n_dropped > 0:
-                    # If we dropped events, we must re-compute FIM if we plan to use it for preconditioning!
-                    # Because indices have shifted.
-                    _log("Events dropped. Re-computing FIM for preconditioner...")
-                    fim_diag, fim_sparse = compute_block_fim(state, batch_size=4096, return_sparse=need_sparse)
-                    
-                    # Re-initialize the sampler optimizer completely
-                    # This ensures no stale state (momentum, RMSprop) from old parameters exists.
-                    _log("Re-initializing sampler optimizer due to parameter change...")
-                    
-                    # _setup_sampler is defined in THIS file, just call it directly.
-                    # No need to import.
-                    new_sampler = _setup_sampler(state)
-                    # We may need to transplant state if we wanted to keep it, but here we explicitly WANT a reset.
-                    # However, if Phase 2 had built up useful preconditioner stats (RMSProp), we lose them.
-                    # But if we use FIM preconditioner (Matrix), it is injected below anyway.
-                    # If using RMSProp, we restart warm-up in Phase 3. This is acceptable.
-                    state.sampler = new_sampler
-            
-            _log("----------------------------------------------------------\n")
-
-            # Install FIM as preconditioner if requested
-            if use_fim:
-                _log("Installing FIM-based Block-Diagonal Preconditioner for Phase 3/4...")
-                # fim_diag is (N, 4, 4) (Sum over observations)
-                
-                # Scale FIM by 1/N to get "Average Fisher Information"
-                # This aligns the scale of the inverse with the scale of the gradients (if using total gradient)
-                # RMSProp effectively scales updates by N.
-                # Natural Gradient (FIM) scales updates by 1.
-                # To match RMSProp magnitude convention (so 'lr' means similar thing), we scale by N.
-                # Scaling M^{-1} by N is equivalent to dividing M by N.
-                # M_avg = F_total / N + damping
-                
-                # Damping logic:
-                # We apply damping to M before inversion.
-                damping = float(state.params.get("fim_damping", 1e-2))
-                I_eye = torch.eye(4, device=state.device, dtype=fim_diag.dtype).unsqueeze(0)
-                M = fim_diag + damping * I_eye
-                
-                try:
-                    # M is the curvature (Precision). We need M^{-1} for drift and noise cov.
-                    # M = L_M @ L_M.T
-                    L_M = torch.linalg.cholesky(M)
-                    
-                    # We need L_fac such that L_fac @ L_fac.T = M^{-1}
-                    # M^{-1} = (L_M @ L_M.T)^{-1} = L_M^{-T} @ L_M^{-1}
-                    # Let L_fac = L_M^{-T} (Upper triangular)
-                    L_M_inv = torch.linalg.inv(L_M)
-                    L_fac = L_M_inv.mT
-                    
-                    # Also need M^{-1} for drift term
-                    # M^{-1} = L_fac @ L_fac.T
-                    M_inv = L_fac @ L_fac.mT
-                    
-                    # No artificial scaling by N. We use the raw FIM inverse.
-                    # This is the true Natural Gradient scaling.
-                    # Note: You may need a larger LR in config if steps are too small.
-                    
-                    # Install into sampler state
-                    p_dX = state.dX_src
-                    # IMPORTANT: Use the sampler instance from state, which might have been updated!
-                    # The local variable 'sampler' (from top of function) might be stale if we did _setup_sampler(state).
-                    # Always use state.sampler
-                    
-                    # Ensure state exists
-                    if p_dX not in state.sampler.state:
-                        state.sampler.state[p_dX] = {}
-                    
-                    state.sampler.state[p_dX]['matrix_inv'] = M_inv
-                    state.sampler.state[p_dX]['matrix_L'] = L_fac
-                    
-                    # Switch param group to 'matrix' mode
-                    found = False
-                    for g in state.sampler.param_groups:
-                        # Check if p_dX is in this group
-                        # Note: 'params' is a list of tensors
-                        if any(p is p_dX for p in g['params']):
-                            g['preconditioner'] = 'matrix'
-                            # Also ensure preconditioning is True so fallback works for other params
-                            g['preconditioning'] = True
-                            found = True
-                    
-                    if found:
-                        _log(f"FIM Preconditioner installed. Damping={damping}")
-                    else:
-                        _log("Warning: dX_src not found in any sampler param group.")
-
-                except Exception as e:
-                    _log(f"Error computing/installing FIM preconditioner (singular?): {e}")
-
-    except Exception as e:
-        _log(f"Warning: FIM computation failed: {e}")
-
-
-
 def _phase3_noise_ramp(
     state: LocateState, start_epoch: int = 0, skip_saving_first_epoch: bool = False, wandb_logger=None
 ) -> None:
@@ -1780,44 +1601,6 @@ def _phase3_noise_ramp(
             _log(f"Phase 3: noise ramp | {_format_sampler_status(state.sampler)}")
     ramp_len = int(state.params.get("phase3_epochs", 500))
 
-    # Re-verify FIM installation before starting Phase 3
-    # If the user enabled FIM, it should be installed after Phase 2.
-    # We check if 'matrix_inv' is present in the sampler state.
-    has_fim = False
-    try:
-        p_first = state.dX_src
-        if p_first in sampler.state and 'matrix_inv' in sampler.state[p_first]:
-            has_fim = True
-            _log("Verified: FIM Preconditioner is active for Phase 3.")
-        else:
-            # Check user intent
-            precond_type = str(state.params["sampler_preconditioner"]).lower()
-            if precond_type in {"matrix", "fim"}:
-                _log("Warning: FIM requested but not found in sampler state! Re-running FIM computation...")
-                # Re-run installation logic (copied from end of Phase 2)
-                from spider.diagnostics.fim import compute_block_fim
-                fim_diag, _ = compute_block_fim(state, batch_size=4096, return_sparse=False)
-                
-                damping = float(state.params.get("fim_damping", 1e-2))
-                I_eye = torch.eye(4, device=state.device, dtype=fim_diag.dtype).unsqueeze(0)
-                M = fim_diag + damping * I_eye
-                L_M = torch.linalg.cholesky(M)
-                L_M_inv = torch.linalg.inv(L_M)
-                L_fac = L_M_inv.mT
-                M_inv = L_fac @ L_fac.mT
-                
-                # Install
-                if p_first not in sampler.state: sampler.state[p_first] = {}
-                sampler.state[p_first]['matrix_inv'] = M_inv
-                sampler.state[p_first]['matrix_L'] = L_fac
-                for g in sampler.param_groups:
-                    if any(p is p_first for p in g['params']):
-                        g['preconditioner'] = 'matrix'
-                        g['preconditioning'] = True
-                _log("FIM Preconditioner installed (late).")
-    except Exception as e:
-        _log(f"Warning checking FIM status: {e}")
-
     # Set constant learning rate (per-observation scaling).
     lr_user = _lr_for_phase(state.params, "phase3")
     sampler_backend = str(state.params["sampler_backend"]).lower()
@@ -1828,9 +1611,10 @@ def _phase3_noise_ramp(
     sampler.set_lr(base_lr)
     _apply_sampler_group_overrides(state, sampler)
     
+    freeze_precond = bool(state.params.get("freeze_preconditioner_sampling", True))
     for g in sampler.param_groups:
-        # Phase 3 is burn-in / noise-ramp. Allow the preconditioner to adapt here.
-        g["freeze_preconditioner"] = False
+        # Phase 3 now follows the configured freeze policy instead of hardcoding unfreeze.
+        g["freeze_preconditioner"] = freeze_precond
         g["is_burnin"] = True
     ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
     if ddp_main:
@@ -1850,14 +1634,6 @@ def _phase3_noise_ramp(
         
         grad_clip_norm = float(state.params.get("sampler_grad_clip_norm", 0.0))
         metrics = _run_epoch(state, t, sampler, noise_scale_factor=progress, grad_clip_norm=grad_clip_norm)
-
-        # --- per-iteration (ramp step) summary ---
-        phase3_interval = int(state.params.get("phase3_mads_interval", 0 if state.event_batch_enable else 10))
-        mad_p_val: Optional[float] = None
-        mad_s_val: Optional[float] = None
-        if phase3_interval > 0 and (t % phase3_interval == 0 or t == ramp_len - 1):
-            mp, ms = _compute_phase_mads(state, state.batch_size_sgld)
-            mad_p_val, mad_s_val = mp.item(), ms.item()
 
         # See note in Phase 2: drift_ratio_* is removed; SGHMC teff/noise diagnostics are logged only when noise is on.
         tau_mean = float('nan')
@@ -1886,11 +1662,6 @@ def _phase3_noise_ramp(
                     })
             except Exception:
                 pass
-            if mad_p_val is not None and mad_s_val is not None:
-                wandb_metrics.update({
-                    "mad_p": mad_p_val,
-                    "mad_s": mad_s_val,
-                })
             
             # Hierarchical prior stats are logged centrally in epoch_runner; avoid duplicating here.
 
@@ -2159,14 +1930,6 @@ def _phase4_sampling(
         except Exception:
             drift_metrics = {}
 
-        # --- per-epoch summary ---
-        phase4_interval = int(state.params.get("phase4_mads_interval", 0 if state.event_batch_enable else 10))
-        mad_p_val: Optional[float] = None
-        mad_s_val: Optional[float] = None
-        if phase4_interval > 0 and (epoch % phase4_interval == 0 or epoch == n_epochs - 1):
-            mp, ms = _compute_phase_mads(state, state.batch_size_sgld)
-            mad_p_val, mad_s_val = mp.item(), ms.item()
-
         # Sampler diagnostics (noise variance ratios, etc.)
         sampler_extra: Dict[str, float] = {}
         try:
@@ -2201,11 +1964,6 @@ def _phase4_sampling(
                     })
             except Exception:
                 pass
-            if mad_p_val is not None and mad_s_val is not None:
-                wandb_metrics.update({
-                    "mad_p": mad_p_val,
-                    "mad_s": mad_s_val,
-                })
             
             # Hierarchical prior stats are logged centrally in epoch_runner; avoid duplicating here.
 
@@ -2637,16 +2395,6 @@ def _apply_sampler_group_overrides(state: "LocateState", sampler: Optional[torch
 #     if X_map.shape[0] != comp.shape[0]:
 #         return
 #     P = X_map[:, :3].astype(np.float32, copy=False)
-
-#     # Optional degree for linkage-aware seeding
-#     deg = None
-#     try:
-#         if getattr(state, "dd_event_degree", None) is not None:
-#             deg = state.dd_event_degree.detach().cpu().numpy().reshape(-1).astype(np.float32, copy=False)
-#             if deg.shape[0] != comp.shape[0]:
-#                 deg = None
-#     except Exception:
-#         deg = None
 
 #     rng = np.random.default_rng(int(state.params.get("runtime_seed", 0)))
 #     t0 = time.time()

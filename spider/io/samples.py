@@ -831,6 +831,10 @@ def read_all_samples(
         total_samples = 0
         batch_names: list[str] = []
         batch_sample_counts: list[int] = []
+        batch_chain_idx: list[int] = []
+        batch_chain_file: list[str] = []
+        batch_source_batch: list[str] = []
+        batch_source_batch_idx: list[int] = []
         for _, bname, grp in batches:
             n_samples_in_batch = grp['longitude'].shape[1]
             if thin == 1:
@@ -840,6 +844,30 @@ def read_all_samples(
             total_samples += int(n_keep)
             batch_names.append(str(bname))
             batch_sample_counts.append(int(n_keep))
+            # Chain provenance (when available; present for sample-multi merged files).
+            try:
+                cidx = int(grp.attrs.get("chain_idx", -1))
+            except Exception:
+                cidx = -1
+            batch_chain_idx.append(int(cidx))
+            try:
+                cfile = str(grp.attrs.get("chain_file", ""))
+            except Exception:
+                cfile = ""
+            batch_chain_file.append(cfile)
+            try:
+                sb = str(grp.attrs.get("source_batch", str(bname)))
+            except Exception:
+                sb = str(bname)
+            batch_source_batch.append(sb)
+            try:
+                sbi = int(grp.attrs.get("source_batch_idx", -1))
+            except Exception:
+                try:
+                    sbi = int(str(sb).split("_")[1])
+                except Exception:
+                    sbi = -1
+            batch_source_batch_idx.append(int(sbi))
 
         # Helpful warning for a very common footgun:
         # if the samples file contains multiple batch_* groups, the returned arrays are a concatenation.
@@ -889,6 +917,10 @@ def read_all_samples(
             out["_batch_boundaries"] = csum[:-1].astype(np.int64, copy=False)
             starts = np.concatenate([np.asarray([0], dtype=np.int64), csum[:-1]]).astype(np.int64, copy=False)
             out["_batch_slices"] = {str(nm): (int(s), int(e)) for nm, s, e in zip(batch_names, starts, csum)}
+            out["_batch_chain_idx"] = np.asarray(batch_chain_idx, dtype=np.int64)
+            out["_batch_chain_file"] = list(batch_chain_file)
+            out["_batch_source_batch"] = list(batch_source_batch)
+            out["_batch_source_batch_idx"] = np.asarray(batch_source_batch_idx, dtype=np.int64)
         except Exception:
             pass
         if map_lon is not None and map_lat is not None and map_dep is not None:
@@ -902,8 +934,9 @@ def read_all_samples(
             out['log_sigma_p'] = np.empty((total_samples,), dtype=np.float32)
             out['log_sigma_s'] = np.empty((total_samples,), dtype=np.float32)
 
+        sample_chain_idx = np.full((total_samples,), -1, dtype=np.int64)
         offset = 0
-        for _, _, grp in batches:
+        for bi, (_, _, grp) in enumerate(batches):
             w = grp['longitude'].shape[1]
             # Apply thinning to this batch
             
@@ -942,8 +975,51 @@ def read_all_samples(
                 
                 grp['log_sigma_p'].read_direct(out['log_sigma_p'], source_sel=src_sel_1d, dest_sel=dst_sel_1d)
                 grp['log_sigma_s'].read_direct(out['log_sigma_s'], source_sel=src_sel_1d, dest_sel=dst_sel_1d)
-            
+            try:
+                sample_chain_idx[sl] = int(batch_chain_idx[bi])
+            except Exception:
+                pass
             offset += n_current
+
+        # Per-sample chain identity for chain-aware postprocessing.
+        out["_sample_chain_idx"] = sample_chain_idx
+        # Chain segments in concatenated sample axis (robust even if chain batches are interleaved).
+        try:
+            segs: list[tuple[int, int, int]] = []
+            if int(sample_chain_idx.size) > 0:
+                st = 0
+                cur = int(sample_chain_idx[0])
+                for i in range(1, int(sample_chain_idx.size)):
+                    ci = int(sample_chain_idx[i])
+                    if ci != cur:
+                        segs.append((int(cur), int(st), int(i)))
+                        st = i
+                        cur = ci
+                segs.append((int(cur), int(st), int(sample_chain_idx.size)))
+            chain_segments: dict[str, list[tuple[int, int]]] = {}
+            for cidx, s0, s1 in segs:
+                key = str(int(cidx))
+                chain_segments.setdefault(key, []).append((int(s0), int(s1)))
+            out["_chain_segments"] = chain_segments
+            # Convenience: contiguous chains get a single slice.
+            chain_slices: dict[str, tuple[int, int]] = {}
+            for key, v in chain_segments.items():
+                if len(v) == 1:
+                    chain_slices[key] = (int(v[0][0]), int(v[0][1]))
+            out["_chain_slices"] = chain_slices
+            # Stable chain counts and order by first appearance.
+            order = []
+            seen = set()
+            for c in sample_chain_idx.tolist():
+                ci = int(c)
+                if ci in seen:
+                    continue
+                seen.add(ci)
+                order.append(ci)
+            out["_chain_indices"] = np.asarray(order, dtype=np.int64)
+            out["_chain_sample_counts"] = {str(int(ci)): int(np.sum(sample_chain_idx == int(ci))) for ci in order}
+        except Exception:
+            pass
 
     # Return as-is if numpy backend requested (default)
     if str(backend).lower() == 'numpy':
@@ -977,7 +1053,21 @@ def read_all_samples(
             out_torch[name] = t.to(target_device, non_blocking=True) if target_device != 'cpu' else t
 
     # Preserve non-tensor batch metadata (useful for plotting/debugging).
-    for k in ("_batch_names", "_batch_sample_counts", "_batch_boundaries", "_batch_slices"):
+    for k in (
+        "_batch_names",
+        "_batch_sample_counts",
+        "_batch_boundaries",
+        "_batch_slices",
+        "_batch_chain_idx",
+        "_batch_chain_file",
+        "_batch_source_batch",
+        "_batch_source_batch_idx",
+        "_sample_chain_idx",
+        "_chain_segments",
+        "_chain_slices",
+        "_chain_indices",
+        "_chain_sample_counts",
+    ):
         if k in out:
             out_torch[k] = out[k]  # type: ignore[index]
 

@@ -71,7 +71,6 @@ class LocateState:
     _perm_epoch: Optional[torch.Tensor] = None
     # Optional per-dimension clamp for ΔX_src (abs max for [dx, dy, dz, dt])
     clamp_abs_dX: Optional[torch.Tensor] = None
-    dd_event_degree: Optional[torch.Tensor] = None
     # (receiver-centric residual scaling removed)
     # Nuisance field (Phase 1): station-phase basis expansion coefficients and mapping
     nuisance_enable: bool = False
@@ -83,10 +82,8 @@ class LocateState:
     cluster_ids: Optional[torch.Tensor] = None         # shape (Ne,) int64
     cluster_counts: Optional[torch.Tensor] = None      # shape (K, 1) float32
 
-    # Sampler preconditioner partition (disjoint clusters for blockdiag_fisher)
-    # This is separate from `cluster_ids` above (which is used for component detection / gauge projection).
-    # If enabled, blocks partition each connected component into disjoint groups of size <= max_cluster_size
-    # based on weighted event-event edges (pair_count).
+    # Reserved sampler partition metadata (currently unused in active preconditioners).
+    # This remains separate from `cluster_ids` above.
     precond_block_members: Optional[torch.Tensor] = None    # shape (K, S) int64, padded with -1
     precond_block_sizes: Optional[torch.Tensor] = None      # shape (K,) int64
     precond_n_blocks: int = 0
@@ -94,11 +91,6 @@ class LocateState:
     # Hierarchical Prior (Global Precision Matrix)
     hierarchical_prior_enable: bool = False
     event_precision_matrix: Optional[torch.Tensor] = None  # shape (K, 4, 4) P0 per cluster
-
-    # SVRG State
-    svrg_enable: bool = False
-    svrg_dX_snapshot: Optional[torch.Tensor] = None        # Snapshot of params at start of epoch
-    svrg_grad_full: Optional[torch.Tensor] = None          # Full gradient at snapshot
 
     # Event-centric batching
     event_batch_enable: bool = False
@@ -277,28 +269,6 @@ def _clamp_dX_inplace(state: LocateState) -> None:
         if not math.isfinite(c) or c <= 0.0:
             continue
         state.dX_src[:, dim].clamp_(-c, c)
-
-
-def _attach_dd_preconditioner_metric(state: LocateState) -> None:
-    """Attach per-event degree tensor to ΔX_src for DD preconditioning."""
-    deg = state.dd_event_degree
-    if deg is None:
-        if hasattr(state.dX_src, "_dd_degree"):
-            try:
-                delattr(state.dX_src, "_dd_degree")
-            except AttributeError:
-                pass
-        return
-    try:
-        # Support either:
-        # - deg shape (Ne,)   -> broadcast across 4 dims
-        # - deg shape (Ne,4)  -> per-dimension degree scaling (e.g., apply to XYZ only)
-        if isinstance(deg, torch.Tensor) and deg.ndim == 2:
-            setattr(state.dX_src, "_dd_degree", deg)
-        else:
-            setattr(state.dX_src, "_dd_degree", deg.view(-1, 1))
-    except Exception as exc:
-        _log(f"Warning: could not attach DD preconditioner tensor: {exc}")
 
 
 def _current_noise_scales(state: LocateState) -> tuple[torch.Tensor, torch.Tensor]:

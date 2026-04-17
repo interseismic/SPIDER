@@ -11,11 +11,6 @@
         "save_every_n": 10,
         "write_samples": true
     },
-    "wandb": {
-        "enabled": false,
-        "project_name": null,
-        "run_name": null
-    },
     "model": {
         "model_file": "PATH/TO/eikonet_model.pt",
         "domain": {
@@ -103,32 +98,80 @@
                 ],
                 "shared_event_re": {
                     "enabled": true,
-                    "whitening_only_mode": true,
-                    "grouping": "station_phase",
-                    "tau_s": [
-                        0.03,
-                        0.04
-                    ],
-                    "max_nodes_per_group": 25000,
-                    "max_rows_per_group": 1500000,
-                    "solver": "pcg_sparse",
-                    "pcg_max_iters": 20,
-                    "pcg_tol": 0.005,
-                    "whitening": {
-                        "enabled": true,
-                        "solver": "pcg",
-                        "pcg_batched": true,
-                        "pcg_warm_start": true,
-                        "pcg_bucket_nodes": [
-                            4096,
-                            16384,
-                            25000
+                    "model": {
+                        "group_by": "station_phase",
+                        "tau_s": [
+                            0.03,
+                            0.04
                         ],
-                        "pcg_max_iters": 100,
-                        "pcg_tol": 0.0003,
-                        "pcg_min_iters": 2,
-                        "precompute": true,
-                        "precompute_device": "gpu"
+                        "cluster": {
+                            "mode": "none",
+                            "k": 1
+                        }
+                    },
+                    "limits": {
+                        "max_nodes": 25000,
+                        "max_rows": 1500000
+                    },
+                    "fallback": {
+                        "to_diag": true,
+                        "abort_on_pcg_fallback": false
+                    },
+                    "numerics": {
+                        "jitter0": 1e-08,
+                        "jitter_max": 0.001
+                    },
+                    "solver": {
+                        "kind": "pcg",
+                        "max_iters": 50,
+                        "min_iters": 2,
+                        "tol": 0.001,
+                        "batched": true,
+                        "node_bin_edges": [
+                            512,
+                            1024,
+                            2048,
+                            4096,
+                            8192,
+                            16384,
+                            32768
+                        ],
+                        "warm_start": false,
+                        "cache_max_entries": 8,
+                        "prefetch_grouping": false,
+                        "profile_micro_steps": false,
+                        "merge_sparse_node_bins": true,
+                        "min_groups_per_node_bin": 32,
+                        "max_node_bins_per_node": 4,
+                        "precompute": {
+                            "enabled": false,
+                            "device": "gpu"
+                        }
+                    },
+                    "edge_weights": {
+                        "mode": "uniform",
+                        "ell_km": 1.0,
+                        "eps_km": 0.001,
+                        "power": 1.0,
+                        "scale_km": 1.0,
+                        "global_scale": 1.0,
+                        "normalize": false
+                    },
+                    "autotune": {
+                        "enabled": true,
+                        "observe_epochs": 1,
+                        "latest_epoch": 2,
+                        "min_groups": 128,
+                        "max_node_bins": 8,
+                        "min_groups_per_node_bin": 24,
+                        "min_node_bin": 512,
+                        "min_gain": 0.08,
+                        "raise_nodes_cap": true,
+                        "nodes_cap_max": 65536
+                    },
+                    "logging": {
+                        "quiet": true,
+                        "stats_log_every_epochs": 0
                     }
                 }
             }
@@ -165,14 +208,50 @@
                 "include_gamma": false
             },
             "beta": 0.999,
-            "freeze_preconditioner_sampling": false,
-            "dd_prec_enable": false,
-            "dd_prec_dims": [
-                0,
-                1,
-                2,
-                3
-            ]
+            "freeze_preconditioner_sampling": false
+        },
+        "batching": {
+            "standard": {
+                "warmup": 250000,
+                "sgld": 1000000,
+                "shuffle": false
+            },
+            "event_batches": {
+                "enabled": false,
+                "events_per_batch": 50,
+                "max_edges_per_batch": 200000,
+                "bucket_reorder_all": false,
+                "bucket_reuse_epochs": 1
+            }
+        },
+        "safety": {
+            "max_abs_dX": null
+        },
+        "runtime": {
+            "cuda_empty_cache_every": 0,
+            "reset_batch_numbers": true,
+            "clear_samples_on_reset": true,
+            "min_samples_to_save": 10,
+            "verbose": true,
+            "cluster_events": false,
+            "gauge_projection": {
+                "enabled": false,
+                "mode": "global",
+                "dims": [
+                    0,
+                    1,
+                    2
+                ],
+                "apply_noise": true,
+                "apply_momentum": true
+            }
+        }
+    },
+    "observability": {
+        "wandb": {
+            "enabled": false,
+            "project_name": null,
+            "run_name": null
         },
         "diagnostics": {
             "pair_count_stats_enable": true,
@@ -198,54 +277,6 @@
                     2,
                     3
                 ]
-            },
-            "fim": {
-                "enable_phase2": false,
-                "filter_threshold": 1.0
-            },
-            "svrg": {
-                "enabled": false
-            }
-        },
-        "batching": {
-            "standard": {
-                "warmup": 250000,
-                "sgld": 1000000,
-                "shuffle": false
-            },
-            "event_batches": {
-                "enabled": false,
-                "events_per_batch": 50,
-                "max_edges_per_batch": 200000,
-                "bucket_reorder_all": false,
-                "bucket_reuse_epochs": 1
-            }
-        },
-        "safety": {
-            "max_abs_dX": null
-        },
-        "runtime": {
-            "phase_mads_interval": {
-                "phase2": 0,
-                "phase3": 0,
-                "phase4": 0
-            },
-            "cuda_empty_cache_every": 0,
-            "reset_batch_numbers": true,
-            "clear_samples_on_reset": true,
-            "min_samples_to_save": 10,
-            "verbose": true,
-            "cluster_events": false,
-            "gauge_projection": {
-                "enabled": false,
-                "mode": "global",
-                "dims": [
-                    0,
-                    1,
-                    2
-                ],
-                "apply_noise": true,
-                "apply_momentum": true
             }
         }
     }

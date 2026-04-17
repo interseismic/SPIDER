@@ -15,6 +15,141 @@ def _log(*parts, section: str = "SGLD", **_kwargs) -> None:
     else:
         info(msg, section=section)
 
+
+def _build_lrd_metric(
+    *,
+    group: dict,
+    state: dict,
+    grad_for_precond: torch.Tensor,
+    beta: float,
+    eps: float,
+    freeze_preconditioner: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build/update a low-rank-plus-diagonal preconditioner for a parameter tensor.
+
+    Returns:
+      d_flat: (D,) diagonal term (positive)
+      U: (D, r) orthonormal basis
+      lam: (r,) non-negative low-rank spectrum
+    """
+    g = grad_for_precond
+    D = int(g.numel())
+    g_flat = g.reshape(-1)
+
+    rank_cfg = int(group.get("lrd_rank", 16))
+    rank = max(0, min(int(rank_cfg), D))
+    mode = str(group.get("lrd_mode", "svd")).strip().lower()
+    if mode in {"randomized_svd", "stochastic_svd"}:
+        mode = "svd"
+    if mode not in {"svd", "oja"}:
+        mode = "svd"
+    update_every = max(1, int(group.get("lrd_update_every", 20)))
+    buffer_size = max(max(2, rank + 1), int(group.get("lrd_buffer_size", 64)))
+    oja_eta = float(group.get("lrd_oja_eta", 0.02))
+    if (not math.isfinite(oja_eta)) or (oja_eta <= 0.0):
+        oja_eta = 0.02
+    diag_floor = float(group.get("lrd_diag_floor", eps))
+    if (not math.isfinite(diag_floor)) or (diag_floor <= 0.0):
+        diag_floor = max(float(eps), 1e-12)
+
+    v = state.get("exp_avg_sq", None)
+    if (not isinstance(v, torch.Tensor)) or v.shape != g.shape or v.device != g.device or v.dtype != g.dtype:
+        v = torch.zeros_like(g)
+        state["exp_avg_sq"] = v
+    if not freeze_preconditioner:
+        v.mul_(beta).addcmul_(g, g, value=(1.0 - beta))
+    step_i = int(state.get("step", 1))
+    if 0.0 <= float(beta) < 1.0:
+        v_hat = v / (1.0 - (float(beta) ** max(step_i, 1)))
+    else:
+        v_hat = v
+    d_flat = (1.0 / (float(eps) + v_hat.clamp_min(0.0).sqrt())).reshape(-1).clamp_min(diag_floor)
+
+    if rank <= 0:
+        U = torch.zeros((D, 0), device=g.device, dtype=g.dtype)
+        lam = torch.zeros((0,), device=g.device, dtype=g.dtype)
+        state["lrd_U"] = U
+        state["lrd_lambda"] = lam
+        state["precond_diag"] = d_flat.reshape_as(g).detach()
+        return d_flat, U, lam
+
+    U = state.get("lrd_U", None)
+    lam = state.get("lrd_lambda", None)
+    if (not isinstance(U, torch.Tensor)) or U.shape != (D, rank) or U.device != g.device or U.dtype != g.dtype:
+        U = torch.zeros((D, rank), device=g.device, dtype=g.dtype)
+    if (not isinstance(lam, torch.Tensor)) or lam.shape != (rank,) or lam.device != g.device or lam.dtype != g.dtype:
+        lam = torch.zeros((rank,), device=g.device, dtype=g.dtype)
+
+    if not freeze_preconditioner:
+        if mode == "oja":
+            if not bool(torch.any(torch.isfinite(U))) or float(U.abs().sum().item()) == 0.0:
+                gn = float(g_flat.norm().item())
+                if gn > 0.0:
+                    U[:, 0] = g_flat / max(gn, 1e-12)
+                if rank > 1:
+                    U[:, 1:] = torch.randn((D, rank - 1), device=g.device, dtype=g.dtype)
+                try:
+                    U, _ = torch.linalg.qr(U, mode="reduced")
+                except Exception:
+                    pass
+            q = U.mT @ g_flat
+            U = U + (oja_eta * torch.outer(g_flat, q))
+            try:
+                U, _ = torch.linalg.qr(U, mode="reduced")
+            except Exception:
+                pass
+            if U.shape[1] > rank:
+                U = U[:, :rank].contiguous()
+            if U.shape[1] < rank:
+                U_pad = torch.zeros((D, rank), device=g.device, dtype=g.dtype)
+                if U.shape[1] > 0:
+                    U_pad[:, : U.shape[1]] = U
+                U = U_pad
+            q = U.mT @ g_flat
+            lam.mul_(beta).addcmul_(q, q, value=(1.0 - beta))
+        else:
+            buf = state.get("lrd_grad_buffer", None)
+            if (
+                (not isinstance(buf, torch.Tensor))
+                or buf.ndim != 2
+                or int(buf.shape[1]) != int(D)
+                or buf.device != g.device
+                or buf.dtype != g.dtype
+            ):
+                buf = torch.zeros((0, D), device=g.device, dtype=g.dtype)
+            buf = torch.cat([buf, g_flat.detach().unsqueeze(0)], dim=0)
+            if int(buf.shape[0]) > int(buffer_size):
+                buf = buf[-int(buffer_size) :, :]
+            state["lrd_grad_buffer"] = buf.detach()
+            if (int(state.get("step", 1)) % int(update_every) == 0) and int(buf.shape[0]) >= max(2, rank):
+                X = buf - buf.mean(dim=0, keepdim=True)
+                try:
+                    _, S, Vh = torch.linalg.svd(X, full_matrices=False)
+                    r_eff = min(rank, int(Vh.shape[0]), int(S.shape[0]))
+                    if r_eff > 0:
+                        U_new = Vh[:r_eff, :].mT.contiguous()
+                        lam_new = (S[:r_eff] * S[:r_eff]) / float(max(1, int(X.shape[0]) - 1))
+                        U.zero_()
+                        U[:, :r_eff] = U_new
+                        lam.mul_(beta)
+                        lam[:r_eff].add_(lam_new.to(dtype=lam.dtype, device=lam.device), alpha=(1.0 - beta))
+                except Exception:
+                    pass
+
+    lam = lam.clamp_min(0.0)
+    diag_low = torch.zeros((D,), device=g.device, dtype=g.dtype)
+    if int(U.numel()) > 0 and int(lam.numel()) > 0:
+        try:
+            diag_low = (U * U).matmul(lam)
+        except Exception:
+            diag_low = torch.zeros((D,), device=g.device, dtype=g.dtype)
+    diag_proxy = (d_flat + diag_low).clamp_min(diag_floor).reshape_as(g)
+    state["lrd_U"] = U.detach()
+    state["lrd_lambda"] = lam.detach()
+    state["precond_diag"] = diag_proxy.detach()
+    return d_flat, U, lam
+
 class pSGLD(torch.optim.Optimizer):
     """
     Preconditioned Stochastic Gradient Langevin Dynamics (pSGLD) optimizer.
@@ -28,11 +163,9 @@ class pSGLD(torch.optim.Optimizer):
     We use a diagonal, low-cost approximation suitable for RMSprop-style
     diagonal metrics.
 
-    Note: for the matrix-valued `blockdiag_fisher` preconditioner we do NOT compute
-    the exact matrix divergence Γ(θ). Optionally, SPIDER can add a cheap diagonal
-    proxy based on diag(EMA[ g g^T ]) for blockdiag_fisher (see group key
-    `blockdiag_fisher_include_gamma_proxy`), which can reduce drift when the
-    preconditioner is adapting.
+    Supported preconditioners in current runtime:
+    - `rmsprop` (diagonal)
+    - `lrd` (low-rank plus diagonal)
     """
 
     def __init__(self, params, n_obs, lr=1e-3, beta=0.99, eps=1e-5,
@@ -74,18 +207,14 @@ class pSGLD(torch.optim.Optimizer):
             raise ValueError(f"Invalid n_obs: {n_obs}")
 
         preconditioner = str(preconditioner).strip().lower()
-        # Allow blockdiag_fisher (alias: matrix_ema)
-        if preconditioner == "matrix_ema":
-            preconditioner = "blockdiag_fisher"
         if preconditioner in {"none", "false", ""}:
             if preconditioning:
                 raise ValueError("preconditioner cannot be 'none' when preconditioning=True")
             # Keep a valid label even when preconditioning is disabled.
             preconditioner = "rmsprop"
-        if preconditioner not in {"rmsprop", "matrix", "blockdiag_fisher", "monge", "shampoo"}:
+        if preconditioner not in {"rmsprop", "lrd"}:
             raise ValueError(
-                "preconditioner must be 'rmsprop', 'matrix', 'blockdiag_fisher', 'monge', or 'shampoo' "
-                f"(alias: 'matrix_ema'); got '{preconditioner}'"
+                f"preconditioner must be 'rmsprop' or 'lrd'; got '{preconditioner}'"
             )
 
         defaults = dict(lr=lr, beta=beta, eps=eps, n_obs=n_obs,
@@ -159,13 +288,7 @@ class pSGLD(torch.optim.Optimizer):
                     pass
 
                 grad_for_drift = raw_grad.mul(n_obs)  # sum-loglik convention (N*ḡ)
-                
-                # Define ḡ for preconditioner stats (minibatch mean, optionally DD-normalized)
-                dd_degree = getattr(p, "_dd_degree", None)
-                if dd_degree is not None:
-                    grad_for_precond = raw_grad / dd_degree
-                else:
-                    grad_for_precond = raw_grad
+                grad_for_precond = raw_grad
 
                 state = self.state[p]
 
@@ -175,8 +298,6 @@ class pSGLD(torch.optim.Optimizer):
                     if preconditioning:
                         if preconditioner == "rmsprop":
                             state.setdefault('exp_avg_sq', torch.zeros_like(p))
-                        elif preconditioner == "blockdiag_fisher" and p.ndim == 2 and p.shape[1] == 4:
-                            state.setdefault('exp_avg_outer', torch.zeros((p.shape[0], 4, 4), device=p.device, dtype=p.dtype))
                     state['ema_g'] = torch.zeros_like(p)
                     state['ema_g2'] = torch.zeros_like(p)
 
@@ -185,261 +306,44 @@ class pSGLD(torch.optim.Optimizer):
                     state['step'] = 0
                 state['step'] += 1
 
-                # --- MATRIX PRECONDITIONER PATHS ---
-                if preconditioner in {"matrix", "blockdiag_fisher"}:
-                    # User-provided matrix (FIM) path
-                    M_inv = state.get('matrix_inv', None)
-                    L_fac = state.get('matrix_L', None)
+                if preconditioning and preconditioner == "lrd":
+                    # Non-diagonal preconditioner (LRD)
+                    ema_g = state['ema_g']
+                    ema_g2 = state['ema_g2']
+                    ema_g.mul_(grad_ema_beta).add_(grad_for_drift, alpha=(1.0 - grad_ema_beta))
+                    ema_g2.mul_(grad_ema_beta).addcmul_(grad_for_drift, grad_for_drift, value=(1.0 - grad_ema_beta))
+                    state['ema_g'] = ema_g
+                    state['ema_g2'] = ema_g2
 
-                    # If blockdiag_fisher: optionally use static disjoint blocks (size <= max_cluster_size)
-                    # specified in the param-group. This is separate from connected-component detection.
-                    block_members = group.get("blockdiag_fisher_block_members", None)
-                    block_sizes = group.get("blockdiag_fisher_block_sizes", None)
-                    if preconditioner == "blockdiag_fisher" and (block_members is not None) and (block_sizes is not None) and (p.ndim == 2 and p.shape[1] == 4):
-                        # Optimized, batched blockwise Fisher-like preconditioner:
-                        # - gather block gradients once (K,S,4)
-                        # - update EMA outer-products in batch (K,D,D)
-                        # - apply drift/noise via triangular solves (no explicit inverses)
-                        bm = block_members.to(device=p.device)
-                        bs = block_sizes.to(device=p.device)
-                        K = int(bm.shape[0])
-                        Smax = int(bm.shape[1])
-                        Dmax = int(4 * Smax)
-
-                        # EMA storage (K,D,D)
-                        Vb = state.get("block_exp_avg_outer", None)
-                        if (Vb is None) or (not isinstance(Vb, torch.Tensor)) or (Vb.shape != (K, Dmax, Dmax)) or (Vb.device != p.device) or (Vb.dtype != p.dtype):
-                            Vb = torch.zeros((K, Dmax, Dmax), device=p.device, dtype=p.dtype)
-                            state["block_exp_avg_outer"] = Vb
-
-                        # Update EMA gradient stats (using drift-scaled gradients) for gnoise diagnostics.
-                        ema_g = state.get('ema_g', None)
-                        ema_g2 = state.get('ema_g2', None)
-                        if ema_g is None:
-                            ema_g = torch.zeros_like(p)
-                            state['ema_g'] = ema_g
-                        if ema_g2 is None:
-                            ema_g2 = torch.zeros_like(p)
-                            state['ema_g2'] = ema_g2
-                        ema_g.mul_(grad_ema_beta).add_(grad_for_drift, alpha=(1.0 - grad_ema_beta))
-                        ema_g2.mul_(grad_ema_beta).addcmul_(grad_for_drift, grad_for_drift, value=(1.0 - grad_ema_beta))
-
-                        # Gather block indices and grads (pad entries -> masked to 0)
-                        mask = (bm >= 0)
-                        idx_clamped = bm.clamp_min(0).reshape(-1)
-                        g_pre = grad_for_precond.index_select(0, idx_clamped).view(K, Smax, 4)
-                        g_drift = grad_for_drift.index_select(0, idx_clamped).view(K, Smax, 4)
-                        g_pre = g_pre * mask.unsqueeze(-1)
-                        g_drift = g_drift * mask.unsqueeze(-1)
-
-                        gv = g_pre.reshape(K, Dmax)  # (K,D)
-                        if preconditioning and (not freeze_preconditioner):
-                            outer = torch.bmm(gv.unsqueeze(-1), gv.unsqueeze(-2))  # (K,D,D)
-                            Vb.mul_(beta).add_(outer, alpha=(1.0 - beta))
-
-                        # Build damped SPD matrix M = V + eps I (batched)
-                        I = torch.eye(Dmax, device=p.device, dtype=p.dtype).unsqueeze(0)  # (1,D,D)
-                        M = Vb + eps * I
-                        M = 0.5 * (M + M.transpose(-1, -2))
-
-                        # Cholesky (batched) with jitter escalation on failing blocks
-                        L, chol_info = torch.linalg.cholesky_ex(M)  # (K,D,D), (K,)
-                        fail = (chol_info != 0)
-                        if torch.any(fail):
-                            base_jitter = float(max(eps, 1e-10))
-                            max_tries = int(group.get("blockdiag_fisher_cholesky_max_tries", 6))
-                            for t in range(max_tries):
-                                if not torch.any(fail):
-                                    break
-                                jitter = base_jitter * (10.0 ** t)
-                                M = M + (jitter * I) * fail.to(M.dtype).view(-1, 1, 1)
-                                M = 0.5 * (M + M.transpose(-1, -2))
-                                L, chol_info = torch.linalg.cholesky_ex(M)
-                                fail = (chol_info != 0)
-
-                        # Apply drift: x = M^{-1} g using triangular solves (batched)
-                        gd = g_drift.reshape(K, Dmax, 1)
-                        # Good blocks: solve; bad blocks: diagonal fallback
-                        y = torch.linalg.solve_triangular(L, gd, upper=False)
-                        x = torch.linalg.solve_triangular(L.transpose(-1, -2), y, upper=True)
-
-                        if torch.any(fail):
-                            base_jitter = float(max(eps, 1e-10))
-                            diag = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(base_jitter)  # (K,D)
-                            inv_diag = 1.0 / diag
-                            x_bad = inv_diag.unsqueeze(-1) * gd
-                            x = torch.where(fail.view(-1, 1, 1), x_bad, x)
-
-                        # Noise: corr = L^{-T} epsn has covariance M^{-1}
-                        temp = max(0.0, temperature)
-                        std = math.sqrt(2.0 * lr * temp) * noise_scale
-                        if add_noise and std > 0.0:
-                            epsn = torch.randn((K, Dmax, 1), device=p.device, dtype=p.dtype)
-                            corr = torch.linalg.solve_triangular(L.transpose(-1, -2), epsn, upper=True)
-                            if torch.any(fail):
-                                base_jitter = float(max(eps, 1e-10))
-                                diag = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(base_jitter)
-                                inv_sqrt = torch.sqrt(1.0 / diag).unsqueeze(-1)
-                                corr_bad = inv_sqrt * epsn
-                                corr = torch.where(fail.view(-1, 1, 1), corr_bad, corr)
-                        else:
-                            corr = None
-
-                        upd_vec = (lr * x)
-                        if corr is not None:
-                            upd_vec = upd_vec + (std * corr)
-
-                        # Optional: cheap diagonal Γ proxy for blockdiag_fisher (NOT exact matrix divergence).
-                        # Uses diag(Vb) as a second-moment proxy for each coordinate in the block.
-                        if bool(group.get("blockdiag_fisher_include_gamma_proxy", False)) and preconditioning:
+                    if preconditioner == "lrd":
+                        d_flat, U_lrd, lam_lrd = _build_lrd_metric(
+                            group=group,
+                            state=state,
+                            grad_for_precond=grad_for_precond,
+                            beta=float(beta),
+                            eps=float(eps),
+                            freeze_preconditioner=bool(freeze_preconditioner),
+                        )
+                        g_flat = grad_for_drift.reshape(-1)
+                        pre_flat = d_flat * g_flat
+                        if int(U_lrd.numel()) > 0 and int(lam_lrd.numel()) > 0:
                             try:
-                                vdiag = torch.diagonal(Vb, dim1=-2, dim2=-1)  # (K,D)
-                                sqrt_v = vdiag.clamp_min(0.0).sqrt()
-                                denom = (eps + sqrt_v)
-                                # Gather raw minibatch-mean grad for gamma term (same convention as diagonal path)
-                                g_raw = raw_grad.index_select(0, idx_clamped).view(K, Smax, 4)
-                                g_raw = g_raw * mask.unsqueeze(-1)
-                                g_raw_vec = g_raw.reshape(K, Dmax)
-                                gamma_vec = - (1.0 - beta) * g_raw_vec * (sqrt_v / (denom * denom))
-                                upd_vec = upd_vec + (lr * gamma_vec.unsqueeze(-1))
+                                q = U_lrd.mT @ g_flat
+                                pre_flat = pre_flat + (U_lrd @ (lam_lrd * q))
                             except Exception:
                                 pass
-
-                        upd = upd_vec.view(K, Smax, 4) * mask.unsqueeze(-1)
-
-                        # Scatter-add updates to parameters (disjoint blocks => no overlap)
-                        if mask.any():
-                            idx_real = bm[mask]
-                            upd_real = upd[mask]
-                            p.index_add_(0, idx_real, -upd_real)
-
-                        # Keep the existing per-event 4x4 `matrix_inv`/`matrix_L` stats path for diagnostics/logging.
-                        # This is cheap (batched over N) and avoids a heavy per-block inverse just for stats.
-                        V = state.get('exp_avg_outer', None)
-                        if V is None:
-                            V = torch.zeros((p.shape[0], 4, 4), device=p.device, dtype=p.dtype)
-                            state['exp_avg_outer'] = V
-                        if preconditioning and (not freeze_preconditioner):
-                            g_ev = grad_for_precond  # (N,4)
-                            outer_ev = torch.matmul(g_ev.unsqueeze(-1), g_ev.unsqueeze(-2))  # (N,4,4)
-                            V.mul_(beta).add_(outer_ev, alpha=(1.0 - beta))
-                        I4 = torch.eye(4, device=p.device, dtype=p.dtype).unsqueeze(0)
-                        M4 = V + eps * I4
-                        M4 = 0.5 * (M4 + M4.transpose(-1, -2))
-                        L4, chol_info4 = torch.linalg.cholesky_ex(M4)
-                        if torch.any(chol_info4 != 0):
-                            base_jitter = float(max(eps, 1e-10))
-                            max_tries4 = int(group.get("blockdiag_fisher_cholesky_max_tries", 6))
-                            info_mask = (chol_info4 != 0)
-                            for t in range(max_tries4):
-                                if not torch.any(info_mask):
-                                    break
-                                jitter = base_jitter * (10.0 ** t)
-                                M4 = M4 + (jitter * I4) * info_mask.to(M4.dtype).view(-1, 1, 1)
-                                M4 = 0.5 * (M4 + M4.transpose(-1, -2))
-                                L4, chol_info4 = torch.linalg.cholesky_ex(M4)
-                                info_mask = (chol_info4 != 0)
-                        # For diagnostics, approximate M^{-1} via cholesky inverse (4x4 is cheap)
-                        L4_inv = torch.linalg.inv(L4)
-                        L_fac4 = L4_inv.mT
-                        M_inv4 = L_fac4 @ L_fac4.mT
-                        state['matrix_inv'] = M_inv4
-                        state['matrix_L'] = L_fac4
-
-                        continue
-
-                    # If blockdiag_fisher (legacy per-event 4x4): compute/update block metric from EMA of ḡ ḡ^T
-                    if preconditioner == "blockdiag_fisher" and (p.ndim == 2 and p.shape[1] == 4):
-                        V = state.get('exp_avg_outer', None)
-                        if V is None:
-                            V = torch.zeros((p.shape[0], 4, 4), device=p.device, dtype=p.dtype)
-                            state['exp_avg_outer'] = V
-
-                        if preconditioning and (not freeze_preconditioner):
-                            g = grad_for_precond  # (N,4)
-                            outer = torch.matmul(g.unsqueeze(-1), g.unsqueeze(-2))  # (N,4,4)
-                            V.mul_(beta).add_(outer, alpha=(1.0 - beta))
-
-                        # Damped precision-like matrix
-                        I = torch.eye(4, device=p.device, dtype=p.dtype).unsqueeze(0)  # (1,4,4)
-                        M = V + eps * I  # (N,4,4)
-                        # Numerical safety: enforce symmetry and add jitter to any non-PD blocks.
-                        # V should be PSD in theory (EMA of outer-products), but float error / NaNs can break PD.
-                        M = 0.5 * (M + M.transpose(-1, -2))
-
-                        # Build M_inv and its factor for noise: L_fac L_fac^T = M^{-1}
-                        # Use cholesky_ex so we can recover gracefully instead of crashing.
-                        L_M, chol_info = torch.linalg.cholesky_ex(M)  # (N,4,4), (N,)
-                        if torch.any(chol_info != 0):
-                            # Adaptive jitter on failing blocks only.
-                            # Start from eps, but allow escalation since eps may be extremely small.
-                            base_jitter = float(max(eps, 1e-10))
-                            max_tries = int(group.get("blockdiag_fisher_cholesky_max_tries", group.get("matrix_ema_cholesky_max_tries", 6)))
-                            info_mask = (chol_info != 0)
-                            for k in range(max_tries):
-                                if not torch.any(info_mask):
-                                    break
-                                jitter_k = base_jitter * (10.0 ** k)
-                                M = M + (jitter_k * I) * info_mask.to(M.dtype).view(-1, 1, 1)
-                                M = 0.5 * (M + M.transpose(-1, -2))
-                                L_M, chol_info = torch.linalg.cholesky_ex(M)
-                                info_mask = (chol_info != 0)
-
-                            if torch.any(chol_info != 0):
-                                # Final fallback: diagonal-only inverse for the remaining bad blocks.
-                                bad = (chol_info != 0)
-                                diag = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(base_jitter)  # (N,4)
-                                inv_diag = 1.0 / diag
-                                # L_fac such that L_fac @ eps ~ N(0, M_inv): for diagonal M_inv, L_fac = diag(sqrt(inv_diag))
-                                L_fac_fallback = torch.diag_embed(torch.sqrt(inv_diag))
-                                M_inv_fallback = torch.diag_embed(inv_diag)
-
-                                # For good blocks, compute from Cholesky.
-                                good = ~bad
-                                L_M_inv = torch.linalg.inv(L_M)
-                                L_fac_good = L_M_inv.mT
-                                M_inv_good = L_fac_good @ L_fac_good.mT
-
-                                # Merge
-                                L_fac = torch.where(good.view(-1, 1, 1), L_fac_good, L_fac_fallback)
-                                M_inv = torch.where(good.view(-1, 1, 1), M_inv_good, M_inv_fallback)
-                            else:
-                                L_M_inv = torch.linalg.inv(L_M)
-                                L_fac = L_M_inv.mT
-                                M_inv = L_fac @ L_fac.mT
-                        else:
-                            L_M_inv = torch.linalg.inv(L_M)
-                            L_fac = L_M_inv.mT
-                            M_inv = L_fac @ L_fac.mT
-
-                        state['matrix_inv'] = M_inv
-                        state['matrix_L'] = L_fac
-
-                    # Use matrix if available
-                    if M_inv is not None and L_fac is not None:
-                        g_u = grad_for_drift.unsqueeze(-1)                      # (N,4,1)
-                        precond_grad = torch.matmul(M_inv, g_u).squeeze(-1)     # (N,4)
-                        update = lr * precond_grad
-
-                        # Optional: cheap diagonal Γ proxy for blockdiag_fisher (NOT exact matrix divergence).
-                        if (preconditioner == "blockdiag_fisher") and bool(group.get("blockdiag_fisher_include_gamma_proxy", False)) and preconditioning:
-                            try:
-                                V = state.get('exp_avg_outer', None)
-                                if isinstance(V, torch.Tensor) and (V.ndim == 3 and V.shape[-2:] == (4, 4)):
-                                    vdiag = torch.diagonal(V, dim1=-2, dim2=-1)  # (N,4)
-                                    sqrt_v = vdiag.clamp_min(0.0).sqrt()
-                                    denom = (eps + sqrt_v)
-                                    gamma = - (1.0 - beta) * raw_grad * (sqrt_v / (denom * denom))
-                                    update = update + lr * gamma
-                            except Exception:
-                                pass
-
+                        update = lr * pre_flat.reshape_as(p)
                         if add_noise:
                             temp = max(0.0, temperature)
                             std = math.sqrt(2.0 * lr * temp) * noise_scale
-                            eps_noise = torch.randn_like(grad_for_drift).unsqueeze(-1)
-                            corr_noise = torch.matmul(L_fac, eps_noise).squeeze(-1)
-                            noise_u = std * corr_noise
+                            noise_flat = torch.randn_like(g_flat) * d_flat.sqrt()
+                            if int(U_lrd.numel()) > 0 and int(lam_lrd.numel()) > 0:
+                                try:
+                                    z2 = torch.randn((int(lam_lrd.numel()),), device=p.device, dtype=p.dtype)
+                                    noise_flat = noise_flat + (U_lrd @ (lam_lrd.clamp_min(0.0).sqrt() * z2))
+                                except Exception:
+                                    pass
+                            noise = std * noise_flat.reshape_as(p)
                             # Optional gauge projection of injected noise.
                             try:
                                 if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
@@ -448,24 +352,11 @@ class pSGLD(torch.optim.Optimizer):
                                         mode = str(getattr(self, "_gauge_project_mode", "global"))
                                         cid = getattr(self, "_gauge_cluster_ids", None)
                                         cc = getattr(self, "_gauge_cluster_counts", None)
-                                        project_event_mean_inplace(noise_u, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                                        project_event_mean_inplace(noise, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
                             except Exception:
                                 pass
-                            update += noise_u
-                        
-                        # {{ edit }} Update EMA gradient stats (using drift-scaled gradients) even in matrix path
-                        ema_g = state.get('ema_g', None)
-                        ema_g2 = state.get('ema_g2', None)
-                        if ema_g is None:
-                            ema_g = torch.zeros_like(p)
-                            state['ema_g'] = ema_g
-                        if ema_g2 is None:
-                            ema_g2 = torch.zeros_like(p)
-                            state['ema_g2'] = ema_g2
-                        ema_g.mul_(grad_ema_beta).add_(grad_for_drift, alpha=(1.0 - grad_ema_beta))
-                        ema_g2.mul_(grad_ema_beta).addcmul_(grad_for_drift, grad_for_drift, value=(1.0 - grad_ema_beta))
-
-                        # Optional gauge projection of total update (protects against drift of translation mode).
+                            update = update + noise
+                        # Optional gauge projection of total update.
                         try:
                             if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
                                 dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
@@ -475,156 +366,6 @@ class pSGLD(torch.optim.Optimizer):
                                 project_event_mean_inplace(update, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
                         except Exception:
                             pass
-                        p.add_(-update)
-                        continue
-                # ----------------------------------
-
-                if preconditioning and preconditioner in {"monge", "shampoo"}:
-                    # Non-diagonal preconditioners (Monge / Shampoo)
-                    ema_g = state['ema_g']
-                    ema_g2 = state['ema_g2']
-                    ema_g.mul_(grad_ema_beta).add_(grad_for_drift, alpha=(1.0 - grad_ema_beta))
-                    ema_g2.mul_(grad_ema_beta).addcmul_(grad_for_drift, grad_for_drift, value=(1.0 - grad_ema_beta))
-                    state['ema_g'] = ema_g
-                    state['ema_g2'] = ema_g2
-
-                    if preconditioner == "monge":
-                        alpha = float(group.get("monge_alpha", 1.0))
-                        if not (math.isfinite(alpha) and alpha > 0.0):
-                            alpha = 1.0
-                        monge_beta = float(group.get("monge_beta", grad_ema_beta))
-                        if not (math.isfinite(monge_beta) and 0.0 <= monge_beta < 1.0):
-                            monge_beta = grad_ema_beta
-                        # Use EMA of minibatch-mean gradient (paper's v_t / ghat_t).
-                        monge_ema = state.get("monge_ema", None)
-                        if monge_ema is None or not isinstance(monge_ema, torch.Tensor):
-                            monge_ema = torch.zeros_like(p)
-                            state["monge_ema"] = monge_ema
-                        if not freeze_preconditioner:
-                            monge_ema.mul_(monge_beta).add_(grad_for_precond, alpha=(1.0 - monge_beta))
-                        # Monge rank-1 vector u = alpha * v_t
-                        u = monge_ema.mul(alpha)
-                        u_dot_u = float((u * u).sum().item())
-                        denom = 1.0 + u_dot_u
-                        if u_dot_u > 0.0:
-                            u_dot_g = (u * grad_for_drift).sum()
-                            precond_grad = grad_for_drift - u * (u_dot_g / denom)
-                            # Diagonal proxy for diagnostics
-                            diag_g = (1.0 - (u * u) / denom).clamp_min(0.0)
-                            state["precond_diag"] = diag_g
-                        else:
-                            precond_grad = grad_for_drift
-                            state["precond_diag"] = torch.ones_like(p)
-
-                        update = lr * precond_grad
-                        if add_noise:
-                            temp = max(0.0, temperature)
-                            std = math.sqrt(2.0 * lr * temp) * noise_scale
-                            z = torch.randn_like(p) * std
-                            if u_dot_u > 0.0:
-                                c = (1.0 - (1.0 / math.sqrt(1.0 + u_dot_u))) / max(u_dot_u, 1e-12)
-                                u_dot_z = (u * z).sum()
-                                z = z - u * (u_dot_z * c)
-                            update = update + z
-                        # One-time early-step diagnostic print to compare scaling vs RMSprop.
-                        if int(state.get('step', 0)) <= 3 and (p is group.get("params", [None])[0]):
-                            try:
-                                var_g = (ema_g2 - ema_g * ema_g).clamp_min(0.0)
-                                diag_g = state.get("precond_diag", torch.ones_like(p))
-                                var_noise = (2.0 * lr * max(temperature, 0.0)) * (noise_scale * noise_scale) * diag_g
-                                num = (lr * lr) * (diag_g * diag_g) * var_g
-                                ratio = (num / var_noise.clamp_min(1e-30)).clamp_min(1e-30)
-                                g_pre = grad_for_precond
-                                g_drift = grad_for_drift
-                                _log(
-                                    "[monge_debug]"
-                                    f" step={int(state.get('step', 0))}"
-                                    f" n_obs={int(n_obs)}"
-                                    f" lr={float(lr):.3e}"
-                                    f" alpha={float(alpha):.3e}"
-                                    f" monge_beta={float(monge_beta):.3e}"
-                                    f" u_dot_u={float(u_dot_u):.3e}"
-                                    f" monge_ema_norm={float(monge_ema.norm().item()):.3e}"
-                                    f" g_pre_norm={float(g_pre.norm().item()):.3e}"
-                                    f" g_drift_norm={float(g_drift.norm().item()):.3e}"
-                                    f" diag_g_med={float(diag_g.median().item()):.3e}"
-                                    f" var_g_med={float(var_g.median().item()):.3e}"
-                                    f" var_noise_med={float(var_noise.median().item()):.3e}"
-                                    f" ratio_med={float(ratio.median().item()):.3e}"
-                                )
-                            except Exception:
-                                pass
-                        p.add_(-update)
-                        continue
-
-                    # Shampoo (Kronecker) for small 2D tensors
-                    if preconditioner == "shampoo":
-                        if p.ndim != 2:
-                            # Fallback to RMSprop for unsupported shapes
-                            v = state['exp_avg_sq']
-                            if not freeze_preconditioner:
-                                v.mul_(beta).addcmul_(grad_for_precond, grad_for_precond, value=1 - beta)
-                            G = 1.0 / (eps + v.sqrt())
-                        else:
-                            n0, n1 = int(p.shape[0]), int(p.shape[1])
-                            max_dim = int(group.get("shampoo_max_dim", 512))
-                            if n0 > max_dim or n1 > max_dim:
-                                v = state['exp_avg_sq']
-                                if not freeze_preconditioner:
-                                    v.mul_(beta).addcmul_(grad_for_precond, grad_for_precond, value=1 - beta)
-                                G = 1.0 / (eps + v.sqrt())
-                            else:
-                                beta_s = float(group.get("shampoo_beta", beta))
-                                eps_s = float(group.get("shampoo_eps", eps))
-                                update_every = int(group.get("shampoo_update_every", 10))
-                                L = state.get("shampoo_L", None)
-                                R = state.get("shampoo_R", None)
-                                if L is None or L.shape != (n0, n0):
-                                    L = torch.zeros((n0, n0), device=p.device, dtype=p.dtype)
-                                    state["shampoo_L"] = L
-                                if R is None or R.shape != (n1, n1):
-                                    R = torch.zeros((n1, n1), device=p.device, dtype=p.dtype)
-                                    state["shampoo_R"] = R
-                                if not freeze_preconditioner:
-                                    L.mul_(beta_s).add_(grad_for_precond @ grad_for_precond.mT, alpha=(1.0 - beta_s))
-                                    R.mul_(beta_s).add_(grad_for_precond.mT @ grad_for_precond, alpha=(1.0 - beta_s))
-                                # Cache inverse sqrt
-                                if (state['step'] % update_every) == 0 or ("shampoo_L_inv_sqrt" not in state):
-                                    eye0 = torch.eye(n0, device=p.device, dtype=p.dtype)
-                                    eye1 = torch.eye(n1, device=p.device, dtype=p.dtype)
-                                    evals0, evecs0 = torch.linalg.eigh(L + eps_s * eye0)
-                                    evals1, evecs1 = torch.linalg.eigh(R + eps_s * eye1)
-                                    inv0 = evecs0 @ torch.diag(1.0 / torch.sqrt(evals0.clamp_min(0.0))) @ evecs0.mT
-                                    inv1 = evecs1 @ torch.diag(1.0 / torch.sqrt(evals1.clamp_min(0.0))) @ evecs1.mT
-                                    state["shampoo_L_inv_sqrt"] = inv0
-                                    state["shampoo_R_inv_sqrt"] = inv1
-                                inv0 = state.get("shampoo_L_inv_sqrt")
-                                inv1 = state.get("shampoo_R_inv_sqrt")
-                                if inv0 is None or inv1 is None:
-                                    G = torch.ones_like(p)
-                                else:
-                                    precond_grad = inv0 @ grad_for_drift @ inv1
-                                    update = lr * precond_grad
-                                    if add_noise:
-                                        temp = max(0.0, temperature)
-                                        std = math.sqrt(2.0 * lr * temp) * noise_scale
-                                        z = torch.randn_like(p) * std
-                                        z = inv0 @ z @ inv1
-                                        update = update + z
-                                    # Diagonal proxy for diagnostics
-                                    diag_g = (inv0.diagonal().unsqueeze(1) * inv1.diagonal().unsqueeze(0)).clamp_min(0.0)
-                                    state["precond_diag"] = diag_g
-                                    p.add_(-update)
-                                    continue
-
-                    # Shampoo fallback uses diagonal G computed above
-                    if preconditioning:
-                        update = lr * (G * grad_for_drift)
-                        if add_noise:
-                            temp = max(0.0, temperature)
-                            std = math.sqrt(2.0 * lr * temp) * noise_scale
-                            noise = torch.randn_like(p) * std * G.sqrt()
-                            update = update + noise
                         p.add_(-update)
                         continue
 
@@ -797,14 +538,7 @@ class pSGLD(torch.optim.Optimizer):
                 # Preconditioner metric (diagonal proxy in update space)
                 if preconditioning:
                     precond = str(preconditioner).lower()
-                    if precond in {"matrix", "blockdiag_fisher", "matrix_ema"}:
-                        M_inv = state.get('matrix_inv', None)
-                        if M_inv is not None and p.ndim == 2 and p.shape[1] == 4:
-                            # Use diag of M^{-1} as a per-parameter variance proxy
-                            G = torch.diagonal(M_inv, dim1=-2, dim2=-1)  # (N,4)
-                        else:
-                            G = torch.ones_like(ema_g)
-                    elif precond in {"monge", "shampoo"}:
+                    if precond in {"lrd"}:
                         G = state.get("precond_diag", None)
                         if G is None or not isinstance(G, torch.Tensor):
                             G = torch.ones_like(ema_g)
@@ -1004,14 +738,7 @@ class AdaptiveDriftSGLDAdam(torch.optim.Optimizer):
                 # Algorithm 1 uses mean gradient g_t (no N scaling).
                 drift_grad = grad_mean
 
-                dd_degree = getattr(p, "_dd_degree", None)
-                if dd_degree is not None:
-                    try:
-                        adapt_grad = grad_mean / dd_degree
-                    except Exception:
-                        adapt_grad = grad_mean
-                else:
-                    adapt_grad = grad_mean
+                adapt_grad = grad_mean
 
                 state = self.state[p]
                 if "step" not in state:
@@ -1236,7 +963,7 @@ class AdaptiveDriftSGLDAdam(torch.optim.Optimizer):
         Return summary stats of the preconditioner (dict):
           {min, p25, median, p75, max}
         - rmsprop: stats of diagonal G
-        - matrix/blockdiag_fisher: stats of diagonal entries of M^{-1} (from state['matrix_inv'])
+        - lrd: stats of diagonal proxy from state['precond_diag']
         """
         try:
             def _five_num(x: torch.Tensor) -> dict:
@@ -1290,14 +1017,10 @@ class AdaptiveDriftSGLDAdam(torch.optim.Optimizer):
 
             state = self.state.get(p, {})
 
-            # {{ edit }} matrix stats
-            if preconditioner in {"matrix", "blockdiag_fisher", "matrix_ema"}:
-                M_inv = state.get('matrix_inv', None)
-                if M_inv is None:
-                    return {"min": float("nan"), "p25": float("nan"), "median": float("nan"), "p75": float("nan"), "max": float("nan")}
-                # M_inv: (N,4,4) for dX_src
-                diagonals = torch.diagonal(M_inv, dim1=-2, dim2=-1)
-                return _five_num(diagonals)
+            if preconditioner == "lrd":
+                G_diag = state.get("precond_diag", None)
+                if isinstance(G_diag, torch.Tensor):
+                    return _five_num(G_diag)
 
             # existing diagonal stats
             v = state.get('exp_avg_sq', None)
@@ -1339,23 +1062,6 @@ def transplant_v_from_adam(adam_opt, sgld_opt):
                 st['exp_avg_sq'] = v_src.detach().clone()
             else:
                 st.setdefault('exp_avg_sq', torch.zeros_like(p))
-
-            # {{ edit }} If using blockdiag_fisher (alias: matrix_ema) on (N,4), ensure exp_avg_outer exists
-            precond = str(group.get('preconditioner', 'rmsprop')).lower()
-            preconditioning = bool(group.get('preconditioning', True))
-            if preconditioning and precond in {"blockdiag_fisher", "matrix_ema"} and (p.ndim == 2 and p.shape[1] == 4):
-                st.setdefault('exp_avg_outer', torch.zeros((p.shape[0], 4, 4), device=p.device, dtype=p.dtype))
-                # If block partitioning is active, initialize blockwise EMA storage too.
-                bm = group.get("blockdiag_fisher_block_members", None)
-                bs = group.get("blockdiag_fisher_block_sizes", None)
-                if bm is not None and bs is not None:
-                    try:
-                        K = int(bm.shape[0])
-                        Smax = int(bm.shape[1])
-                        Dmax = int(4 * Smax)
-                        st.setdefault("block_exp_avg_outer", torch.zeros((K, Dmax, Dmax), device=p.device, dtype=p.dtype))
-                    except Exception:
-                        pass
 
 @torch.no_grad()
 def heartbeat_poststep_from(prev_params, params, rel_floor_scale=1e-3, abs_floor=1e-8):

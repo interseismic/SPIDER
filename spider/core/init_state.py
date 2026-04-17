@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import List, Optional
-import math
 import time
 
 import numpy as np
@@ -12,7 +11,7 @@ from pyproj import Proj
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import connected_components
 
-from spider.core.state import LocateState, _attach_dd_preconditioner_metric, _parse_clamp_tensor
+from spider.core.state import LocateState, _parse_clamp_tensor
 from spider.utils.console import info, warn
 
 
@@ -139,49 +138,6 @@ def _build_initial_state(
         dtype=torch.int64,
         device=device,
     )
-    dd_event_degree: Optional[torch.Tensor] = None
-    if bool(params.get("dd_prec_enable", False)):
-        dd_prec_dims = params.get("dd_prec_dims", [0, 1, 2, 3])
-        if not isinstance(dd_prec_dims, list) or len(dd_prec_dims) == 0:
-            dd_prec_dims = [0, 1, 2, 3]
-        dd_prec_dims = [int(x) for x in dd_prec_dims if int(x) in (0, 1, 2, 3)]
-        if len(dd_prec_dims) == 0:
-            dd_prec_dims = [0, 1, 2, 3]
-        deg_counts = (
-            pl.concat(
-                [
-                    dtimes.select(pl.col("evid1").alias("evid")),
-                    dtimes.select(pl.col("evid2").alias("evid")),
-                ]
-            )
-            .group_by("evid")
-            .len()
-            .rename({"len": "deg"})
-        )
-        deg_map = {int(row["evid"]): max(1.0, float(row["deg"])) for row in deg_counts.iter_rows(named=True)}
-        degree_vec = [
-            deg_map.get(int(evid), 1.0)
-            for evid in origins0["evid"].to_numpy()
-        ]
-        dd_event_degree = torch.tensor(degree_vec, dtype=torch.float32, device=device)
-        # Normalize by the mean degree so the average preconditioner stays unchanged.
-        if dd_event_degree.numel() > 0:
-            mean_degree = float(dd_event_degree.mean().item())
-            if not math.isfinite(mean_degree) or mean_degree <= 0.0:
-                mean_degree = 1.0
-            dd_event_degree = dd_event_degree / mean_degree
-        # Optional: apply DD degree scaling only to selected ΔX dims.
-        # Default (backward compatible) is all dims [0,1,2,3].
-        try:
-            if set(dd_prec_dims) != {0, 1, 2, 3}:
-                Ne = int(X_src.shape[0])
-                deg4 = torch.ones((Ne, 4), dtype=torch.float32, device=device)
-                for d in dd_prec_dims:
-                    deg4[:, int(d)] = dd_event_degree
-                dd_event_degree = deg4
-        except Exception:
-            # Best-effort: keep scalar degree vector if shaping fails
-            pass
     II_cpu_np = dtimes[["evid1_idx", "evid2_idx"]].to_numpy().astype(np.int64, copy=False)
     YY = torch.tensor(
         dtimes[["dt", "X", "Y", "Z", "phase"]].to_numpy(),
@@ -351,19 +307,11 @@ def _build_initial_state(
         except Exception as e:
             warn(f"shared_event_re k-hop clustering failed; falling back to no clustering: {e}", section="GRAPH")
 
-    # Optional: unique event-event pair count distribution (useful for graph-aware features like blockdiag_fisher).
+    # Optional: unique event-event pair count distribution (diagnostics only).
     pair_count_stats_enable = bool(params.get("pair_count_stats_enable", False))
 
     pair_counts: Optional[pl.DataFrame] = None
-    # Also compute pair_counts when blockdiag_fisher partitioning is requested (static, pre-optimization).
-    # This is only used by pSGLD's blockdiag_fisher preconditioner.
-    sampler_backend = str(params.get("sampler_backend", "psgld")).strip().lower()
-    want_blockdiag_partition = (
-        sampler_backend == "psgld"
-        and str(params.get("sampler_preconditioner", "")).strip().lower() in {"blockdiag_fisher", "matrix_ema"}
-        and int(params.get("blockdiag_fisher_max_cluster_size", 1)) > 1
-    )
-    if pair_count_stats_enable or want_blockdiag_partition:
+    if pair_count_stats_enable:
         try:
             t0 = time.time()
             pairs = dtimes.select(
@@ -404,64 +352,13 @@ def _build_initial_state(
                     section="GRAPH",
                 )
         except Exception as e:
-            if pair_count_stats_enable or want_blockdiag_partition:
-                warn(f"Pair-count stats unavailable: {e}", section="GRAPH")
+            warn(f"Pair-count stats unavailable: {e}", section="GRAPH")
             pair_counts = None
 
-    # --- Optional: static disjoint partition for blockdiag_fisher ---
+    # No static graph partitioning is used for current sampler preconditioners.
     precond_block_members = None
     precond_block_sizes = None
     precond_n_blocks = 0
-    if want_blockdiag_partition and pair_counts is not None:
-        try:
-            from spider.analysis.graph_partition import partition_graph_disjoint_blocks
-
-            S = int(params.get("blockdiag_fisher_max_cluster_size", 1))
-            u_np = pair_counts["u"].to_numpy().astype(np.int64, copy=False)
-            v_np = pair_counts["v"].to_numpy().astype(np.int64, copy=False)
-            w_np = pair_counts["pair_count"].to_numpy().astype(np.float64, copy=False)
-            t_part0 = time.time()
-            method = str(params.get("blockdiag_fisher_partition_method", "auto")).strip().lower()
-            info(
-                f"blockdiag_fisher partition start method={method} max_cluster_size={S} n_events={int(n_events):,} n_pairs={int(u_np.size):,}",
-                section="GRAPH",
-            )
-            part = partition_graph_disjoint_blocks(
-                n_nodes=int(n_events),
-                u=u_np,
-                v=v_np,
-                w=w_np,
-                max_cluster_size=int(S),
-                method=method,
-                min_balance=float(params.get("blockdiag_fisher_min_balance", 0.30)),
-                seed=int(params.get("blockdiag_fisher_partition_seed", 0)),
-            )
-            blocks = part.blocks
-            K = int(len(blocks))
-            precond_n_blocks = K
-            members = np.full((K, int(S)), -1, dtype=np.int64)
-            sizes = np.zeros((K,), dtype=np.int64)
-            for k, nd in enumerate(blocks):
-                nd = np.asarray(nd, dtype=np.int64)
-                sizes[k] = int(nd.size)
-                members[k, : int(nd.size)] = nd
-            precond_block_members = torch.tensor(members, dtype=torch.int64, device=device)
-            precond_block_sizes = torch.tensor(sizes, dtype=torch.int64, device=device)
-
-            if K > 0:
-                srt = np.sort(sizes)
-                dt_part = time.time() - t_part0
-                info(
-                    f"blockdiag_fisher partition: max_cluster_size={S} blocks={K} "
-                    f"size_min={int(srt[0])} size_med={float(np.median(srt)):.1f} size_max={int(srt[-1])} "
-                    f"dt={dt_part:.1f}s",
-                    section="GRAPH",
-                )
-        except Exception as e:
-            warn(f"blockdiag_fisher partitioning failed; falling back to per-event blocks: {e}", section="GRAPH")
-            precond_block_members = None
-            precond_block_sizes = None
-            precond_n_blocks = 0
 
     # (Laplacian prior removed: no static Laplacian graph build or Laplacian hyperparameters.)
 
@@ -496,7 +393,6 @@ def _build_initial_state(
         YY=YY,
         row_station_index=row_station_index,
         n_stations=int(n_stations),
-        dd_event_degree=dd_event_degree,
         model=model,
         prior_event=prior_event,
         prior_centroid=prior_centroid,
@@ -531,7 +427,6 @@ def _build_initial_state(
         params["_runtime_n_components"] = int(n_components)
     except Exception:
         pass
-    _attach_dd_preconditioner_metric(state)
     # Initialize event-centric batching flag (mapping is built lazily when used)
     state.event_batch_enable = bool(params.get("event_batch_enable", False))
     # Cache CPU mirror of II for fast owner bucketing

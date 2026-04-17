@@ -66,6 +66,9 @@ def _compute_residuals_numpy(
 
 def _get_diag_cfg(state, key: str) -> dict:
     try:
+        # Removed diagnostics: keep hard-disabled at runtime.
+        if key in {"resid_distribution", "shared_event_legcorr2d", "resid_scalar_metrics"}:
+            return {}
         inf = state.params.get("inference", None)
         dg = (inf.get("diagnostics", None) if isinstance(inf, dict) else None)
         cfg = dg.get(key, {}) if isinstance(dg, dict) else {}
@@ -4667,12 +4670,6 @@ def analyze_resid_from_bundle(
             plot_dir = os.path.dirname(os.path.abspath(str(bundle_path))) or "."
         except Exception:
             plot_dir = "."
-
-    # Optional: 2D shared-event cross-correlation binned by both leg lengths (h1,h2).
-    try:
-        _maybe_shared_event_legcorr2d(state=state, plot_dir=str(plot_dir))
-    except Exception as e:
-        warn(f"shared_event_legcorr2d failed: {e}", section="DIAG")
 
     # Optional: cross-station correlation for the same event-pair (phase-specific).
     try:

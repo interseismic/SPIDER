@@ -522,7 +522,7 @@ def prepare_input_dfs(params, *, model=None, device=None):
         II = torch.tensor(np.column_stack([e1_idx, e2_idx]), dtype=torch.int64, device=device)
         YY = torch.tensor(YY_np, dtype=torch.float32, device=device)
         zero_dX = torch.zeros_like(dX_src, device=device)
-        residuals = compute_residuals_full(II, YY, X_src, zero_dX, model, bs, N)
+        residuals = compute_residuals_full(II, YY, X_src, zero_dX, model, bs, N, params=params)
 
         abs_thr = abs_max if (abs_max is not None and float(abs_max) > 0.0) else float("inf")
         if method == "abs":

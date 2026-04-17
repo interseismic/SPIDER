@@ -85,34 +85,29 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         )
         _ensure_common_group_keys(opt, params=params, n_obs=state.N)
 
-        # Ensure group keys reflect config (avoid accidental "none")
+        # Ensure group keys reflect config. When preconditioning is disabled, keep "none".
+        precond_enabled = bool(params.get("sampler_preconditioning", False))
         precond = str(params["sampler_preconditioner"]).strip().lower()
-        if bool(params.get("sampler_preconditioning", False)) and precond in {"none", "false", ""}:
-            precond = "rmsprop"
-        # Backwards-compatible alias
-        if precond == "matrix_ema":
-            precond = "blockdiag_fisher"
-        include_gamma_proxy_bdf = bool(params.get("sampler_preconditioning_include_gamma_proxy", False))
+        if precond_enabled:
+            if precond in {"none", "false", ""}:
+                precond = "rmsprop"
+            if precond not in {"rmsprop", "lrd"}:
+                raise ValueError(
+                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd."
+                )
+        else:
+            precond = "none"
         for g in opt.param_groups:
             g["preconditioner"] = precond
-            g["preconditioning"] = bool(params["sampler_preconditioning"])
-            if precond == "monge":
-                g["monge_alpha"] = float(params.get("sampler_preconditioning_monge_alpha", 1.0))
-            if precond == "shampoo":
-                g["shampoo_beta"] = float(params.get("sampler_preconditioning_shampoo_beta", 0.99))
-                g["shampoo_eps"] = float(params.get("sampler_preconditioning_shampoo_eps", 1e-6))
-                g["shampoo_update_every"] = int(params.get("sampler_preconditioning_shampoo_update_every", 10))
-                g["shampoo_max_dim"] = int(params.get("sampler_preconditioning_shampoo_max_dim", 512))
-            # Optional: attach static disjoint blocks for blockdiag_fisher (computed in LocateState).
-            if precond == "blockdiag_fisher":
-                # Optional: cheap diagonal Γ proxy for blockdiag_fisher.
-                g["blockdiag_fisher_include_gamma_proxy"] = include_gamma_proxy_bdf
-                bm = getattr(state, "precond_block_members", None)
-                bs = getattr(state, "precond_block_sizes", None)
-                if bm is not None and bs is not None:
-                    g["blockdiag_fisher_block_members"] = bm
-                    g["blockdiag_fisher_block_sizes"] = bs
-                    g["blockdiag_fisher_max_cluster_size"] = int(params.get("blockdiag_fisher_max_cluster_size", bm.shape[1]))
+            g["preconditioning"] = precond_enabled
+            if precond == "lrd":
+                g["lrd_rank"] = int(params.get("sampler_preconditioning_lrd_rank", 16))
+                g["lrd_mode"] = str(params.get("sampler_preconditioning_lrd_mode", "svd")).strip().lower()
+                g["lrd_update_every"] = int(params.get("sampler_preconditioning_lrd_update_every", 20))
+                g["lrd_buffer_size"] = int(params.get("sampler_preconditioning_lrd_buffer_size", 64))
+                g["lrd_oja_eta"] = float(params.get("sampler_preconditioning_lrd_oja_eta", 0.02))
+                g["lrd_diag_floor"] = float(params.get("sampler_preconditioning_lrd_diag_floor", params.get("sampler_eps", 1e-8)))
+                g["lrd_target"] = str(params.get("sampler_preconditioning_lrd_target", "dX_src_only")).strip().lower()
 
         _maybe_attach_gauge_projection(opt, params=params, state=state)
         return "psgld", opt
@@ -134,11 +129,29 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         )
         _ensure_common_group_keys(opt, params=params, n_obs=state.N)
 
-        # Force preconditioner mode from config (avoid default "none")
+        # Force preconditioner mode from config. Allow "none" when preconditioning is disabled.
+        precond_enabled = bool(params.get("sampler_preconditioning", False))
         precond = str(params["sampler_preconditioner"]).strip().lower()
+        if precond_enabled:
+            if precond in {"none", "false", ""}:
+                precond = "rmsprop"
+            if precond not in {"rmsprop", "lrd"}:
+                raise ValueError(
+                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd."
+                )
+        else:
+            precond = "none"
         for g in opt.param_groups:
             g["preconditioner"] = precond
-            g["preconditioning"] = bool(params["sampler_preconditioning"])
+            g["preconditioning"] = precond_enabled
+            if precond == "lrd":
+                g["lrd_rank"] = int(params.get("sampler_preconditioning_lrd_rank", 16))
+                g["lrd_mode"] = str(params.get("sampler_preconditioning_lrd_mode", "svd")).strip().lower()
+                g["lrd_update_every"] = int(params.get("sampler_preconditioning_lrd_update_every", 20))
+                g["lrd_buffer_size"] = int(params.get("sampler_preconditioning_lrd_buffer_size", 64))
+                g["lrd_oja_eta"] = float(params.get("sampler_preconditioning_lrd_oja_eta", 0.02))
+                g["lrd_diag_floor"] = float(params.get("sampler_preconditioning_lrd_diag_floor", params.get("sampler_eps", 1e-8)))
+                g["lrd_target"] = str(params.get("sampler_preconditioning_lrd_target", "dX_src_only")).strip().lower()
 
         # Ensure alpha exists in groups
         for g in opt.param_groups:
