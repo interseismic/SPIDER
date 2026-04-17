@@ -17,6 +17,7 @@ release = "0.1.0"
 
 extensions = [
     "myst_parser",
+    "sphinx.ext.mathjax",
     "sphinx_copybutton",
 ]
 
@@ -53,4 +54,6 @@ myst_enable_extensions = [
     "colon_fence",
     "deflist",
     "fieldlist",
+    "dollarmath",
+    "amsmath",
 ]
