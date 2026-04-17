@@ -25,6 +25,21 @@ This is a brand new codebase. Please be patient with us as we work to making thi
 - [Python API](#python-api)
 - [Citation](#citation)
 
+## Documentation site (Sphinx / Read the Docs)
+
+SPIDER includes a dedicated Sphinx documentation site under `docs/`, suitable for Read the Docs.
+
+Build locally:
+
+```bash
+pip install -r docs/requirements.txt
+sphinx-build -b html docs docs/_build/html
+```
+
+Then open:
+
+- `docs/_build/html/index.html`
+
 ## Installation
 
 ```bash
