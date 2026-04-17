@@ -42,6 +42,42 @@ Operational phase policy:
 - Phase 1 (MAP warmup) uses robust independent likelihoods to damp outlier influence and support outlier identification.
 - Phases 2-4 (sampling) use the correlated Gaussian likelihood with shared-event structure.
 
+Quick-summary notation:
+
+- $d_n$: observed differential time for datum $n$
+- $\hat d_n$: model-predicted differential time for datum $n$
+- $r_n$: residual, $r_n=d_n-\hat d_n$
+- $u_n$: standardized residual, $u_n=r_n/\sigma_n$
+- $\sigma_n$: phase-dependent scale for datum $n$
+- $\rho(\cdot)$: per-datum robust penalty (Gaussian, Laplace, Student-$t$, or Huber form)
+- $B$: number of observations in the current likelihood batch
+- $g$: station-phase group index in the correlated model
+- $\mathbf{r}_g$: residual vector for group $g$
+- $\boldsymbol{\Sigma}_g$: group covariance in the correlated model
+- $N$: total number of observations in the full dataset
+- $\Delta \mathbf{Z}$: stacked event perturbations across all events
+
+## Notation conventions
+
+The symbols below are used throughout the page:
+
+| Symbol | Definition |
+| --- | --- |
+| $n$ | Observation index (differential-time row) |
+| $i,j$ | Event indices |
+| $M$ | Number of events |
+| $B$ | Number of observations in a batch used by the likelihood term |
+| $N$ | Total number of observations in the full dataset |
+| $\mathbf{z}_i$ | Event state for event $i$ (space + origin-time component) |
+| $\Delta \mathbf{z}_i$ | Perturbation for event $i$ |
+| $\Delta \mathbf{Z}$ | Collection of all event perturbations $\{\Delta \mathbf{z}_i\}_{i=1}^M$ |
+| $\mathbf{x}_i$ | Spatial part of event state for event $i$ |
+| $t_i$ | Origin-time part of event state for event $i$ |
+| $T(\mathbf{x}, s, \varphi)$ | Travel-time surrogate evaluated at event location $\mathbf{x}$, receiver $s$, phase $\varphi$ |
+| $\sigma_P,\sigma_S$ | Phase-specific residual scales |
+| $\tau_P,\tau_S$ | Phase-specific shared-event random-effect scales |
+| $\mathbf{I}$ | Identity matrix of appropriate dimension |
+
 ## 1) Forward model and residuals
 
 For each differential-time datum $n$, let:
@@ -50,6 +86,8 @@ For each differential-time datum $n$, let:
 - $s_n$ be the receiver
 - $\varphi_n \in \{P,S\}$ be the phase
 - $d_n$ be the observed differential time
+
+Write each event state as $\mathbf{z}_i=[\mathbf{x}_i^\top\; t_i]^\top$, where $\mathbf{x}_i$ is spatial location and $t_i$ is origin time.
 
 Event state is represented as:
 
@@ -113,7 +151,7 @@ $$
 + \log \sigma_n
 $$
 
-where $C(\nu)$ is a $\nu$-dependent constant.
+where $C(\nu)$ is the Student-$t$ normalization constant (depends only on $\nu$).
 
 ### Huber (threshold $\delta_H$)
 
@@ -145,6 +183,8 @@ For each station-phase group $g$, let $\mathbf{r}_g$ be grouped residuals and $\
 $$
 \mathbf{r}_g = \mathbf{B}_g \mathbf{b}_g + \boldsymbol{\varepsilon}_g
 $$
+
+Here $\mathbf{B}_g$ is the signed incidence operator mapping event-level latent terms to edge-level residual contributions within group $g$.
 
 $$
 \mathbf{b}_g \sim \mathcal{N}(\mathbf{0}, \tau_g^2 \mathbf{I}),
@@ -218,7 +258,7 @@ $$
 \mathbf{\Lambda}_{k} \sim \operatorname{Wishart}(\nu_0,\mathbf{V}_0)
 $$
 
-where $\mathbf{V}_0$ is constructed from scale hyperparameters and $\nu_0$ is the Wishart degrees of freedom.
+where $k(i)$ maps event $i$ to its cluster index, $\mathbf{V}_0$ is constructed from scale hyperparameters, and $\nu_0$ is the Wishart degrees of freedom.
 
 ## 5) Training objective (negative log posterior)
 
