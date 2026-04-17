@@ -44,3 +44,5 @@ Input/output file paths and checkpoint controls.
 For shared-event PCG setup and convergence checks, see {doc}`pcg-whitening-convergence`.
 
 For a field-by-field schema reference, see {doc}`configuration-reference`.
+
+For a symbol-level probability-model description with config-to-symbol mapping, see {doc}`probability-model`.

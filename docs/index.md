@@ -12,13 +12,14 @@ quickstart
 data-formats
 configuration
 configuration-reference
+probability-model
+sampler-options
 cli-workflow
+postprocessing-and-analysis-tools
+outputs-and-formats
 pcg-whitening-convergence
 sampler-health
 diagnostics-catalog
-outputs-and-formats
-postprocessing-and-analysis-tools
-sampler-options-and-math
 troubleshooting
 ```
 
@@ -28,5 +29,4 @@ troubleshooting
 
 api-reference
 citation
-legacy-materials
 ```

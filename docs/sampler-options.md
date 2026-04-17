@@ -22,13 +22,12 @@ For both backends in SPIDER:
 - Drift uses minibatch mean gradient scaled by total observations:
   - $g_{\text{drift}} = N \,\bar g$
 - User-configured sampler learning rate is internally scaled per observation at backend creation:
-  - $\text{lr}_{\text{effective}} = \text{lr}_{\text{config}} / N$
+  - $\lambda_{\text{effective}} = \lambda_{\text{config}} / N$
 - Noise is off in Phase 2, ramped in Phase 3, and active in Phase 4.
 
 Common controls:
 
 - `temperature`
-- `noise_scale_mult`
 - `beta`, `eps`
 - `freeze_preconditioner_sampling`
 - `grad_clip_norm`
@@ -56,8 +55,8 @@ Class:
 With diagonal preconditioner $G$, the implemented step is:
 
 $$
-\theta_{t+1} = \theta_t - \Big(\text{lr}\, G_t\, g_{\text{drift}} + \text{lr}\,\Gamma_t\Big)
-              + \sqrt{2\,\text{lr}\,T}\,\sqrt{G_t}\,\xi_t
+\theta_{t+1} = \theta_t - \Big(\lambda\, G_t\, g_{\text{drift}} + \lambda\,\Gamma_t\Big)
+              + \sqrt{2\,\lambda\,T}\,\sqrt{G_t}\,\xi_t
 $$
 
 where:
@@ -81,8 +80,8 @@ Class:
 With momentum $p$, friction $\alpha$, and diagonal $G$:
 
 $$
-p_{t+1} = (1-\alpha)\,p_t - \text{lr}\,G_t\,g_{\text{drift}}
-          + \sqrt{2\alpha\,\text{lr}}\,\text{noise\_scale}\,\sqrt{T}\,\sqrt{G_t}\,\xi_t
+p_{t+1} = (1-\alpha)\,p_t - \lambda\,G_t\,g_{\text{drift}}
+          + \sqrt{2\alpha\,\lambda}\,\,\sqrt{T}\,\sqrt{G_t}\,\xi_t
 $$
 $$
 \theta_{t+1} = \theta_t + p_{t+1}
