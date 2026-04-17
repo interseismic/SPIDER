@@ -37,6 +37,11 @@ $$
 \mathcal{L}_{\text{data}}\in\{\mathcal{L}_{\text{ind}},\mathcal{L}_{\text{corr}}\}
 $$
 
+Operational phase policy:
+
+- Phase 1 (MAP warmup) uses robust independent likelihoods to damp outlier influence and support outlier identification.
+- Phases 2-4 (sampling) use the correlated Gaussian likelihood with shared-event structure.
+
 ## 1) Forward model and residuals
 
 For each differential-time datum $n$, let:
@@ -82,7 +87,7 @@ $$
 \end{cases}
 $$
 
-## 2) Independent residual likelihood family
+## 2) Independent residual likelihood family (Phase 1 robust path)
 
 Define standardized residual $u_n = r_n / \sigma_n$.  
 The per-observation negative log-likelihood is:
@@ -133,7 +138,7 @@ $$
 \mathcal{L}_{\text{ind}} = \frac{1}{B}\sum_{n=1}^{B}\ell_n
 $$
 
-## 3) Correlated shared-event likelihood (sampling path)
+## 3) Correlated shared-event likelihood (Phases 2-4 sampling path)
 
 For each station-phase group $g$, let $\mathbf{r}_g$ be grouped residuals and $\mathbf{b}_g$ latent event effects:
 
@@ -270,6 +275,7 @@ where:
 
 ## 7) Which likelihood is active in each stage
 
-- MAP stage uses the `locate_map` likelihood block.
-- Sampling stages use the `sample` likelihood block.
-- If collapsed shared-event correlation is enabled in the sampling block, the correlated quadratic path is used; otherwise the independent residual form is used.
+- Phase 1 (MAP warmup/outlier-screening stage) uses the `locate_map` likelihood block.
+- In this stage, robust independent residual families (Laplace, Huber, or Student-$t$) are used to reduce sensitivity to outliers and help identify problematic residuals.
+- Phases 2-4 use the `sample` likelihood block and are intended to run with correlated Gaussian structure (`correlated_gaussian`) and shared-event whitening.
+- If shared-event correlation is disabled in the sampling block, phases 2-4 fall back to the independent residual form.
