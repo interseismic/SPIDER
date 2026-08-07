@@ -1728,17 +1728,6 @@ def _run_epoch(
             optimizer.zero_grad(set_to_none=True)
             continue
 
-        # Optional: per-dimension learning-rate multiplier for ΔT (origin time correction).
-        # This is implemented as a gradient scaler so it works for Adam and our SGLD/SGHMC backends.
-        try:
-            dt_lr_mult = float(state.params.get("dt_lr_mult", 1.0))
-            if math.isfinite(dt_lr_mult) and dt_lr_mult > 0.0 and (dt_lr_mult != 1.0):
-                g = state.dX_src.grad
-                if isinstance(g, torch.Tensor) and g.ndim == 2 and int(g.shape[1]) >= 4:
-                    g[:, 3].mul_(dt_lr_mult)
-        except Exception:
-            pass
-
         # Gauge projection (translation-mode removal): apply to MAP/Adam as well (sampler backends handle internally).
         _maybe_apply_gauge_projection_for_optimizer(state, optimizer)
             

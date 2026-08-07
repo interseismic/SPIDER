@@ -197,7 +197,6 @@
                 1e-05,
                 1e-05
             ],
-            "dt_lr_mult": 1.0,
             "temperature": 1.0,
             "noise_scale_mult": 1.0,
             "sghmc_alpha": 0.01,

@@ -199,16 +199,22 @@ Required/validated:
 Optional:
 
 - `noise_scale_mult` (`> 0` when set)
-- `dt_lr_mult` (`> 0` when set)
 - `grad_clip_norm` (`>= 0` when set)
+- `reparameterization` (dict)
 - `overrides` (dict)
 
 `preconditioning` sub-block:
 
 - `enabled` (bool)
-- `type` (`rmsprop` or `lrd` when enabled)
+- `type` (`rmsprop`, `lrd`, or `component_lrd` when enabled; aliases `cc_lrd` and `block_lrd` are accepted)
 - `include_gamma` (bool)
 - `lrd` (dict when present)
+
+`reparameterization` sub-block:
+
+- `enabled` (bool)
+- `spatial_scale` (`> 0`, static scale for `x/y/z` in blocked sampler coordinates)
+- `dt_scale` (`> 0`, static scale for `dt` in blocked sampler coordinates)
 
 ### `inference.batching`
 

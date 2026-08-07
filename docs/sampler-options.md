@@ -43,8 +43,24 @@ Supported preconditioner types:
 
 - `rmsprop` (diagonal)
 - `lrd` (low-rank plus diagonal)
+- `component_lrd` (component-wise low-rank plus diagonal; no cross-component coupling)
 
 When preconditioning is enabled, both drift and injected noise are scaled by the same metric.
+
+## Blocked Reparameterization
+
+Configured at:
+
+- `inference.sampler.reparameterization.enabled`
+- `inference.sampler.reparameterization.spatial_scale`
+- `inference.sampler.reparameterization.dt_scale`
+
+When enabled, samplers operate in a blocked transformed coordinate system:
+
+- one static scale for spatial coordinates (`x/y/z`)
+- one static scale for temporal coordinate (`dt`)
+
+This is useful when spatial and temporal units are imbalanced and can destabilize frozen metrics.
 
 ## pSGLD backend
 
@@ -97,7 +113,7 @@ $$
 
 ## LRD preconditioner math
 
-Implemented in both samplers via `_build_lrd_metric(...)`.
+Implemented in both samplers via `_build_lrd_metric(...)` (global) and `_build_component_lrd_metric(...)` (component-wise).
 
 Metric form:
 
@@ -144,7 +160,7 @@ Production path (via backend factory) currently exposes:
 
 - `psgld`
 - `sghmc`
-- `rmsprop` or `lrd` preconditioning
+- `rmsprop`, `lrd`, or `component_lrd` preconditioning
 
 There is an additional optimizer class in code (`AdaptiveDriftSGLDAdam`), but it is not currently selected by `inference.sampler.backend`.
 

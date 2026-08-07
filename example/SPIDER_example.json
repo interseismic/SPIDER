@@ -180,17 +180,16 @@
             "backend": "psgld",
             "epochs_per_phase": [
                 10000,
-                2000,
+                1000,
                 1000,
                 100000
             ],
             "lr": [
                 0.001,
-                5e-4,
-                5e-4,
-                5e-4
+                1e-2,
+                1e-2,
+                1e-2
             ],
-            "dt_lr_mult": 0.05,
             "temperature": 1.0,
             "eps": 1e-05,
             "sghmc_alpha": null,
@@ -207,8 +206,26 @@
                     "diag_floor": 1e-4
                 }
             },
+            "preconditioning": {
+                "enabled": true,
+                "type": "component_lrd",
+                "lrd": {
+                  "rank": 32,
+                  "mode": "svd"
+                }
+            },
+            "preconditioning": {
+                "enabled": true,
+                "type": "rmsprop",
+                "include_gamma": false
+            },
+            "reparameterization": {
+                "enabled": true,
+                "spatial_scale": 1.0,
+                "dt_scale": 0.3
+            },
             "beta": 0.99,
-            "freeze_preconditioner_sampling": true
+            "freeze_preconditioner_sampling": false
         },
         "batching": {
             "standard": {

@@ -57,19 +57,14 @@ Other names may be consumed by logger-side code paths depending on run mode and 
 
 When the optimizer exposes diagnostics methods, SPIDER logs:
 
-- `grad_noise_to_langevin_med`
-- `grad_noise_to_langevin_gm`
-- `grad_noise_to_langevin_med_dt`
-- `grad_noise_to_langevin_gm_dt`
-- per-group variants (for example `grad_noise_to_langevin_med_hypocenter`)
+- `grad_noise_to_langevin_dr` (formerly the `hypocenter` spatial median)
+- `grad_noise_to_langevin_dt`
 - `t_eff_var_over_target`
 - `t_eff_var_over_target_gm`
-- `grad_noise_var_med`
-- `langevin_noise_var_med`
 
 Interpretation quick guide:
 
-- `grad_noise_to_langevin_*` compares minibatch gradient-noise variance to injected Langevin-noise variance.
+- `grad_noise_to_langevin_dr` and `grad_noise_to_langevin_dt` compare minibatch gradient-noise variance to injected Langevin-noise variance for spatial and `dt` directions, respectively.
 - `t_eff_var_over_target` near 1 suggests temperature calibration is closer to target.
 
 See also {doc}`sampler-health`.

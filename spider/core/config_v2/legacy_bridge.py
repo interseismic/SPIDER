@@ -8,6 +8,7 @@ parameter access patterns. It intentionally does NOT depend on config_schema.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict
 from typing import Any, Dict, List
 
@@ -126,12 +127,14 @@ def _materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     precond = _require_dict(sampler.get("preconditioning"), "inference.sampler.preconditioning")
     precond_enabled = bool(precond.get("enabled", False))
     precond_type = str(precond.get("type", "none")).strip().lower()
+    if precond_type in {"cc_lrd", "block_lrd", "component-lrd"}:
+        precond_type = "component_lrd"
     if not precond_enabled:
         precond_type = "none"
-    if precond_type not in {"none", "rmsprop", "lrd"}:
+    if precond_type not in {"none", "rmsprop", "lrd", "component_lrd"}:
         raise ValueError(
             "Invalid config at `inference.sampler.preconditioning.type`: "
-            "supported values are 'rmsprop' and 'lrd' (or disable preconditioning)."
+            "supported values are 'rmsprop', 'lrd', and 'component_lrd' (or disable preconditioning)."
         )
     lrd_cfg = precond.get("lrd", {})
     if not isinstance(lrd_cfg, dict):
@@ -158,10 +161,8 @@ def _materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     params["sampler_backend"] = str(backend)
     params["sampler_temperature"] = float(sampler.get("temperature", 1.0))
     noise_scale_mult = sampler.get("noise_scale_mult", 1.0)
-    dt_lr_mult = sampler.get("dt_lr_mult", 1.0)
     grad_clip_norm = sampler.get("grad_clip_norm", 0.0)
     params["sampler_noise_scale_mult"] = float(1.0 if noise_scale_mult is None else noise_scale_mult)
-    params["dt_lr_mult"] = float(1.0 if dt_lr_mult is None else dt_lr_mult)
     params["sampler_grad_clip_norm"] = float(0.0 if grad_clip_norm is None else grad_clip_norm)
     params["sampler_preconditioning"] = bool(precond_enabled)
     params["sampler_preconditioner"] = str(precond_type)
@@ -178,6 +179,26 @@ def _materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     params["sampler_preconditioning_lrd_oja_eta"] = float(lrd_oja_eta)
     params["sampler_preconditioning_lrd_diag_floor"] = float(lrd_diag_floor)
     params["sampler_preconditioning_lrd_target"] = str(lrd_target)
+
+    reparam = sampler.get("reparameterization", None)
+    if not isinstance(reparam, dict):
+        extras = sampler.get("extras", {})
+        if isinstance(extras, dict):
+            reparam = extras.get("reparameterization", {})
+        else:
+            reparam = {}
+    if not isinstance(reparam, dict):
+        reparam = {}
+    reparam_enabled = bool(reparam.get("enabled", False))
+    reparam_spatial_scale = float(reparam.get("spatial_scale", 1.0) or 1.0)
+    reparam_dt_scale = float(reparam.get("dt_scale", 1.0) or 1.0)
+    if (not math.isfinite(reparam_spatial_scale)) or reparam_spatial_scale <= 0.0:
+        reparam_spatial_scale = 1.0
+    if (not math.isfinite(reparam_dt_scale)) or reparam_dt_scale <= 0.0:
+        reparam_dt_scale = 1.0
+    params["sampler_reparam_blocked_enable"] = bool(reparam_enabled)
+    params["sampler_reparam_blocked_spatial_scale"] = float(reparam_spatial_scale)
+    params["sampler_reparam_blocked_dt_scale"] = float(reparam_dt_scale)
 
     overrides = sampler.get("overrides", {})
     if not isinstance(overrides, dict):

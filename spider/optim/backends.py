@@ -7,6 +7,13 @@ from .sgld import pSGLD  # default backend
 from .sghmc import SGHMC
 
 
+def _normalize_preconditioner_name(name: str) -> str:
+    x = str(name).strip().lower()
+    if x in {"cc_lrd", "block_lrd", "component-lrd"}:
+        return "component_lrd"
+    return x
+
+
 def _attach_set_lr(opt: torch.optim.Optimizer) -> None:
     if not hasattr(opt, "set_lr"):
         def set_lr(self, new_lr: float):
@@ -42,6 +49,9 @@ def _ensure_common_group_keys(opt: torch.optim.Optimizer, *, params: dict, n_obs
         g.setdefault("n_obs", int(n_obs))
         g.setdefault("freeze_preconditioner", bool(params["freeze_preconditioner_sampling"]))
         g.setdefault("is_burnin", True)
+        g.setdefault("reparam_blocked_enable", bool(params.get("sampler_reparam_blocked_enable", False)))
+        g.setdefault("reparam_blocked_spatial_scale", float(params.get("sampler_reparam_blocked_spatial_scale", 1.0)))
+        g.setdefault("reparam_blocked_dt_scale", float(params.get("sampler_reparam_blocked_dt_scale", 1.0)))
 
 
 def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimizer]:
@@ -69,7 +79,7 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         lr_eff = lr / float(n_obs)
         base_group = {"params": base_params_list, "group_name": "core"}
         param_groups = [base_group]
-        precond_arg = str(params["sampler_preconditioner"]).strip().lower()
+        precond_arg = _normalize_preconditioner_name(str(params["sampler_preconditioner"]))
         if bool(params.get("sampler_preconditioning", False)) and precond_arg in {"none", "false", ""}:
             precond_arg = "rmsprop"
         opt = pSGLD(
@@ -87,20 +97,20 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
 
         # Ensure group keys reflect config. When preconditioning is disabled, keep "none".
         precond_enabled = bool(params.get("sampler_preconditioning", False))
-        precond = str(params["sampler_preconditioner"]).strip().lower()
+        precond = _normalize_preconditioner_name(str(params["sampler_preconditioner"]))
         if precond_enabled:
             if precond in {"none", "false", ""}:
                 precond = "rmsprop"
-            if precond not in {"rmsprop", "lrd"}:
+            if precond not in {"rmsprop", "lrd", "component_lrd"}:
                 raise ValueError(
-                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd."
+                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd, component_lrd."
                 )
         else:
             precond = "none"
         for g in opt.param_groups:
             g["preconditioner"] = precond
             g["preconditioning"] = precond_enabled
-            if precond == "lrd":
+            if precond in {"lrd", "component_lrd"}:
                 g["lrd_rank"] = int(params.get("sampler_preconditioning_lrd_rank", 16))
                 g["lrd_mode"] = str(params.get("sampler_preconditioning_lrd_mode", "svd")).strip().lower()
                 g["lrd_update_every"] = int(params.get("sampler_preconditioning_lrd_update_every", 20))
@@ -108,6 +118,12 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
                 g["lrd_oja_eta"] = float(params.get("sampler_preconditioning_lrd_oja_eta", 0.02))
                 g["lrd_diag_floor"] = float(params.get("sampler_preconditioning_lrd_diag_floor", params.get("sampler_eps", 1e-8)))
                 g["lrd_target"] = str(params.get("sampler_preconditioning_lrd_target", "dX_src_only")).strip().lower()
+                if precond == "component_lrd":
+                    cid = getattr(state, "cluster_ids", None)
+                    cc = getattr(state, "cluster_counts", None)
+                    if isinstance(cid, torch.Tensor) and isinstance(cc, torch.Tensor):
+                        g["lrd_component_ids"] = cid
+                        g["lrd_component_counts"] = cc
 
         _maybe_attach_gauge_projection(opt, params=params, state=state)
         return "psgld", opt
@@ -131,20 +147,20 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
 
         # Force preconditioner mode from config. Allow "none" when preconditioning is disabled.
         precond_enabled = bool(params.get("sampler_preconditioning", False))
-        precond = str(params["sampler_preconditioner"]).strip().lower()
+        precond = _normalize_preconditioner_name(str(params["sampler_preconditioner"]))
         if precond_enabled:
             if precond in {"none", "false", ""}:
                 precond = "rmsprop"
-            if precond not in {"rmsprop", "lrd"}:
+            if precond not in {"rmsprop", "lrd", "component_lrd"}:
                 raise ValueError(
-                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd."
+                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd, component_lrd."
                 )
         else:
             precond = "none"
         for g in opt.param_groups:
             g["preconditioner"] = precond
             g["preconditioning"] = precond_enabled
-            if precond == "lrd":
+            if precond in {"lrd", "component_lrd"}:
                 g["lrd_rank"] = int(params.get("sampler_preconditioning_lrd_rank", 16))
                 g["lrd_mode"] = str(params.get("sampler_preconditioning_lrd_mode", "svd")).strip().lower()
                 g["lrd_update_every"] = int(params.get("sampler_preconditioning_lrd_update_every", 20))
@@ -152,6 +168,12 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
                 g["lrd_oja_eta"] = float(params.get("sampler_preconditioning_lrd_oja_eta", 0.02))
                 g["lrd_diag_floor"] = float(params.get("sampler_preconditioning_lrd_diag_floor", params.get("sampler_eps", 1e-8)))
                 g["lrd_target"] = str(params.get("sampler_preconditioning_lrd_target", "dX_src_only")).strip().lower()
+                if precond == "component_lrd":
+                    cid = getattr(state, "cluster_ids", None)
+                    cc = getattr(state, "cluster_counts", None)
+                    if isinstance(cid, torch.Tensor) and isinstance(cc, torch.Tensor):
+                        g["lrd_component_ids"] = cid
+                        g["lrd_component_counts"] = cc
 
         # Ensure alpha exists in groups
         for g in opt.param_groups:

@@ -324,9 +324,9 @@ def _parse_sampler(raw: Mapping[str, Any]) -> SamplerConfig:
             "freeze_preconditioner_sampling",
             "sghmc_alpha",
             "noise_scale_mult",
-            "dt_lr_mult",
             "grad_clip_norm",
             "preconditioning",
+            "reparameterization",
             "overrides",
         },
     )
@@ -373,14 +373,12 @@ def _parse_sampler(raw: Mapping[str, Any]) -> SamplerConfig:
     noise_scale_mult = _optional_num(raw, "noise_scale_mult", path)
     if noise_scale_mult is not None and noise_scale_mult <= 0.0:
         raise single_issue_error(path="inference.sampler.noise_scale_mult", code="value_error", message="Must be > 0")
-    dt_lr_mult = _optional_num(raw, "dt_lr_mult", path)
-    if dt_lr_mult is not None and dt_lr_mult <= 0.0:
-        raise single_issue_error(path="inference.sampler.dt_lr_mult", code="value_error", message="Must be > 0")
     grad_clip_norm = _optional_num(raw, "grad_clip_norm", path)
     if grad_clip_norm is not None and grad_clip_norm < 0.0:
         raise single_issue_error(path="inference.sampler.grad_clip_norm", code="value_error", message="Must be >= 0")
 
     preconditioning = raw.get("preconditioning", {})
+    reparameterization = raw.get("reparameterization", {})
     overrides = raw.get("overrides", {})
     if not isinstance(preconditioning, dict):
         raise single_issue_error(path="inference.sampler.preconditioning", code="type_error", message="Expected object/dict")
@@ -391,11 +389,13 @@ def _parse_sampler(raw: Mapping[str, Any]) -> SamplerConfig:
     )
     precond_enabled = bool(preconditioning.get("enabled", False))
     precond_type = str(preconditioning.get("type", "none")).strip().lower()
-    if precond_enabled and precond_type not in {"rmsprop", "lrd"}:
+    if precond_type in {"cc_lrd", "block_lrd", "component-lrd"}:
+        precond_type = "component_lrd"
+    if precond_enabled and precond_type not in {"rmsprop", "lrd", "component_lrd"}:
         raise single_issue_error(
             path="inference.sampler.preconditioning.type",
             code="enum_error",
-            message="Supported values are: rmsprop, lrd (or disable preconditioning).",
+            message="Supported values are: rmsprop, lrd, component_lrd (or disable preconditioning).",
         )
     lrd_cfg = preconditioning.get("lrd", {})
     if lrd_cfg is not None and not isinstance(lrd_cfg, dict):
@@ -406,6 +406,30 @@ def _parse_sampler(raw: Mapping[str, Any]) -> SamplerConfig:
         )
     if not isinstance(overrides, dict):
         raise single_issue_error(path="inference.sampler.overrides", code="type_error", message="Expected object/dict")
+    if not isinstance(reparameterization, dict):
+        raise single_issue_error(path="inference.sampler.reparameterization", code="type_error", message="Expected object/dict")
+    _reject_unknown_keys(
+        "inference.sampler.reparameterization",
+        reparameterization,
+        {"enabled", "spatial_scale", "dt_scale"},
+    )
+    reparam_enabled = bool(reparameterization.get("enabled", False))
+    if "spatial_scale" in reparameterization:
+        spatial_scale = _optional_num(reparameterization, "spatial_scale", "inference.sampler.reparameterization")
+        if spatial_scale is not None and spatial_scale <= 0.0:
+            raise single_issue_error(
+                path="inference.sampler.reparameterization.spatial_scale",
+                code="value_error",
+                message="Must be > 0",
+            )
+    if "dt_scale" in reparameterization:
+        dt_scale = _optional_num(reparameterization, "dt_scale", "inference.sampler.reparameterization")
+        if dt_scale is not None and dt_scale <= 0.0:
+            raise single_issue_error(
+                path="inference.sampler.reparameterization.dt_scale",
+                code="value_error",
+                message="Must be > 0",
+            )
     return SamplerConfig(
         backend=backend,
         epochs_per_phase=epochs,
@@ -416,11 +440,10 @@ def _parse_sampler(raw: Mapping[str, Any]) -> SamplerConfig:
         freeze_preconditioner_sampling=freeze_preconditioner_sampling,
         sghmc_alpha=sghmc_alpha,
         noise_scale_mult=noise_scale_mult,
-        dt_lr_mult=dt_lr_mult,
         grad_clip_norm=grad_clip_norm,
         preconditioning=dict(preconditioning),
         overrides=dict(overrides),
-        extras={},
+        extras={"reparameterization": dict(reparameterization), "reparameterization_enabled": bool(reparam_enabled)},
     )
 
 

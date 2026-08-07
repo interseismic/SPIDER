@@ -63,7 +63,6 @@ class SamplerConfig:
     freeze_preconditioner_sampling: bool
     sghmc_alpha: Optional[float] = None
     noise_scale_mult: Optional[float] = None
-    dt_lr_mult: Optional[float] = None
     grad_clip_norm: Optional[float] = None
     preconditioning: Dict[str, Any] = field(default_factory=dict)
     overrides: Dict[str, Any] = field(default_factory=dict)

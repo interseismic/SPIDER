@@ -5,6 +5,34 @@ import math
 from .gauge import project_event_mean_inplace
 from spider.utils.console import info, warn
 
+_COMPONENT_LRD_ALIASES = {"component_lrd", "cc_lrd", "block_lrd", "component-lrd"}
+
+
+def _canonical_preconditioner_name(preconditioner: str) -> str:
+    p = str(preconditioner).strip().lower()
+    if p in _COMPONENT_LRD_ALIASES:
+        return "component_lrd"
+    return p
+
+
+def _blocked_reparam_scale(group: dict, p: torch.Tensor) -> torch.Tensor | None:
+    if not bool(group.get("reparam_blocked_enable", False)):
+        return None
+    if (not isinstance(p, torch.Tensor)) or p.ndim != 2 or int(p.shape[1]) < 4:
+        return None
+    s_xyz = float(group.get("reparam_blocked_spatial_scale", 1.0))
+    s_dt = float(group.get("reparam_blocked_dt_scale", 1.0))
+    if (not math.isfinite(s_xyz)) or s_xyz <= 0.0:
+        s_xyz = 1.0
+    if (not math.isfinite(s_dt)) or s_dt <= 0.0:
+        s_dt = 1.0
+    if abs(s_xyz - 1.0) < 1e-12 and abs(s_dt - 1.0) < 1e-12:
+        return None
+    scale = torch.ones_like(p)
+    scale[:, :3] = float(s_xyz)
+    scale[:, 3] = float(s_dt)
+    return scale
+
 
 # Standardized stdout helper
 def _log(*parts, section: str = "SGLD", **_kwargs) -> None:
@@ -150,6 +178,325 @@ def _build_lrd_metric(
     state["precond_diag"] = diag_proxy.detach()
     return d_flat, U, lam
 
+
+def _build_component_event_groups(
+    *,
+    state: dict,
+    component_ids: torch.Tensor,
+    n_events: int,
+) -> list[torch.Tensor]:
+    cache = state.get("lrd_component_groups_cache", None)
+    if isinstance(cache, dict):
+        cid_cached = cache.get("component_ids", None)
+        groups_cached = cache.get("groups", None)
+        if (
+            isinstance(cid_cached, torch.Tensor)
+            and isinstance(groups_cached, list)
+            and cid_cached.device == component_ids.device
+            and int(cid_cached.numel()) == int(component_ids.numel())
+            and int(n_events) == int(cache.get("n_events", -1))
+        ):
+            try:
+                if int(cid_cached.data_ptr()) == int(component_ids.data_ptr()):
+                    return groups_cached
+            except Exception:
+                pass
+    if n_events <= 0:
+        groups: list[torch.Tensor] = []
+    else:
+        cid = component_ids.to(dtype=torch.int64)
+        order = torch.argsort(cid)
+        if int(order.numel()) <= 0:
+            groups = []
+        else:
+            cid_sorted = cid.index_select(0, order)
+            if int(cid_sorted.numel()) <= 1:
+                groups = [order]
+            else:
+                split = torch.nonzero(cid_sorted[1:] != cid_sorted[:-1], as_tuple=False).flatten() + 1
+                starts = torch.cat([split.new_tensor([0]), split], dim=0)
+                ends = torch.cat([split, split.new_tensor([int(order.numel())])], dim=0)
+                groups = []
+                for s, e in zip(starts.tolist(), ends.tolist()):
+                    if int(e) > int(s):
+                        groups.append(order[int(s):int(e)])
+    state["lrd_component_groups_cache"] = {
+        "component_ids": component_ids,
+        "groups": groups,
+        "n_events": int(n_events),
+    }
+    return groups
+
+
+def _build_component_lrd_metric(
+    *,
+    group: dict,
+    state: dict,
+    grad_for_precond: torch.Tensor,
+    beta: float,
+    eps: float,
+    freeze_preconditioner: bool,
+) -> tuple[torch.Tensor, list[dict]]:
+    """
+    Component-wise low-rank+diagonal preconditioner.
+
+    This keeps low-rank couplings strictly within DD connected components.
+    Returns:
+      d_flat: full diagonal term over all entries
+      factors: list of per-component factors {event_idx, U, lam}
+    """
+    g = grad_for_precond
+    if g.ndim != 2:
+        # Fallback to global LRD for non-event-shaped tensors.
+        d_flat, U, lam = _build_lrd_metric(
+            group=group,
+            state=state,
+            grad_for_precond=grad_for_precond,
+            beta=beta,
+            eps=eps,
+            freeze_preconditioner=freeze_preconditioner,
+        )
+        factors: list[dict] = []
+        if int(U.numel()) > 0 and int(lam.numel()) > 0:
+            factors.append({"event_idx": None, "U": U, "lam": lam})
+        return d_flat, factors
+
+    component_ids = group.get("lrd_component_ids", None)
+    if not isinstance(component_ids, torch.Tensor) or component_ids.ndim != 1 or int(component_ids.numel()) != int(g.shape[0]):
+        d_flat, U, lam = _build_lrd_metric(
+            group=group,
+            state=state,
+            grad_for_precond=grad_for_precond,
+            beta=beta,
+            eps=eps,
+            freeze_preconditioner=freeze_preconditioner,
+        )
+        factors = []
+        if int(U.numel()) > 0 and int(lam.numel()) > 0:
+            factors.append({"event_idx": None, "U": U, "lam": lam})
+        return d_flat, factors
+
+    if component_ids.device != g.device:
+        component_ids = component_ids.to(device=g.device)
+
+    rank_cfg = int(group.get("lrd_rank", 16))
+    mode = str(group.get("lrd_mode", "svd")).strip().lower()
+    if mode in {"randomized_svd", "stochastic_svd"}:
+        mode = "svd"
+    if mode not in {"svd", "oja"}:
+        mode = "svd"
+    update_every = max(1, int(group.get("lrd_update_every", 20)))
+    buffer_size = max(max(2, rank_cfg + 1), int(group.get("lrd_buffer_size", 64)))
+    oja_eta = float(group.get("lrd_oja_eta", 0.02))
+    if (not math.isfinite(oja_eta)) or (oja_eta <= 0.0):
+        oja_eta = 0.02
+    diag_floor = float(group.get("lrd_diag_floor", eps))
+    if (not math.isfinite(diag_floor)) or (diag_floor <= 0.0):
+        diag_floor = max(float(eps), 1e-12)
+
+    # Shared diagonal RMSprop term (already block-separable by entry).
+    v = state.get("exp_avg_sq", None)
+    if (not isinstance(v, torch.Tensor)) or v.shape != g.shape or v.device != g.device or v.dtype != g.dtype:
+        v = torch.zeros_like(g)
+        state["exp_avg_sq"] = v
+    if not freeze_preconditioner:
+        v.mul_(beta).addcmul_(g, g, value=(1.0 - beta))
+    step_i = int(state.get("step", 1))
+    if 0.0 <= float(beta) < 1.0:
+        v_hat = v / (1.0 - (float(beta) ** max(step_i, 1)))
+    else:
+        v_hat = v
+    d2 = (1.0 / (float(eps) + v_hat.clamp_min(0.0).sqrt())).clamp_min(diag_floor)
+    d_flat = d2.reshape(-1)
+
+    comp_states = state.get("lrd_component_states", None)
+    if not isinstance(comp_states, dict):
+        comp_states = {}
+    factors: list[dict] = []
+    diag_low = torch.zeros_like(g)
+    n_events, d_event = int(g.shape[0]), int(g.shape[1])
+    event_groups = _build_component_event_groups(state=state, component_ids=component_ids, n_events=n_events)
+
+    for ev_idx in event_groups:
+        m = int(ev_idx.numel())
+        if m <= 0:
+            continue
+        Dk = int(m * d_event)
+        rank = max(0, min(int(rank_cfg), Dk))
+        if rank <= 0:
+            continue
+        try:
+            comp_key = int(component_ids[int(ev_idx[0].item())].item())
+        except Exception:
+            comp_key = int(len(factors))
+        sub = comp_states.get(comp_key, {})
+        if not isinstance(sub, dict):
+            sub = {}
+
+        gk = g.index_select(0, ev_idx).reshape(-1)
+        U = sub.get("U", None)
+        lam = sub.get("lam", None)
+        if (not isinstance(U, torch.Tensor)) or U.shape != (Dk, rank) or U.device != g.device or U.dtype != g.dtype:
+            U = torch.zeros((Dk, rank), device=g.device, dtype=g.dtype)
+        if (not isinstance(lam, torch.Tensor)) or lam.shape != (rank,) or lam.device != g.device or lam.dtype != g.dtype:
+            lam = torch.zeros((rank,), device=g.device, dtype=g.dtype)
+
+        if not freeze_preconditioner:
+            if mode == "oja":
+                if not bool(torch.any(torch.isfinite(U))) or float(U.abs().sum().item()) == 0.0:
+                    gn = float(gk.norm().item())
+                    if gn > 0.0:
+                        U[:, 0] = gk / max(gn, 1e-12)
+                    if rank > 1:
+                        U[:, 1:] = torch.randn((Dk, rank - 1), device=g.device, dtype=g.dtype)
+                    try:
+                        U, _ = torch.linalg.qr(U, mode="reduced")
+                    except Exception:
+                        pass
+                q = U.mT @ gk
+                U = U + (oja_eta * torch.outer(gk, q))
+                try:
+                    U, _ = torch.linalg.qr(U, mode="reduced")
+                except Exception:
+                    pass
+                if U.shape[1] > rank:
+                    U = U[:, :rank].contiguous()
+                if U.shape[1] < rank:
+                    U_pad = torch.zeros((Dk, rank), device=g.device, dtype=g.dtype)
+                    if U.shape[1] > 0:
+                        U_pad[:, : U.shape[1]] = U
+                    U = U_pad
+                q = U.mT @ gk
+                lam.mul_(beta).addcmul_(q, q, value=(1.0 - beta))
+            else:
+                buf = sub.get("grad_buffer", None)
+                if (
+                    (not isinstance(buf, torch.Tensor))
+                    or buf.ndim != 2
+                    or int(buf.shape[1]) != int(Dk)
+                    or buf.device != g.device
+                    or buf.dtype != g.dtype
+                ):
+                    buf = torch.zeros((0, Dk), device=g.device, dtype=g.dtype)
+                buf = torch.cat([buf, gk.detach().unsqueeze(0)], dim=0)
+                if int(buf.shape[0]) > int(buffer_size):
+                    buf = buf[-int(buffer_size):, :]
+                sub["grad_buffer"] = buf.detach()
+                if (int(step_i) % int(update_every) == 0) and int(buf.shape[0]) >= max(2, rank):
+                    X = buf - buf.mean(dim=0, keepdim=True)
+                    try:
+                        _, S, Vh = torch.linalg.svd(X, full_matrices=False)
+                        r_eff = min(rank, int(Vh.shape[0]), int(S.shape[0]))
+                        if r_eff > 0:
+                            U_new = Vh[:r_eff, :].mT.contiguous()
+                            lam_new = (S[:r_eff] * S[:r_eff]) / float(max(1, int(X.shape[0]) - 1))
+                            U.zero_()
+                            U[:, :r_eff] = U_new
+                            lam.mul_(beta)
+                            lam[:r_eff].add_(lam_new.to(dtype=lam.dtype, device=lam.device), alpha=(1.0 - beta))
+                    except Exception:
+                        pass
+
+        lam = lam.clamp_min(0.0)
+        sub["U"] = U.detach()
+        sub["lam"] = lam.detach()
+        comp_states[comp_key] = sub
+
+        if int(U.numel()) > 0 and int(lam.numel()) > 0:
+            try:
+                diag_low_k = (U * U).matmul(lam).reshape(m, d_event)
+                diag_low[ev_idx, :] = diag_low_k
+                factors.append({"event_idx": ev_idx, "U": U.detach(), "lam": lam.detach()})
+            except Exception:
+                pass
+
+    diag_proxy = (d2 + diag_low).clamp_min(diag_floor)
+    state["lrd_component_states"] = comp_states
+    state["precond_diag"] = diag_proxy.detach()
+    return d_flat, factors
+
+
+def _apply_component_lowrank_drift(
+    *,
+    grad_for_drift: torch.Tensor,
+    pre_flat: torch.Tensor,
+    factors: list[dict],
+) -> torch.Tensor:
+    if not factors:
+        return pre_flat
+    out_flat = pre_flat
+    pre2 = pre_flat.reshape_as(grad_for_drift) if grad_for_drift.ndim == 2 else None
+    d_event = int(grad_for_drift.shape[1]) if grad_for_drift.ndim == 2 else 0
+    for fac in factors:
+        ev_idx = fac.get("event_idx", None)
+        U = fac.get("U", None)
+        lam = fac.get("lam", None)
+        if not isinstance(U, torch.Tensor) or not isinstance(lam, torch.Tensor):
+            continue
+        if int(U.numel()) <= 0 or int(lam.numel()) <= 0:
+            continue
+        if ev_idx is None:
+            try:
+                g_flat = grad_for_drift.reshape(-1)
+                q = U.mT @ g_flat
+                out_flat = out_flat + (U @ (lam * q))
+                if pre2 is not None:
+                    pre2 = out_flat.reshape_as(grad_for_drift)
+            except Exception:
+                continue
+            continue
+        if pre2 is None or not isinstance(ev_idx, torch.Tensor) or int(ev_idx.numel()) <= 0:
+            continue
+        try:
+            gk = grad_for_drift.index_select(0, ev_idx).reshape(-1)
+            q = U.mT @ gk
+            add = (U @ (lam * q)).reshape(int(ev_idx.numel()), d_event)
+            pre2[ev_idx, :] = pre2.index_select(0, ev_idx) + add
+            out_flat = pre2.reshape(-1)
+        except Exception:
+            continue
+    return out_flat
+
+
+def _apply_component_lowrank_noise(
+    *,
+    grad_shape_like: torch.Tensor,
+    noise_flat: torch.Tensor,
+    factors: list[dict],
+) -> torch.Tensor:
+    if not factors:
+        return noise_flat
+    out_flat = noise_flat
+    noise2 = noise_flat.reshape_as(grad_shape_like) if grad_shape_like.ndim == 2 else None
+    d_event = int(grad_shape_like.shape[1]) if grad_shape_like.ndim == 2 else 0
+    for fac in factors:
+        ev_idx = fac.get("event_idx", None)
+        U = fac.get("U", None)
+        lam = fac.get("lam", None)
+        if not isinstance(U, torch.Tensor) or not isinstance(lam, torch.Tensor):
+            continue
+        if int(U.numel()) <= 0 or int(lam.numel()) <= 0:
+            continue
+        if ev_idx is None:
+            try:
+                z2 = torch.randn((int(lam.numel()),), device=out_flat.device, dtype=out_flat.dtype)
+                out_flat = out_flat + (U @ (lam.clamp_min(0.0).sqrt() * z2))
+                if noise2 is not None:
+                    noise2 = out_flat.reshape_as(grad_shape_like)
+            except Exception:
+                continue
+            continue
+        if noise2 is None or not isinstance(ev_idx, torch.Tensor) or int(ev_idx.numel()) <= 0:
+            continue
+        try:
+            z2 = torch.randn((int(lam.numel()),), device=noise2.device, dtype=noise2.dtype)
+            add = (U @ (lam.clamp_min(0.0).sqrt() * z2)).reshape(int(ev_idx.numel()), d_event)
+            noise2[ev_idx, :] = noise2.index_select(0, ev_idx) + add
+            out_flat = noise2.reshape(-1)
+        except Exception:
+            continue
+    return out_flat
+
 class pSGLD(torch.optim.Optimizer):
     """
     Preconditioned Stochastic Gradient Langevin Dynamics (pSGLD) optimizer.
@@ -166,6 +513,7 @@ class pSGLD(torch.optim.Optimizer):
     Supported preconditioners in current runtime:
     - `rmsprop` (diagonal)
     - `lrd` (low-rank plus diagonal)
+    - `component_lrd` (low-rank plus diagonal, block-separated by DD component)
     """
 
     def __init__(self, params, n_obs, lr=1e-3, beta=0.99, eps=1e-5,
@@ -206,15 +554,15 @@ class pSGLD(torch.optim.Optimizer):
         if n_obs <= 0:
             raise ValueError(f"Invalid n_obs: {n_obs}")
 
-        preconditioner = str(preconditioner).strip().lower()
+        preconditioner = _canonical_preconditioner_name(str(preconditioner))
         if preconditioner in {"none", "false", ""}:
             if preconditioning:
                 raise ValueError("preconditioner cannot be 'none' when preconditioning=True")
             # Keep a valid label even when preconditioning is disabled.
             preconditioner = "rmsprop"
-        if preconditioner not in {"rmsprop", "lrd"}:
+        if preconditioner not in {"rmsprop", "lrd", "component_lrd"}:
             raise ValueError(
-                f"preconditioner must be 'rmsprop' or 'lrd'; got '{preconditioner}'"
+                f"preconditioner must be 'rmsprop', 'lrd', or 'component_lrd'; got '{preconditioner}'"
             )
 
         defaults = dict(lr=lr, beta=beta, eps=eps, n_obs=n_obs,
@@ -260,7 +608,7 @@ class pSGLD(torch.optim.Optimizer):
             n_obs = group['n_obs']
             preconditioning = group['preconditioning']
             add_noise = group['add_noise']
-            preconditioner = group.get('preconditioner', 'rmsprop')
+            preconditioner = _canonical_preconditioner_name(group.get('preconditioner', 'rmsprop'))
             include_gamma = group.get('include_gamma', True)
             noise_scale = float(group.get('noise_scale', 1.0))
             temperature = float(group.get('temperature', 1.0))
@@ -272,6 +620,7 @@ class pSGLD(torch.optim.Optimizer):
                     continue
 
                 raw_grad = p.grad  # minibatch-mean grad ḡ
+                reparam_scale = _blocked_reparam_scale(group, p)
 
                 # --- Optional gauge projection: remove translation mode before preconditioner stats update ---
                 try:
@@ -287,8 +636,9 @@ class pSGLD(torch.optim.Optimizer):
                 except Exception:
                     pass
 
-                grad_for_drift = raw_grad.mul(n_obs)  # sum-loglik convention (N*ḡ)
-                grad_for_precond = raw_grad
+                raw_grad_eff = raw_grad if reparam_scale is None else (raw_grad * reparam_scale)
+                grad_for_drift = raw_grad_eff.mul(n_obs)  # sum-loglik convention (N*ḡ)
+                grad_for_precond = raw_grad_eff
 
                 state = self.state[p]
 
@@ -306,7 +656,7 @@ class pSGLD(torch.optim.Optimizer):
                     state['step'] = 0
                 state['step'] += 1
 
-                if preconditioning and preconditioner == "lrd":
+                if preconditioning and preconditioner in {"lrd", "component_lrd"}:
                     # Non-diagonal preconditioner (LRD)
                     ema_g = state['ema_g']
                     ema_g2 = state['ema_g2']
@@ -315,7 +665,23 @@ class pSGLD(torch.optim.Optimizer):
                     state['ema_g'] = ema_g
                     state['ema_g2'] = ema_g2
 
-                    if preconditioner == "lrd":
+                    if preconditioner == "component_lrd":
+                        d_flat, comp_factors = _build_component_lrd_metric(
+                            group=group,
+                            state=state,
+                            grad_for_precond=grad_for_precond,
+                            beta=float(beta),
+                            eps=float(eps),
+                            freeze_preconditioner=bool(freeze_preconditioner),
+                        )
+                        g_flat = grad_for_drift.reshape(-1)
+                        pre_flat = d_flat * g_flat
+                        pre_flat = _apply_component_lowrank_drift(
+                            grad_for_drift=grad_for_drift,
+                            pre_flat=pre_flat,
+                            factors=comp_factors,
+                        )
+                    else:
                         d_flat, U_lrd, lam_lrd = _build_lrd_metric(
                             group=group,
                             state=state,
@@ -332,42 +698,40 @@ class pSGLD(torch.optim.Optimizer):
                                 pre_flat = pre_flat + (U_lrd @ (lam_lrd * q))
                             except Exception:
                                 pass
-                        update = lr * pre_flat.reshape_as(p)
-                        if add_noise:
-                            temp = max(0.0, temperature)
-                            std = math.sqrt(2.0 * lr * temp) * noise_scale
-                            noise_flat = torch.randn_like(g_flat) * d_flat.sqrt()
+                    update = lr * pre_flat.reshape_as(p)
+                    if add_noise:
+                        temp = max(0.0, temperature)
+                        std = math.sqrt(2.0 * lr * temp) * noise_scale
+                        noise_flat = torch.randn_like(g_flat) * d_flat.sqrt()
+                        if preconditioner == "component_lrd":
+                            noise_flat = _apply_component_lowrank_noise(
+                                grad_shape_like=grad_for_drift,
+                                noise_flat=noise_flat,
+                                factors=comp_factors,
+                            )
+                        else:
                             if int(U_lrd.numel()) > 0 and int(lam_lrd.numel()) > 0:
                                 try:
                                     z2 = torch.randn((int(lam_lrd.numel()),), device=p.device, dtype=p.dtype)
                                     noise_flat = noise_flat + (U_lrd @ (lam_lrd.clamp_min(0.0).sqrt() * z2))
                                 except Exception:
                                     pass
-                            noise = std * noise_flat.reshape_as(p)
-                            # Optional gauge projection of injected noise.
-                            try:
-                                if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
-                                    if bool(getattr(self, "_gauge_project_apply_noise", True)):
-                                        dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
-                                        mode = str(getattr(self, "_gauge_project_mode", "global"))
-                                        cid = getattr(self, "_gauge_cluster_ids", None)
-                                        cc = getattr(self, "_gauge_cluster_counts", None)
-                                        project_event_mean_inplace(noise, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
-                            except Exception:
-                                pass
-                            update = update + noise
-                        # Optional gauge projection of total update.
-                        try:
-                            if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
-                                dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
-                                mode = str(getattr(self, "_gauge_project_mode", "global"))
-                                cid = getattr(self, "_gauge_cluster_ids", None)
-                                cc = getattr(self, "_gauge_cluster_counts", None)
-                                project_event_mean_inplace(update, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
-                        except Exception:
-                            pass
-                        p.add_(-update)
-                        continue
+                        noise = std * noise_flat.reshape_as(p)
+                        update = update + noise
+                    if reparam_scale is not None:
+                        update = update * reparam_scale
+                    # Optional gauge projection of injected noise / total update.
+                    try:
+                        if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                            dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                            mode = str(getattr(self, "_gauge_project_mode", "global"))
+                            cid = getattr(self, "_gauge_cluster_ids", None)
+                            cc = getattr(self, "_gauge_cluster_counts", None)
+                            project_event_mean_inplace(update, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                    except Exception:
+                        pass
+                    p.add_(-update)
+                    continue
 
                 if preconditioning:
                     v = state['exp_avg_sq']
@@ -421,7 +785,7 @@ class pSGLD(torch.optim.Optimizer):
                 if include_gamma and preconditioning:
                     sqrt_v = v.sqrt().clamp_min(0.0)
                     denom = (eps + sqrt_v)
-                    gamma = - (1.0 - beta) * raw_grad * (sqrt_v / (denom * denom))
+                    gamma = - (1.0 - beta) * grad_for_precond * (sqrt_v / (denom * denom))
                     update = update + lr * gamma
 
                 # Add Langevin noise if requested:
@@ -431,18 +795,10 @@ class pSGLD(torch.optim.Optimizer):
                     temp = max(0.0, temperature)
                     std = math.sqrt(2.0 * lr * temp) * noise_scale
                     noise = torch.randn_like(p) * std * G.sqrt()
-                    # Optional gauge projection of injected noise.
-                    try:
-                        if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
-                            if bool(getattr(self, "_gauge_project_apply_noise", True)):
-                                dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
-                                mode = str(getattr(self, "_gauge_project_mode", "global"))
-                                cid = getattr(self, "_gauge_cluster_ids", None)
-                                cc = getattr(self, "_gauge_cluster_counts", None)
-                                project_event_mean_inplace(noise, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
-                    except Exception:
-                        pass
                     update += noise
+
+                if reparam_scale is not None:
+                    update = update * reparam_scale
 
                 # Update parameter
                 # Optional gauge projection of total update.
@@ -508,7 +864,7 @@ class pSGLD(torch.optim.Optimizer):
             beta = float(group.get('beta', 0.99))
             eps_g = float(group.get('eps', 1e-5))
             preconditioning = bool(group.get('preconditioning', True))
-            preconditioner = str(group.get('preconditioner', 'rmsprop'))
+            preconditioner = _canonical_preconditioner_name(group.get('preconditioner', 'rmsprop'))
             add_noise = bool(group.get('add_noise', True))
             noise_scale = float(group.get('noise_scale', 1.0))
             temperature = float(group.get('temperature', 1.0))
@@ -537,8 +893,8 @@ class pSGLD(torch.optim.Optimizer):
                 var_g = (ema_g2 - ema_g * ema_g).clamp_min(0.0)
                 # Preconditioner metric (diagonal proxy in update space)
                 if preconditioning:
-                    precond = str(preconditioner).lower()
-                    if precond in {"lrd"}:
+                    precond = _canonical_preconditioner_name(preconditioner)
+                    if precond in {"lrd", "component_lrd"}:
                         G = state.get("precond_diag", None)
                         if G is None or not isinstance(G, torch.Tensor):
                             G = torch.ones_like(ema_g)
@@ -1004,7 +1360,7 @@ class AdaptiveDriftSGLDAdam(torch.optim.Optimizer):
 
             eps = float(group.get('eps', 1e-5))
             beta = float(group.get('beta', 0.99))
-            preconditioner = str(group.get('preconditioner', 'rmsprop')).lower()
+            preconditioner = _canonical_preconditioner_name(group.get('preconditioner', 'rmsprop'))
 
             # Find first parameter with state
             p = None
@@ -1017,7 +1373,7 @@ class AdaptiveDriftSGLDAdam(torch.optim.Optimizer):
 
             state = self.state.get(p, {})
 
-            if preconditioner == "lrd":
+            if preconditioner in {"lrd", "component_lrd"}:
                 G_diag = state.get("precond_diag", None)
                 if isinstance(G_diag, torch.Tensor):
                     return _five_num(G_diag)

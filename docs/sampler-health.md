@@ -5,13 +5,14 @@ This page summarizes practical checks for pSGLD/SGHMC behavior in Phase 4.
 ## Core diagnostics
 
 - `t_eff_var_over_target` (temperature calibration proxy)
-- `grad_noise_to_langevin_*` (gradient-noise vs injected-noise balance)
+- `grad_noise_to_langevin_dr` / `grad_noise_to_langevin_dt` (gradient-noise vs injected-noise balance for spatial vs `dt`)
 - per-parameter/block ESS and split-Rhat (multi-chain)
 
 ## Suggested targets
 
 - `t_eff_var_over_target`: around `0.8-1.2`
-- `grad_noise_to_langevin_med`: around `0.1-1.0` (order of magnitude)
+- `grad_noise_to_langevin_dr`: around `0.1-1.0` (order of magnitude)
+- `grad_noise_to_langevin_dt`: around `0.1-1.0` (order of magnitude)
 
 These are heuristics, not strict guarantees.
 

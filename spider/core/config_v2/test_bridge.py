@@ -138,7 +138,6 @@ def _base_config() -> dict:
                 "sghmc_alpha": 0.05,
                 "eps": 1e-5,
                 "beta": 0.99,
-                "dt_lr_mult": 0.5,
                 "freeze_preconditioner_sampling": False,
                 "preconditioning": {
                     "enabled": True,
@@ -256,6 +255,33 @@ class ConfigBridgeTests(unittest.TestCase):
         self.assertAlmostEqual(legacy["sampler_preconditioning_lrd_oja_eta"], 0.015)
         self.assertAlmostEqual(legacy["sampler_preconditioning_lrd_diag_floor"], 1e-6)
         self.assertEqual(legacy["sampler_preconditioning_lrd_target"], "dx_src_only")
+
+    def test_sampler_component_lrd_alias_materialization(self) -> None:
+        cfg = _base_config()
+        pre = cfg["inference"]["sampler"]["preconditioning"]
+        pre["type"] = "cc_lrd"
+        pre["lrd"] = {"rank": 8, "mode": "svd"}
+
+        resolved = load_config(cfg, mode="sample")
+        legacy = to_legacy_runtime_params(resolved, profile="all", require_priors=False)
+        self.assertEqual(legacy["sampler_preconditioner"], "component_lrd")
+        self.assertEqual(legacy["sampler_preconditioning_lrd_rank"], 8)
+        self.assertEqual(legacy["sampler_preconditioning_lrd_mode"], "svd")
+
+    def test_sampler_blocked_reparameterization_materialization(self) -> None:
+        cfg = _base_config()
+        sampler = cfg["inference"]["sampler"]
+        sampler["reparameterization"] = {
+            "enabled": True,
+            "spatial_scale": 0.5,
+            "dt_scale": 2.0,
+        }
+
+        resolved = load_config(cfg, mode="sample")
+        legacy = to_legacy_runtime_params(resolved, profile="all", require_priors=False)
+        self.assertTrue(legacy["sampler_reparam_blocked_enable"])
+        self.assertAlmostEqual(legacy["sampler_reparam_blocked_spatial_scale"], 0.5)
+        self.assertAlmostEqual(legacy["sampler_reparam_blocked_dt_scale"], 2.0)
 
     def test_synth_profile_skips_sampler_materialization(self) -> None:
         cfg = _base_config()

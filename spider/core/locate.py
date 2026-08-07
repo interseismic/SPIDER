@@ -121,7 +121,7 @@ def _sampler_extra_metrics(optimizer: Optional[torch.optim.Optimizer]) -> Dict[s
     We intentionally do NOT log `drift_ratio_*` metrics anymore (removed).
 
     We *do* log two SGHMC-specific diagnostics when SGHMC is active and Langevin noise is enabled:
-      - grad_noise_to_langevin_*: ratio of minibatch-gradient-induced update variance to injected noise variance
+      - grad_noise_to_langevin_dr / grad_noise_to_langevin_dt: ratio of minibatch-gradient-induced update variance to injected noise variance
       - t_eff_var_over_target: effective temperature estimate (variance-based) relative to target temperature
     """
     metrics: Dict[str, float] = {}
@@ -141,47 +141,26 @@ def _sampler_extra_metrics(optimizer: Optional[torch.optim.Optimizer]) -> Dict[s
         if hasattr(optimizer, "grad_vs_noise_stats"):
             s = optimizer.grad_vs_noise_stats()  # type: ignore[attr-defined]
             if isinstance(s, dict):
-                med = float(s.get("median", float("nan")))
-                gm = float(s.get("gm", float("nan")))
-                if med == med:
-                    metrics["grad_noise_to_langevin_med"] = med
-                if gm == gm:
-                    metrics["grad_noise_to_langevin_gm"] = gm
+                dr_med = float("nan")
                 dt_med = float(s.get("dt_median", float("nan")))
-                dt_gm = float(s.get("dt_gm", float("nan")))
-                if dt_med == dt_med:
-                    metrics["grad_noise_to_langevin_med_dt"] = dt_med
-                if dt_gm == dt_gm:
-                    metrics["grad_noise_to_langevin_gm_dt"] = dt_gm
-                vg = float(s.get("var_g_median", float("nan")))
-                vn = float(s.get("var_noise_median", float("nan")))
-                if vg == vg:
-                    metrics["grad_noise_var_med"] = vg
-                if vn == vn:
-                    metrics["langevin_noise_var_med"] = vn
                 pg = s.get("per_group", None)
                 if isinstance(pg, list):
                     for i, gs in enumerate(pg):
                         if not isinstance(gs, dict):
                             continue
                         name = str(gs.get("group_name", f"group{i}")).strip().lower()
-                        # Map legacy "core" group to a more user-meaningful label.
-                        if name in {"core", "main"}:
-                            name = "hypocenter"
-                        # sanitize
-                        name = "".join([c if (c.isalnum() or c in {"_", "-"} ) else "_" for c in name])
-                        gmed = float(gs.get("median", float("nan")))
-                        ggm = float(gs.get("gm", float("nan")))
-                        if gmed == gmed:
-                            metrics[f"grad_noise_to_langevin_med_{name}"] = gmed
-                        if ggm == ggm:
-                            metrics[f"grad_noise_to_langevin_gm_{name}"] = ggm
-                        gdt_med = float(gs.get("dt_median", float("nan")))
-                        gdt_gm = float(gs.get("dt_gm", float("nan")))
-                        if gdt_med == gdt_med:
-                            metrics[f"grad_noise_to_langevin_med_{name}_dt"] = gdt_med
-                        if gdt_gm == gdt_gm:
-                            metrics[f"grad_noise_to_langevin_gm_{name}_dt"] = gdt_gm
+                        if name in {"core", "main", "hypocenter"}:
+                            dr_med = float(gs.get("median", float("nan")))
+                            dt_med_h = float(gs.get("dt_median", float("nan")))
+                            if math.isfinite(dt_med_h):
+                                dt_med = dt_med_h
+                            break
+                if not math.isfinite(dr_med):
+                    dr_med = float(s.get("median", float("nan")))
+                if math.isfinite(dr_med):
+                    metrics["grad_noise_to_langevin_dr"] = dr_med
+                if math.isfinite(dt_med):
+                    metrics["grad_noise_to_langevin_dt"] = dt_med
     except Exception:
         pass
 
@@ -1049,6 +1028,8 @@ def _setup_sampler(state: LocateState) -> torch.optim.Optimizer:
     try:
         precond_json = bool(state.params.get("sampler_preconditioning", False))
         precond_type_json = str(state.params.get("sampler_preconditioner", "none")).strip().lower()
+        if precond_type_json in {"cc_lrd", "block_lrd", "component-lrd"}:
+            precond_type_json = "component_lrd"
         if precond_json and precond_type_json in {"none", "false", ""}:
             precond_type_json = "rmsprop"
         if (not precond_json) or precond_type_json in {"none", "false", ""}:
@@ -1463,6 +1444,8 @@ def _phase2_preconditioner(
     # Respect user intent: only force RMSProp warmup if preconditioning is enabled
     user_preconditioning = bool(state.params.get("sampler_preconditioning", False))
     user_precond_type = str(state.params.get("sampler_preconditioner", "none")).strip().lower()
+    if user_precond_type in {"cc_lrd", "block_lrd", "component-lrd"}:
+        user_precond_type = "component_lrd"
     if user_preconditioning and user_precond_type in {"none", "false", ""}:
         user_precond_type = "rmsprop"
     
@@ -1473,7 +1456,7 @@ def _phase2_preconditioner(
             g['noise_scale'] = 0.0
 
         # Only keep preconditioners currently supported in runtime.
-        if user_preconditioning and user_precond_type in {"rmsprop", "lrd"}:
+        if user_preconditioning and user_precond_type in {"rmsprop", "lrd", "component_lrd"}:
             g['preconditioner'] = user_precond_type
             g['preconditioning'] = True
             g['freeze_preconditioner'] = False
@@ -4425,6 +4408,8 @@ def locate_all(
             temp_json = float(state.params["sampler_temperature"])
             precond_json = bool(state.params["sampler_preconditioning"])
             precond_type_json = str(state.params.get("sampler_preconditioner", "none")).strip().lower()
+            if precond_type_json in {"cc_lrd", "block_lrd", "component-lrd"}:
+                precond_type_json = "component_lrd"
             if precond_json and precond_type_json in {"none", "false", ""}:
                 precond_type_json = "rmsprop"
             if (not precond_json) or precond_type_json in {"none", "false", ""}:
