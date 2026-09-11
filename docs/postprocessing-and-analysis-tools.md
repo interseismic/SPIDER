@@ -23,8 +23,11 @@ samples = read_all_samples(
 Returned core arrays:
 
 - `event_ids`
-- `longitude`, `latitude`, `depth`
-- `X`, `Y`, `Z`, `delta_t`
+- `depth` — absolute depth (km)
+- `X`, `Y`, `Z`, `delta_t` — sampled **offsets** (ΔX) from the initial catalog, in km and seconds;
+  add the initial catalog position to get absolute coordinates
+- `longitude`, `latitude` — absolute, populated only if lon/lat conversion was enabled when the
+  samples were written
 
 Useful metadata keys for chain-aware analysis:
 
@@ -39,7 +42,10 @@ Map-only behavior:
 Related I/O helpers:
 
 - `merge_samples_hdf5(...)` (merge multi-chain sample files)
-- `read_growclust_bootstrap(...)` (convert GrowClust bootstrap outputs into SPIDER-like sample dict)
+- `read_growclust_bootstrap(...)` (convert GrowClust bootstrap outputs into a SPIDER-like sample
+  dict; needs `params` with `lat_min`/`lon_min` or `model.domain`)
+
+Both must be imported from `spider.io.samples` (they are not re-exported by `spider.io`).
 
 ## 2) Build event summaries
 
@@ -64,7 +70,10 @@ summary = compute_cat_dd_and_xyz(
 
 Key options:
 
-- `include`: choose outputs (`X`, `Y`, `Z`, `T`, `lats`, `lons`, `deps`, `cat_dd`)
+- `include`: any of `X`, `Y`, `Z`, `T`, `lats`, `lons`, `deps`, `cat_dd`. The default set omits
+  `T` — request it explicitly (derived from `delta_t`); `compute_ess_summary` requires
+  `include=["X", "Y", "Z", "T"]`.
+- `uncertainty_metrics`: `sigma` (default), `std`, `mae`, `mad`, `iqr`, `qhw_<p>`
 - `burn_in`, `thin`
 - `compute_map` / `map_bins` for histogram mode estimates
 - `add_wasserstein` to append per-event prior-vs-posterior Wasserstein diagnostics
@@ -135,10 +144,42 @@ fig, ax = plot_uncertainty_histograms(summary, coords=("X", "Y", "Z", "T"))
 fig, axes = plot_event_marginal_kde2d(samples, event_index=0, coords=("X", "Y", "Z"))
 ```
 
-## 6) Typical post-processing workflow
+## 6) Residual diagnostics from a finished run
+
+```bash
+spider analyze-resid my_params.json --device 0 \
+  --bundle checkpoints/phase2_bundle.pth \
+  --use-latest-checkpoint \
+  --plot-dir ./variograms
+```
+
+Runs the residual/whitening diagnostics without rerunning MAP: shared-event τ_s estimators,
+hold-out calibration, event–pair–station correlation, and (by default) variogram PNGs
+(`--no-plot-variograms` to disable). Sub-diagnostics are toggled under `observability.diagnostics`
+(`truth_catalog`, `event_pair_station_corr`, `shared_event_re_tau`).
+
+## 7) Other analysis utilities
+
+- `spider.analysis.calibration.calibrate_event_posteriors_against_truth(...)` — posterior
+  coverage/calibration against a truth catalog.
+- `python -m spider.analysis.diagnose_sticky_events ...` — finds events that barely move
+  (degree/connectivity correlation); writes `sticky_events.csv`.
+- `spider.analysis.spatial.compute_receiver_ratio_semivariograms(...)` /
+  `plot_receiver_ratio_semivariograms(...)`.
+- `spider.analysis.graph_partition.{partition_graph_greedy_unionfind,
+  partition_graph_recursive_bisection, partition_graph_disjoint_blocks}`.
+- `spider.diagnostics.fim.{compute_block_fim, filter_unstable_events, analyze_fim_stability}`.
+- `spider.plotting.build_catalog_posterior_mean(...)`.
+- Repo scripts: `scripts/dtimes_csv_to_ascii_pairs.py`, `scripts/smoke_test_synth_init_catalog.py`,
+  `scripts/canary_shared_event_re_backend.py`.
+- Maintenance CLIs: `python -m spider.tools.audit_reachability`,
+  `python -m spider.tools.clean_worktree`.
+
+## 8) Typical post-processing workflow
 
 1. Read samples with thinning (`read_all_samples`).
 2. Build summary (`compute_cat_dd_and_xyz`) including `X/Y/Z/T` and `cat_dd`.
 3. Compute ESS summary and inspect low-tail events.
 4. Generate chain and marginal plots.
-5. (Optional) run calibration and Wasserstein diagnostics for deeper quality checks.
+5. (Optional) run `analyze-resid`, calibration and Wasserstein diagnostics for deeper quality
+   checks.

@@ -14,6 +14,9 @@ def _canonical_preconditioner_name(preconditioner: str) -> str:
     return p
 
 
+_REPARAM_SCALE_CACHE: dict = {}
+
+
 def _blocked_reparam_scale(group: dict, p: torch.Tensor) -> torch.Tensor | None:
     if not bool(group.get("reparam_blocked_enable", False)):
         return None
@@ -27,9 +30,16 @@ def _blocked_reparam_scale(group: dict, p: torch.Tensor) -> torch.Tensor | None:
         s_dt = 1.0
     if abs(s_xyz - 1.0) < 1e-12 and abs(s_dt - 1.0) < 1e-12:
         return None
-    scale = torch.ones_like(p)
-    scale[:, :3] = float(s_xyz)
-    scale[:, 3] = float(s_dt)
+    # Column-constant scale: a cached (1, D) row broadcasts against (N, D)
+    # tensors, avoiding a full ones_like allocation every step.
+    D = int(p.shape[1])
+    key = (D, p.dtype, p.device, s_xyz, s_dt)
+    scale = _REPARAM_SCALE_CACHE.get(key)
+    if scale is None:
+        scale = torch.ones((1, D), device=p.device, dtype=p.dtype)
+        scale[:, :3] = float(s_xyz)
+        scale[:, 3] = float(s_dt)
+        _REPARAM_SCALE_CACHE[key] = scale
     return scale
 
 
@@ -95,7 +105,12 @@ def _build_lrd_metric(
 
     if not freeze_preconditioner:
         if mode == "oja":
-            if not bool(torch.any(torch.isfinite(U))) or float(U.abs().sum().item()) == 0.0:
+            # A one-time Python flag avoids two full-tensor reductions plus two
+            # host syncs per step just to re-detect the initialized state.
+            u_ready = bool(state.get("lrd_U_ready", False))
+            if not u_ready:
+                u_ready = bool(torch.any(torch.isfinite(U))) and float(U.abs().sum().item()) != 0.0
+            if not u_ready:
                 gn = float(g_flat.norm().item())
                 if gn > 0.0:
                     U[:, 0] = g_flat / max(gn, 1e-12)
@@ -105,6 +120,8 @@ def _build_lrd_metric(
                     U, _ = torch.linalg.qr(U, mode="reduced")
                 except Exception:
                     pass
+                u_ready = (gn > 0.0) or (rank > 1)
+            state["lrd_U_ready"] = bool(u_ready)
             q = U.mT @ g_flat
             U = U + (oja_eta * torch.outer(g_flat, q))
             try:
@@ -121,20 +138,43 @@ def _build_lrd_metric(
             q = U.mT @ g_flat
             lam.mul_(beta).addcmul_(q, q, value=(1.0 - beta))
         else:
-            buf = state.get("lrd_grad_buffer", None)
+            # Preallocated ring buffer: one row copy per step instead of
+            # re-concatenating the whole (buffer_size, D) history each step.
+            ring = state.get("lrd_grad_ring", None)
+            pos = int(state.get("lrd_grad_ring_pos", 0))
+            fill = int(state.get("lrd_grad_ring_fill", 0))
             if (
-                (not isinstance(buf, torch.Tensor))
-                or buf.ndim != 2
-                or int(buf.shape[1]) != int(D)
-                or buf.device != g.device
-                or buf.dtype != g.dtype
+                (not isinstance(ring, torch.Tensor))
+                or ring.shape != (int(buffer_size), int(D))
+                or ring.device != g.device
+                or ring.dtype != g.dtype
             ):
-                buf = torch.zeros((0, D), device=g.device, dtype=g.dtype)
-            buf = torch.cat([buf, g_flat.detach().unsqueeze(0)], dim=0)
-            if int(buf.shape[0]) > int(buffer_size):
-                buf = buf[-int(buffer_size) :, :]
-            state["lrd_grad_buffer"] = buf.detach()
-            if (int(state.get("step", 1)) % int(update_every) == 0) and int(buf.shape[0]) >= max(2, rank):
+                ring = torch.zeros((int(buffer_size), int(D)), device=g.device, dtype=g.dtype)
+                pos = 0
+                fill = 0
+                # Migrate a legacy chronological buffer (older checkpoints).
+                old = state.pop("lrd_grad_buffer", None)
+                if isinstance(old, torch.Tensor) and old.ndim == 2 and int(old.shape[1]) == int(D):
+                    rows = old[-int(buffer_size):].to(device=g.device, dtype=g.dtype)
+                    n0 = int(rows.shape[0])
+                    if n0 > 0:
+                        ring[:n0].copy_(rows)
+                        fill = n0
+                        pos = n0 % int(buffer_size)
+                state["lrd_grad_ring"] = ring
+            ring[pos].copy_(g_flat.detach())
+            pos = (pos + 1) % int(buffer_size)
+            fill = min(fill + 1, int(buffer_size))
+            state["lrd_grad_ring_pos"] = pos
+            state["lrd_grad_ring_fill"] = fill
+            if (int(state.get("step", 1)) % int(update_every) == 0) and fill >= max(2, rank):
+                # Materialize rows in chronological order only on SVD steps.
+                if fill < int(buffer_size):
+                    buf = ring[:fill]
+                elif pos == 0:
+                    buf = ring
+                else:
+                    buf = torch.cat([ring[pos:], ring[:pos]], dim=0)
                 X = buf - buf.mean(dim=0, keepdim=True)
                 try:
                     _, S, Vh = torch.linalg.svd(X, full_matrices=False)
@@ -150,12 +190,13 @@ def _build_lrd_metric(
                     pass
 
     lam = lam.clamp_min(0.0)
-    diag_low = torch.zeros((D,), device=g.device, dtype=g.dtype)
     if int(U.numel()) > 0 and int(lam.numel()) > 0:
         try:
             diag_low = (U * U).matmul(lam)
         except Exception:
             diag_low = torch.zeros((D,), device=g.device, dtype=g.dtype)
+    else:
+        diag_low = torch.zeros((D,), device=g.device, dtype=g.dtype)
     diag_proxy = (d_flat + diag_low).clamp_min(diag_floor).reshape_as(g)
     state["lrd_U"] = U.detach()
     state["lrd_lambda"] = lam.detach()
@@ -168,23 +209,30 @@ def _build_component_event_groups(
     state: dict,
     component_ids: torch.Tensor,
     n_events: int,
-) -> list[torch.Tensor]:
+) -> tuple[list[torch.Tensor], list[int]]:
+    """Returns (groups, keys): per-component event index tensors and the
+    matching integer component ids. Keys are computed once at cache build so
+    the per-step loop never has to sync component ids off the device."""
     cache = state.get("lrd_component_groups_cache", None)
     if isinstance(cache, dict):
         cid_cached = cache.get("component_ids", None)
         groups_cached = cache.get("groups", None)
+        keys_cached = cache.get("keys", None)
         if (
             isinstance(cid_cached, torch.Tensor)
             and isinstance(groups_cached, list)
+            and isinstance(keys_cached, list)
+            and len(keys_cached) == len(groups_cached)
             and cid_cached.device == component_ids.device
             and int(cid_cached.numel()) == int(component_ids.numel())
             and int(n_events) == int(cache.get("n_events", -1))
         ):
             try:
                 if int(cid_cached.data_ptr()) == int(component_ids.data_ptr()):
-                    return groups_cached
+                    return groups_cached, keys_cached
             except Exception:
                 pass
+    keys: list[int] = []
     if n_events <= 0:
         groups: list[torch.Tensor] = []
     else:
@@ -196,20 +244,24 @@ def _build_component_event_groups(
             cid_sorted = cid.index_select(0, order)
             if int(cid_sorted.numel()) <= 1:
                 groups = [order]
+                keys = [int(cid_sorted[0].item())]
             else:
                 split = torch.nonzero(cid_sorted[1:] != cid_sorted[:-1], as_tuple=False).flatten() + 1
                 starts = torch.cat([split.new_tensor([0]), split], dim=0)
                 ends = torch.cat([split, split.new_tensor([int(order.numel())])], dim=0)
+                key_vals = cid_sorted.index_select(0, starts).tolist()
                 groups = []
-                for s, e in zip(starts.tolist(), ends.tolist()):
+                for s, e, kv in zip(starts.tolist(), ends.tolist(), key_vals):
                     if int(e) > int(s):
                         groups.append(order[int(s):int(e)])
+                        keys.append(int(kv))
     state["lrd_component_groups_cache"] = {
         "component_ids": component_ids,
         "groups": groups,
+        "keys": keys,
         "n_events": int(n_events),
     }
-    return groups
+    return groups, keys
 
 
 def _build_component_lrd_metric(
@@ -297,9 +349,9 @@ def _build_component_lrd_metric(
     factors: list[dict] = []
     diag_low = torch.zeros_like(g)
     n_events, d_event = int(g.shape[0]), int(g.shape[1])
-    event_groups = _build_component_event_groups(state=state, component_ids=component_ids, n_events=n_events)
+    event_groups, comp_keys = _build_component_event_groups(state=state, component_ids=component_ids, n_events=n_events)
 
-    for ev_idx in event_groups:
+    for ev_idx, comp_key in zip(event_groups, comp_keys):
         m = int(ev_idx.numel())
         if m <= 0:
             continue
@@ -307,10 +359,6 @@ def _build_component_lrd_metric(
         rank = max(0, min(int(rank_cfg), Dk))
         if rank <= 0:
             continue
-        try:
-            comp_key = int(component_ids[int(ev_idx[0].item())].item())
-        except Exception:
-            comp_key = int(len(factors))
         sub = comp_states.get(comp_key, {})
         if not isinstance(sub, dict):
             sub = {}
@@ -325,7 +373,10 @@ def _build_component_lrd_metric(
 
         if not freeze_preconditioner:
             if mode == "oja":
-                if not bool(torch.any(torch.isfinite(U))) or float(U.abs().sum().item()) == 0.0:
+                u_ready = bool(sub.get("U_ready", False))
+                if not u_ready:
+                    u_ready = bool(torch.any(torch.isfinite(U))) and float(U.abs().sum().item()) != 0.0
+                if not u_ready:
                     gn = float(gk.norm().item())
                     if gn > 0.0:
                         U[:, 0] = gk / max(gn, 1e-12)
@@ -335,6 +386,8 @@ def _build_component_lrd_metric(
                         U, _ = torch.linalg.qr(U, mode="reduced")
                     except Exception:
                         pass
+                    u_ready = (gn > 0.0) or (rank > 1)
+                sub["U_ready"] = bool(u_ready)
                 q = U.mT @ gk
                 U = U + (oja_eta * torch.outer(gk, q))
                 try:
@@ -351,20 +404,39 @@ def _build_component_lrd_metric(
                 q = U.mT @ gk
                 lam.mul_(beta).addcmul_(q, q, value=(1.0 - beta))
             else:
-                buf = sub.get("grad_buffer", None)
+                ring = sub.get("grad_ring", None)
+                pos = int(sub.get("grad_ring_pos", 0))
+                fill = int(sub.get("grad_ring_fill", 0))
                 if (
-                    (not isinstance(buf, torch.Tensor))
-                    or buf.ndim != 2
-                    or int(buf.shape[1]) != int(Dk)
-                    or buf.device != g.device
-                    or buf.dtype != g.dtype
+                    (not isinstance(ring, torch.Tensor))
+                    or ring.shape != (int(buffer_size), int(Dk))
+                    or ring.device != g.device
+                    or ring.dtype != g.dtype
                 ):
-                    buf = torch.zeros((0, Dk), device=g.device, dtype=g.dtype)
-                buf = torch.cat([buf, gk.detach().unsqueeze(0)], dim=0)
-                if int(buf.shape[0]) > int(buffer_size):
-                    buf = buf[-int(buffer_size):, :]
-                sub["grad_buffer"] = buf.detach()
-                if (int(step_i) % int(update_every) == 0) and int(buf.shape[0]) >= max(2, rank):
+                    ring = torch.zeros((int(buffer_size), int(Dk)), device=g.device, dtype=g.dtype)
+                    pos = 0
+                    fill = 0
+                    old = sub.pop("grad_buffer", None)
+                    if isinstance(old, torch.Tensor) and old.ndim == 2 and int(old.shape[1]) == int(Dk):
+                        rows = old[-int(buffer_size):].to(device=g.device, dtype=g.dtype)
+                        n0 = int(rows.shape[0])
+                        if n0 > 0:
+                            ring[:n0].copy_(rows)
+                            fill = n0
+                            pos = n0 % int(buffer_size)
+                    sub["grad_ring"] = ring
+                ring[pos].copy_(gk.detach())
+                pos = (pos + 1) % int(buffer_size)
+                fill = min(fill + 1, int(buffer_size))
+                sub["grad_ring_pos"] = pos
+                sub["grad_ring_fill"] = fill
+                if (int(step_i) % int(update_every) == 0) and fill >= max(2, rank):
+                    if fill < int(buffer_size):
+                        buf = ring[:fill]
+                    elif pos == 0:
+                        buf = ring
+                    else:
+                        buf = torch.cat([ring[pos:], ring[:pos]], dim=0)
                     X = buf - buf.mean(dim=0, keepdim=True)
                     try:
                         _, S, Vh = torch.linalg.svd(X, full_matrices=False)
@@ -433,7 +505,7 @@ def _apply_component_lowrank_drift(
             gk = grad_for_drift.index_select(0, ev_idx).reshape(-1)
             q = U.mT @ gk
             add = (U @ (lam * q)).reshape(int(ev_idx.numel()), d_event)
-            pre2[ev_idx, :] = pre2.index_select(0, ev_idx) + add
+            pre2.index_add_(0, ev_idx, add)
             out_flat = pre2.reshape(-1)
         except Exception:
             continue
@@ -473,7 +545,7 @@ def _apply_component_lowrank_noise(
         try:
             z2 = torch.randn((int(lam.numel()),), device=noise2.device, dtype=noise2.dtype)
             add = (U @ (lam.clamp_min(0.0).sqrt() * z2)).reshape(int(ev_idx.numel()), d_event)
-            noise2[ev_idx, :] = noise2.index_select(0, ev_idx) + add
+            noise2.index_add_(0, ev_idx, add)
             out_flat = noise2.reshape(-1)
         except Exception:
             continue
@@ -727,7 +799,9 @@ class SGHMC(torch.optim.Optimizer):
                         v_hat = v
                     G = 1.0 / (eps + v_hat.sqrt())
                 else:
-                    G = torch.ones_like(p)
+                    # Identity preconditioner: leave G as None so the existing
+                    # identity fast paths below skip the ones-tensor kernels.
+                    G = None
 
                 # Update EMA gradient statistics (using drift-scaled grads)
                 ema_g.mul_(grad_ema_beta).add_(grad_for_drift, alpha=(1.0 - grad_ema_beta))

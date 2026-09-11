@@ -33,6 +33,9 @@ class Phase2Bundle:
     noise_log_scale: Optional[torch.Tensor] = None  # (2,) float32 CPU or None
     phase1_optimizer_state_dict: Optional[Dict[str, Any]] = None
     global_step_count: int = 0
+    # True when the residual outlier filter was already applied to `dtimes` (at data prep or at the
+    # end of Phase 1). Lets sampling runs skip re-applying it to the already-filtered bundle.
+    residual_filter_applied: bool = False
 
 
 def save_phase2_bundle(
@@ -45,6 +48,7 @@ def save_phase2_bundle(
     noise_log_scale: Optional[torch.Tensor] = None,
     phase1_optimizer_state_dict: Optional[Dict[str, Any]] = None,
     global_step_count: int = 0,
+    residual_filter_applied: bool = False,
 ) -> str:
     """
     Save a Phase-2 bundle.
@@ -74,6 +78,7 @@ def save_phase2_bundle(
         "origins0_parquet": str(origins_path),
         "dtimes_parquet": str(dtimes_path),
         "dX_src": dX_cpu,
+        "residual_filter_applied": bool(residual_filter_applied),
     }
     # Backward/optional: allow storing extra state if explicitly provided.
     # New default is *not* to persist these in the bundle.
@@ -138,6 +143,7 @@ def load_phase2_bundle(*, path: str) -> Phase2Bundle:
         dX_src=dX_src.to(torch.float32),
         noise_log_scale=(noise_log_scale.to(torch.float32) if noise_log_scale is not None else None),
         phase1_optimizer_state_dict=opt_state,
+        residual_filter_applied=bool(payload.get("residual_filter_applied", False)),
         global_step_count=gsc,
     )
 

@@ -123,6 +123,7 @@ class CanonicalConfig:
     model: ModelConfig
     inference: InferenceConfig
     observability: ObservabilityConfig
+    synth: Optional[Dict[str, Any]] = None  # optional; used only by `spider synth`
 
 
 @dataclass(frozen=True)

@@ -284,18 +284,24 @@ where:
 
 | Symbol | Meaning | Config key(s) |
 | --- | --- | --- |
-| $\sigma_P, \sigma_S$ | Phase-dependent residual scales | `model.likelihoods.locate_map.phase_unc`, `model.likelihoods.sample.phase_unc` |
-| $\nu$ | Student-$t$ degrees of freedom | `model.likelihoods.locate_map.student_t.nu`, `model.likelihoods.sample.student_t.nu` |
-| $\delta_H$ | Huber threshold | `model.likelihoods.locate_map.huber_delta`, `model.likelihoods.sample.huber_delta` |
-| Likelihood family selector | Choice among Gaussian/Laplace/Student-$t$/Huber | `model.likelihoods.locate_map.type` |
-| Correlated sampling likelihood selector | Enables correlated Gaussian sampling path | `model.likelihoods.sample.type` |
+| $\sigma_P, \sigma_S$ | Phase-dependent residual scales. **Fixed** — never learned. | `model.likelihoods.locate_map.phase_unc`, `model.likelihoods.sample.phase_unc` |
+| $\nu$ | Student-$t$ degrees of freedom (Phase 1 only) | `model.likelihoods.locate_map.student_t.nu` (default 4.0) |
+| $\delta_H$ | Huber threshold (Phase 1 only) | `model.likelihoods.locate_map.huber_delta` (default 1.0) |
+| Likelihood family selector | `huber` (default), `laplace`/`l1`/`mae`, `gaussian`/`l2`/`mse`, `student_t`. Unrecognized values fall through to Huber. | `model.likelihoods.locate_map.type` |
+| Sampling likelihood selector | **Must** be `correlated_gaussian` (or `correlated`); any other value is a configuration error. | `model.likelihoods.sample.type` |
+
+There is no `learn_noise_scale` key and no `model.priors.noise` block; both were removed.
+$\sigma_P,\sigma_S$ come from `phase_unc` and are held fixed in all phases; the sampler's parameter
+list contains only the event perturbations. `model.likelihoods.sample.student_t.nu` and
+`model.likelihoods.sample.huber_delta` are parsed but have no effect, because the sampling path
+is always the correlated Gaussian.
 
 ### Shared-event correlated symbols
 
 | Symbol | Meaning | Config key(s) |
 | --- | --- | --- |
 | $\tau_P, \tau_S$ | Phase-specific latent RE scales | `model.likelihoods.sample.shared_event_re.model.tau_s` |
-| Group definition | Grouping strategy for correlated solve | `model.likelihoods.sample.shared_event_re.model.group_by` |
+| Group definition | Grouping for the correlated solve. **Only `station_phase` is supported**; `phase` raises at run time. | `model.likelihoods.sample.shared_event_re.model.group_by` |
 | Edge-weight model (inside $\widetilde{\mathbf{B}}_g$) | Distance-based weighting mode | `model.likelihoods.sample.shared_event_re.edge_weights.mode` |
 | Weight length scale | RBF weight scale | `model.likelihoods.sample.shared_event_re.edge_weights.ell_km` |
 | Weight power/scale | Power-law weight controls | `model.likelihoods.sample.shared_event_re.edge_weights.power`, `model.likelihoods.sample.shared_event_re.edge_weights.scale_km` |
@@ -313,9 +319,26 @@ where:
 | $\mathbf{V}_0$ scale controls | Wishart scale hyperparameters | `model.priors.event.hyper.params.scale_std` |
 | Hyperprior update cadence | Epoch cadence for precision updates | `model.priors.event.hyper.update.every_epochs` |
 
+Configuration constraints for the hierarchical prior (`model.priors.event.hyper`): `type` must be
+`wishart_precision`; `params.df` must be **> 3** (Wishart dof constraint for the 4-D event prior);
+`params.scale_std` (length 4) and `update.every_epochs` (>= 1) are required when `enabled = true`.
+Per-phase scheduling was removed: `model.priors.event.schedule` and
+`model.priors.event.hyper.update.active_phases` are rejected, and priors/hyper-updates are active
+in all phases when enabled. The priors block must live under `model.priors`; a top-level `priors`
+block is an error.
+
 ## 7) Which likelihood is active in each stage
 
-- Phase 1 (MAP warmup/outlier-screening stage) uses the `locate_map` likelihood block.
-- In this stage, robust independent residual families (Laplace, Huber, or Student-$t$) are used to reduce sensitivity to outliers and help identify problematic residuals.
-- Phases 2-4 use the `sample` likelihood block and are intended to run with correlated Gaussian structure (`correlated_gaussian`) and shared-event whitening.
-- If shared-event correlation is disabled in the sampling block, phases 2-4 fall back to the independent residual form.
+- Phase 1 (MAP warmup / outlier-screening stage) uses the `locate_map` likelihood block.
+  Robust independent families (Laplace, Huber, Student-$t$) reduce sensitivity to outliers and
+  support residual-based outlier identification.
+- Phase 1 may run **twice**: with `inference.sampler.phase1_two_pass.enabled = true`, MAP runs,
+  the post-MAP filters (residual, pair/station ratio, linearization error) are applied at the
+  relocated positions, and MAP runs again on the filtered data. The pass-1 catalog is kept as
+  `<catalog_outfile>_MAP_pass1.csv`.
+- The residual outlier filter defaults to `model.filters.residual.phase = "after_phase1"`, i.e.
+  residuals are screened at the MAP locations rather than at the initial catalog.
+- Phases 2-4 use the `sample` likelihood block, whose `type` must be `correlated_gaussian`, with
+  shared-event whitening.
+- Setting `model.likelihoods.sample.shared_event_re.enabled = false` keeps the required
+  `correlated_gaussian` type but reduces the sampling path to the independent Gaussian form.

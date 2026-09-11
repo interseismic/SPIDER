@@ -6,8 +6,14 @@ This page focuses on one objective: ensure shared-event whitening solves on the 
 
 - `model.likelihoods.sample.type = "correlated_gaussian"`
 - `model.likelihoods.sample.shared_event_re.enabled = true`
-- `model.likelihoods.sample.shared_event_re.model.group_by = "station_phase"`
+- `model.likelihoods.sample.shared_event_re.model.group_by = "station_phase"` (the only legal
+  value; `phase` raises at run time)
 - `model.likelihoods.sample.shared_event_re.solver.kind = "pcg"`
+
+Defaults when keys are omitted: `limits.max_nodes = 512`, `limits.max_rows = 200000`,
+`solver.max_iters = 50`, `solver.min_iters = 2`, `solver.tol = 1e-3`, `numerics.jitter0 = 1e-8`,
+`numerics.jitter_max = 1e-3`. The stock limits are roughly 50x smaller than the baseline
+recommended below — leaving them at default is the most common cause of diagonal fallback.
 
 ## Critical knobs
 
@@ -85,6 +91,9 @@ Use periodic whitening stats logs (`shared_event_re.logging.stats_log_every_epoc
 - `shared_event_re/max_rows_max`
 - `shared_event_re/max_nodes_max`
 - Console fallback reason counters: `rows_cap`, `nodes_cap`, `tau_zero`
+- `skipped_batches` (epoch metric) and any `[WARN][RUN] ... skipped N/M batches` line: PCG
+  instability that produces non-finite losses makes the epoch runner drop batches silently apart
+  from this warning
 
 Healthy target:
 
@@ -107,13 +116,16 @@ If fallback is nonzero:
 
 If all groups still fall back:
 
-- temporarily set `abort_on_pcg_fallback=true`,
+- temporarily set `abort_on_pcg_fallback=true` (it also trips on whitening-path and GPU-path
+  fallbacks, and its error message prints the full reason breakdown including a
+  `max_seen: rows=... nodes=...` line that tells you what to raise the caps to),
 - rerun and inspect the first failing context,
 - verify group sizes are within caps and `tau_s` is valid.
 
 ## Notes on optional solver knobs
 
-`node_bin_edges`, warm starts, cache sizing, sparse-bin merge, and precompute controls are operational knobs. They can improve robustness in difficult workloads, but fallback elimination should first be solved with:
+`node_bin_edges`, warm starts, cache sizing, sparse-bin merge, and `solver.precompute.{enabled, device}`
+(whitening structures precomputed once at the start of bundle-based sampling) are operational knobs. They can improve robustness in difficult workloads, but fallback elimination should first be solved with:
 
 - valid `tau_s`,
 - sufficient `max_nodes`/`max_rows`,

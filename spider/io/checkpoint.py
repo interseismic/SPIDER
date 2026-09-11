@@ -33,6 +33,9 @@ def save_checkpoint(
 
     optimizer: can be Adam (phase1/MAP) or SGLD-like (phases 2–4).
     phase: one of {"phase1", "phase2", "phase3", "phase4"}.
+    samples: callers should pass [] — the samples HDF5 store is the
+        sample-of-record and the resume path never restores this field; the
+        key is kept only for checkpoint-format compatibility.
     """
     checkpoint_dir = Path(params["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -174,9 +177,16 @@ def prune_checkpoints_after_phase1(params) -> Tuple[int, int]:
     kept = 0
     for p in checkpoint_dir.glob("checkpoint*.pth"):
         try:
-            # Load minimal metadata (weights-only).
-            data = torch.load(p, map_location=torch.device("cpu"), weights_only=True)
-            phase_label = str(data.get("phase", "phase4")).strip().lower()
+            # save_checkpoint names files checkpoint_{phase}_epoch_{n}.pth, so
+            # the phase is readable from the filename without deserializing the
+            # (potentially multi-hundred-MB) payload. Fall back to torch.load
+            # only for legacy names that don't match.
+            parts = p.stem.split("_")
+            if len(parts) >= 4 and parts[0] == "checkpoint" and parts[-2] == "epoch":
+                phase_label = "_".join(parts[1:-2]).strip().lower()
+            else:
+                data = torch.load(p, map_location=torch.device("cpu"), weights_only=True)
+                phase_label = str(data.get("phase", "phase4")).strip().lower()
             is_phase1 = (phase_label == "phase1")
         except Exception:
             # If unreadable, keep it to be safe

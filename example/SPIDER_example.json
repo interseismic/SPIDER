@@ -33,10 +33,10 @@
                 "type": "gaussian",
                 "params": {
                     "std": [
-                        0.5,
-                        0.5,
-                        0.5,
-                        0.2
+                        5.0,
+                        5.0,
+                        5.0,
+                        2.0
                     ]
                 }
             },
@@ -160,7 +160,7 @@
                 "ratio_filter_phase": "before",
                 "linearization_error": {
                     "enabled": true,
-                    "phase": "before",
+                    "phase": "after_phase1",
                     "max_ratio": 0.05,
                     "batch_size": 50000,
                     "sample_size": 200000,
@@ -168,10 +168,10 @@
                 }
             },
             "residual": {
-                "enabled": false,
-                "method": "mad",
-                "mad_sigma": 3.0,
-                "abs_max": 99999
+                "enabled": true,
+                "method": "abs",
+                "abs_max": 0.15,
+                "phase": "after_phase1"
             }
         }
     },
@@ -186,34 +186,13 @@
             ],
             "lr": [
                 0.001,
-                1e-2,
-                1e-2,
-                1e-2
+                0.01,
+                0.01,
+                0.01
             ],
             "temperature": 1.0,
             "eps": 1e-05,
             "sghmc_alpha": null,
-            "preconditioning": {
-                "enabled": true,
-                "type": "lrd",
-                "include_gamma": false,
-                "lrd": {
-                    "rank": 32,
-                    "mode": "oja",
-                    "update_every": 20,
-                    "buffer_size": 64,
-                    "eta": 0.02,
-                    "diag_floor": 1e-4
-                }
-            },
-            "preconditioning": {
-                "enabled": true,
-                "type": "component_lrd",
-                "lrd": {
-                  "rank": 32,
-                  "mode": "svd"
-                }
-            },
             "preconditioning": {
                 "enabled": true,
                 "type": "rmsprop",
@@ -225,7 +204,18 @@
                 "dt_scale": 0.3
             },
             "beta": 0.99,
-            "freeze_preconditioner_sampling": false
+            "freeze_preconditioner_sampling": false,
+            "lr_schedule": {
+                "phase1": {
+                    "type": "cosine",
+                    "eta_min": 1e-05
+                }
+            },
+            "phase1_two_pass": {
+                "enabled": true,
+                "epochs": null,
+                "warm_start": true
+            }
         },
         "batching": {
             "standard": {
@@ -243,10 +233,10 @@
         },
         "safety": {
             "max_abs_dX": [
-                2.0,
-                2.0,
-                2.0,
-                1.0
+                10.0,
+                10.0,
+                10.0,
+                3.0
             ]
         },
         "runtime": {

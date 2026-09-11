@@ -32,17 +32,28 @@ def _build_event_to_row_map(state: LocateState) -> None:
         if Ne <= 0 or int(state.N) <= 0:
             state._event_to_rows = [np.empty((0,), dtype=np.int64) for _ in range(max(Ne, 1))]
             return
-        II_cpu = state.II.detach().cpu().numpy()
-        lists: List[list[int]] = [list() for _ in range(Ne)]
-        for r in range(int(state.N)):
-            a = int(II_cpu[r, 0]); b = int(II_cpu[r, 1])
-            if 0 <= a < Ne:
-                lists[a].append(r)
-            if 0 <= b < Ne:
-                lists[b].append(r)
+        if state._II_cpu is not None and int(np.asarray(state._II_cpu).shape[0]) == int(state.N):
+            II_cpu = np.asarray(state._II_cpu)
+        else:
+            II_cpu = state.II.detach().cpu().numpy()
+        N = int(state.N)
+        # Vectorized inverted index: sort (event, row) pairs and slice per-event
+        # runs (the previous pure-Python loop over all edges took minutes at
+        # multi-million-edge scale).
+        ev = np.concatenate([II_cpu[:, 0], II_cpu[:, 1]]).astype(np.int64, copy=False)
+        row = np.concatenate([np.arange(N, dtype=np.int64), np.arange(N, dtype=np.int64)])
+        keep = (ev >= 0) & (ev < Ne)
+        if not keep.all():
+            ev = ev[keep]
+            row = row[keep]
+        order = np.lexsort((row, ev))
+        ev_sorted = ev[order]
+        row_sorted = np.ascontiguousarray(row[order])
+        bounds = np.searchsorted(ev_sorted, np.arange(Ne + 1, dtype=np.int64))
+        empty = np.empty((0,), dtype=np.int64)
         state._event_to_rows = [
-            np.asarray(rows, dtype=np.int64) if len(rows) > 0 else np.empty((0,), dtype=np.int64)
-            for rows in lists
+            row_sorted[bounds[e]:bounds[e + 1]] if bounds[e + 1] > bounds[e] else empty
+            for e in range(Ne)
         ]
     except Exception as e:
         warn(f"Failed to build event->row map: {e}", section="BATCH")
@@ -146,7 +157,9 @@ def _prepare_owner_buckets(
     if state._II_cpu is not None and state._II_cpu.shape[0] == N:
         II_cpu = state._II_cpu
     else:
+        # Cache the CPU mirror so per-epoch rebuilds don't re-download II.
         II_cpu = state.II.detach().cpu().numpy()
+        state._II_cpu = II_cpu
     a_idx = II_cpu[:, 0]
     b_idx = II_cpu[:, 1]
     # Guard bounds
@@ -172,13 +185,24 @@ def _prepare_owner_buckets(
     sta_cpu = None
     comp_cpu = None
     if reorder_all:
+        # YY / row_station_index are static across bucket rebuilds; cache their
+        # CPU mirrors (keyed on tensor identity) instead of re-downloading each
+        # rebuild — these are full-array transfers on multi-million-row runs.
         try:
-            phase_cpu = state.YY[:, 4].detach().cpu().numpy()
+            _ph_cache = getattr(state, "_bucket_phase_cpu_cache", None)
+            if _ph_cache is None or _ph_cache[0] is not state.YY:
+                _ph_cache = (state.YY, state.YY[:, 4].detach().cpu().numpy())
+                state._bucket_phase_cpu_cache = _ph_cache
+            phase_cpu = _ph_cache[1]
         except Exception:
             phase_cpu = None
         try:
             if getattr(state, "row_station_index", None) is not None:
-                sta_cpu = state.row_station_index.detach().cpu().numpy()
+                _sta_cache = getattr(state, "_bucket_sta_cpu_cache", None)
+                if _sta_cache is None or _sta_cache[0] is not state.row_station_index:
+                    _sta_cache = (state.row_station_index, state.row_station_index.detach().cpu().numpy())
+                    state._bucket_sta_cpu_cache = _sta_cache
+                sta_cpu = _sta_cache[1]
         except Exception:
             sta_cpu = None
         # Optional: also sort by connected-component id (event cluster id) within each station/phase.
@@ -196,10 +220,16 @@ def _prepare_owner_buckets(
             try:
                 if getattr(state, "cluster_ids", None) is not None:
                     # Map each row -> component id via e1 index (edges do not cross components).
-                    II_cpu = state.II.detach().cpu().numpy()
+                    # Reuse the II_cpu mirror from above (this used to re-download II).
                     e1 = II_cpu[:, 0].astype(np.int64, copy=False)
-                    c_ev = state.cluster_ids.detach().cpu().numpy().astype(np.int64, copy=False)
-                    comp_cpu = c_ev[e1]
+                    _cid_cache = getattr(state, "_bucket_cid_cpu_cache", None)
+                    if _cid_cache is None or _cid_cache[0] is not state.cluster_ids:
+                        _cid_cache = (
+                            state.cluster_ids,
+                            state.cluster_ids.detach().cpu().numpy().astype(np.int64, copy=False),
+                        )
+                        state._bucket_cid_cpu_cache = _cid_cache
+                    comp_cpu = _cid_cache[1][e1]
             except Exception:
                 comp_cpu = None
 

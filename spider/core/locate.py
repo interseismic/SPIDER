@@ -20,6 +20,7 @@ from typing import Optional, Tuple, List, Dict
 import os
 import time
 import sys
+import shutil
 
 import numpy as np
 import polars as pl
@@ -589,18 +590,25 @@ def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=No
     """Noise-free MAP warmup using Adam on ΔX_src."""
     _apply_likelihood_group(state, "locate_map")
     ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
-    if ddp_main:
-        _log(f"Phase 1: MAP (optimizer=adam) | {_format_sampler_status(state.optimizer)}")
+    # Pass label: "phase1" for the (first) MAP pass, "phase1-pass2" for the optional second pass.
+    pass_no = int(state.params.get("_phase1_pass", 1))
+    phase_label = "phase1" if pass_no <= 1 else f"phase1-pass{pass_no}"
     checkpoint_interval = state.params.get("checkpoint_interval", 50)
-    # Optional cosine LR scheduler
+    # Optional cosine LR scheduler (config: inference.sampler.lr_schedule.phase1)
     use_cosine = bool(state.params.get("phase1_use_cosine", False))
     if use_cosine:
         # T_max: total epochs for cosine; allow override, else use phase1_epochs
-        t_max = int(state.params.get("phase1_cosine_T_max", state.params.get("phase1_epochs", 0)))
+        t_max = int(state.params.get("phase1_cosine_T_max", None) or state.params.get("phase1_epochs", 0))
         eta_min = float(state.params.get("phase1_cosine_eta_min", 0.0))
         scheduler = CosineAnnealingLR(state.optimizer, T_max=max(1, t_max), eta_min=eta_min)
+        # Resuming mid-phase: advance the schedule to the current epoch.
+        for _ in range(max(0, int(start_epoch))):
+            scheduler.step()
     else:
         scheduler = None
+    if ddp_main:
+        sched_msg = f"cosine(T_max={max(1, t_max)}, eta_min={eta_min:g})" if use_cosine else "constant"
+        _log(f"Phase 1{'' if pass_no <= 1 else f' (pass {pass_no})'}: MAP (optimizer=adam) | lr_schedule={sched_msg} | {_format_sampler_status(state.optimizer)}")
     for epoch in range(start_epoch, state.params["phase1_epochs"]):
         grad_clip_norm = float(state.params.get("grad_clip_norm", 100.0))
         
@@ -643,14 +651,14 @@ def _phase1_map_warmup(state: LocateState, start_epoch: int = 0, wandb_logger=No
         if ddp_main:
             σp_now, σs_now = _current_noise_scales(state)
             _log(_format_epoch_line(
-                phase="phase1",
+                phase=phase_label,
                 step=epoch + 1,
                 total=int(state.params.get("phase1_epochs", 0)),
                 metrics=metrics,
                 opt=state.optimizer,
                 extra=f"sigma_p={float(σp_now):.4f} sigma_s={float(σs_now):.4f}",
             ))
-            _shift_guard_check(state, context=f"phase1 epoch {epoch}")
+            _shift_guard_check(state, context=f"{phase_label} epoch {epoch}")
 
         # periodic checkpoint for MAP phase
         if ddp_main and checkpoint_interval > 0 and epoch > 0 and (epoch % checkpoint_interval == 0):
@@ -911,6 +919,63 @@ def _apply_linearization_filter(state: LocateState, target_phase: str) -> None:
         state._bucket_chunks_s = None
         state._bucket_last_epoch = None
 
+def _reset_phase1_optimizer(state: LocateState, *, warm_start: bool) -> None:
+    """Fresh Adam on ΔX_src for a new MAP pass; optionally restart ΔX from the initial catalog."""
+    if not warm_start:
+        with torch.no_grad():
+            state.dX_src.zero_()
+    state.optimizer = torch.optim.Adam([state.dX_src], lr=float(state.params["lr_warmup"]))
+
+
+def _run_phase1(state: LocateState, start_epoch: int = 0, wandb_logger=None) -> None:
+    """
+    Phase 1 (MAP) with an optional second pass (config: inference.sampler.phase1_two_pass).
+
+    Pass 1 runs the usual MAP warmup and finalization, which applies the post-MAP filters
+    (residual filter at the MAP locations, pair/station ratio, linearization error) to the dataset.
+    When the second pass is enabled, the optimizer is rebuilt and MAP is re-run on the filtered
+    dtimes, starting from the pass-1 MAP locations (warm_start=true) or from the initial catalog.
+    The pass-1 catalog is kept as `<catalog_outfile>_MAP_pass1.csv`; `<catalog_outfile>_MAP.csv`
+    holds the final result.
+    """
+    state.params["_phase1_pass"] = 1
+    _phase1_map_warmup(state, start_epoch=start_epoch, wandb_logger=wandb_logger)
+
+    if not bool(state.params.get("phase1_two_pass_enable", False)):
+        return
+    if int(state.params.get("phase1_epochs", 0)) <= 0:
+        return
+    if _ddp_enabled(state.params):
+        warn("phase1_two_pass is not supported under torchrun/DDP (post-MAP filters run on rank 0 only); skipping second pass.", section="RUN")
+        return
+
+    epochs2 = int(state.params.get("phase1_two_pass_epochs", 0) or state.params["phase1_epochs"])
+    warm_start = bool(state.params.get("phase1_two_pass_warm_start", True))
+
+    # Preserve the pass-1 MAP catalog for comparison.
+    map_csv = f"{state.params['catalog_outfile']}_MAP.csv"
+    try:
+        if os.path.exists(map_csv):
+            shutil.copyfile(map_csv, f"{state.params['catalog_outfile']}_MAP_pass1.csv")
+    except Exception as e:
+        warn(f"Could not preserve pass-1 MAP catalog: {e}", section="RUN")
+
+    info(
+        f"Phase 1 second pass: epochs={epochs2} warm_start={warm_start} dtimes={int(state.N)} "
+        f"(post-MAP filters applied)",
+        section="RUN",
+    )
+    _reset_phase1_optimizer(state, warm_start=warm_start)
+    saved_epochs = int(state.params["phase1_epochs"])
+    state.params["phase1_epochs"] = epochs2
+    state.params["_phase1_pass"] = 2
+    try:
+        _phase1_map_warmup(state, start_epoch=0, wandb_logger=wandb_logger)
+    finally:
+        state.params["phase1_epochs"] = saved_epochs
+        state.params["_phase1_pass"] = 1
+
+
 def _finalize_phase1(state: LocateState) -> None:
     if state.params["phase1_epochs"] <= 0:
         return
@@ -987,6 +1052,17 @@ def _finalize_phase1(state: LocateState) -> None:
             state._bucket_chunks_p = None
             state._bucket_chunks_s = None
             state._bucket_last_epoch = None
+        # Residual-based outlier removal at the MAP locations (model.filters.residual.phase="after_phase1").
+        # Applying it here (rather than only at the start of Phase 2) means `locate-map` outputs,
+        # the Phase-2 bundle, and the optional second MAP pass all see the filtered dtimes.
+        if (
+            bool(state.params.get("residual_filter_enable", False))
+            and str(state.params.get("residual_filter_phase", "after_phase1")).strip().lower() == "after_phase1"
+            and not bool(state.params.get("_residual_filter_applied_in_prepare_input_dfs", False))
+        ):
+            _pre_filter_outlier_residuals(state, use_current_dX=True)
+            state.params["_residual_filter_applied_in_phase2"] = True
+
         # Apply linearization error filter if configured for after Phase 1
         _apply_linearization_filter(state, "after_phase1")
 
@@ -1983,13 +2059,18 @@ def _phase4_sampling(
         # Periodic checkpointing (rank0 only under torchrun)
         checkpoint_interval = int(state.params.get("checkpoint_interval", 50))
         if ddp_main and checkpoint_interval > 0 and epoch > 0 and (epoch % checkpoint_interval == 0) and (not skip_saving_first_epoch):
+            # NOTE: pass [] for samples. The HDF5 store is the sample-of-record
+            # (flushed below at sample_write_interval), and the resume path
+            # discards the checkpoint samples buffer anyway — pickling it here
+            # serialized up to (buffer x N_events x 4) floats per checkpoint
+            # for nothing.
             save_checkpoint(
                 state.params,
                 sampler,
                 epoch,
                 state.N,
                 state.dX_src,
-                state.samples,
+                [],
                 state.stats_tensor,
                 phase="phase4",
                 global_step_count=state.global_step_count,
@@ -4228,10 +4309,11 @@ def _maybe_precompute_shared_event_re_whitening(state: LocateState) -> None:
                 return
             if not isinstance(getattr(state, "_bucket_station_index", None), torch.Tensor):
                 return
-            nb = int(state._bucket_offsets.numel() - 1)
+            offs = state._bucket_offsets.tolist()  # one sync instead of one per bucket
+            nb = len(offs) - 1
             for b in range(nb):
-                i_start = int(state._bucket_offsets[b].item())
-                i_end = int(state._bucket_offsets[b + 1].item())
+                i_start = int(offs[b])
+                i_end = int(offs[b + 1])
                 if i_end <= i_start:
                     continue
                 idx_b = state._bucket_II[i_start:i_end].to(device=state.device, dtype=torch.int64)
@@ -4361,7 +4443,7 @@ def locate_all(
     if phase == "phase1":
         if wandb_logger:
             wandb_logger.start_phase("phase1")
-        _phase1_map_warmup(state, start_epoch, wandb_logger)
+        _run_phase1(state, start_epoch, wandb_logger)
         phase = "phase2"
 
     # Optional residual-based outlier removal at the start of Phase 2 (post-MAP).
@@ -4534,7 +4616,7 @@ def locate_map(
     if wandb_logger:
         wandb_logger.start_phase("phase1")
 
-    _phase1_map_warmup(state, start_epoch=start_epoch, wandb_logger=wandb_logger)
+    _run_phase1(state, start_epoch=start_epoch, wandb_logger=wandb_logger)
 
     # In torchrun/DDP mode, only rank0 writes bundle outputs.
     ddp_main = (not _ddp_enabled(state.params)) or _ddp_is_main(state.params)
@@ -4551,6 +4633,10 @@ def locate_map(
                     noise_log_scale=None,
                     phase1_optimizer_state_dict=None,
                     global_step_count=0,
+                    residual_filter_applied=bool(
+                        state.params.get("_residual_filter_applied_in_phase2", False)
+                        or state.params.get("_residual_filter_applied_in_prepare_input_dfs", False)
+                    ),
             )
             info(f"Wrote Phase-2 bundle -> {bundle_out}", section="BUNDLE")
         except Exception as e:
@@ -4644,6 +4730,12 @@ def locate_sample_from_bundle(
     ckpt = None
 
     # Optional residual-based outlier removal at the start of Phase 2 (post-MAP).
+    # Skipped when the bundle records that the filter was already applied (end of Phase 1 / data prep),
+    # so the already-filtered dtimes are not trimmed a second time.
+    if bool(getattr(bun, "residual_filter_applied", False)):
+        state.params["_residual_filter_applied_in_phase2"] = True
+        if bool(state.params.get("residual_filter_enable", False)):
+            info("Residual filter already applied to bundle dtimes; skipping re-application at Phase 2 start.", section="FILTER")
     if (
         bool(state.params.get("residual_filter_enable", False))
         and not bool(state.params.get("_residual_filter_applied_in_prepare_input_dfs", False))

@@ -26,10 +26,10 @@
                 "type": "gaussian",
                 "params": {
                     "std": [
-                        0.2,
-                        0.2,
-                        0.2,
-                        0.1
+                        5.0,
+                        5.0,
+                        5.0,
+                        2.0
                     ]
                 },
                 "hyper": {
@@ -47,6 +47,18 @@
                     "update": {
                         "every_epochs": 1
                     }
+                }
+            },
+            "centroid": {
+                "enabled": true,
+                "type": "gaussian",
+                "params": {
+                    "std": [
+                        0.01,
+                        0.01,
+                        0.01,
+                        0.01
+                    ]
                 }
             }
         },
@@ -67,8 +79,8 @@
                 "max_pair_station_ratio": 1.0,
                 "ratio_filter_phase": "before",
                 "linearization_error": {
-                    "enabled": false,
-                    "phase": "before",
+                    "enabled": true,
+                    "phase": "after_phase1",
                     "max_ratio": 0.05,
                     "batch_size": 50000,
                     "sample_size": 200000,
@@ -76,10 +88,10 @@
                 }
             },
             "residual": {
-                "enabled": false,
-                "method": "mad",
-                "mad_sigma": 3.0,
-                "abs_max": 0.5
+                "enabled": true,
+                "method": "abs",
+                "abs_max": 0.15,
+                "phase": "after_phase1"
             }
         },
         "likelihoods": {
@@ -207,7 +219,18 @@
                 "include_gamma": false
             },
             "beta": 0.999,
-            "freeze_preconditioner_sampling": false
+            "freeze_preconditioner_sampling": false,
+            "lr_schedule": {
+                "phase1": {
+                    "type": "cosine",
+                    "eta_min": 1e-05
+                }
+            },
+            "phase1_two_pass": {
+                "enabled": true,
+                "epochs": null,
+                "warm_start": true
+            }
         },
         "batching": {
             "standard": {
@@ -224,7 +247,12 @@
             }
         },
         "safety": {
-            "max_abs_dX": null
+            "max_abs_dX": [
+                10.0,
+                10.0,
+                10.0,
+                3.0
+            ]
         },
         "runtime": {
             "cuda_empty_cache_every": 0,

@@ -352,13 +352,11 @@ def save_map_locations(
         # Compute MAP in projected coords
         X_src1 = (X_src + dX_src).detach().cpu().numpy().astype('float32')  # (N,4)
         N = X_src1.shape[0]
-        # Convert to lon/lat
-        lons = np.empty((N,), dtype=np.float32)
-        lats = np.empty((N,), dtype=np.float32)
-        for i in range(N):
-            lo, la = projector(X_src1[i, 0], X_src1[i, 1], inverse=True)
-            lons[i] = np.float32(lo)
-            lats[i] = np.float32(la)
+        # Convert to lon/lat in one vectorized pyproj call (the per-event scalar
+        # loop paid one FFI round-trip per event).
+        lo_arr, la_arr = projector(X_src1[:, 0], X_src1[:, 1], inverse=True)
+        lons = np.asarray(lo_arr, dtype=np.float32)
+        lats = np.asarray(la_arr, dtype=np.float32)
         deps = X_src1[:, 2].astype('float32')
         # Event IDs
         try:

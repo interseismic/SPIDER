@@ -57,16 +57,16 @@ def spatial_cat_subset(params, origins):
     Returns:
         Filtered origins DataFrame
     """
-    if "event_lat_bounds" in params:
-        origins = origins.filter(
-            (pl.col("latitude") >= params["event_lat_bounds"][0]) &
-            (pl.col("latitude") <= params["event_lat_bounds"][1])
-        )
-    if "event_lon_bounds" in params:
-        origins = origins.filter(
-            (pl.col("longitude") >= params["event_lon_bounds"][0]) &
-            (pl.col("longitude") <= params["event_lon_bounds"][1])
-        )
+    # Configured via model.filters.events.lat_bounds / lon_bounds ([min, max] degrees); absent -> no-op.
+    n0 = int(origins.shape[0])
+    lat_b = params.get("event_lat_bounds", None)
+    lon_b = params.get("event_lon_bounds", None)
+    if lat_b is not None:
+        origins = origins.filter((pl.col("latitude") >= float(lat_b[0])) & (pl.col("latitude") <= float(lat_b[1])))
+    if lon_b is not None:
+        origins = origins.filter((pl.col("longitude") >= float(lon_b[0])) & (pl.col("longitude") <= float(lon_b[1])))
+    if lat_b is not None or lon_b is not None:
+        info(f"Catalog bounds filter (lat={lat_b}, lon={lon_b}): kept {origins.shape[0]}/{n0} events", section="FILTER")
     return origins
 
 
@@ -653,9 +653,10 @@ def prepare_input_dfs(params, *, model=None, device=None):
         # Residual filter is applied only during sampling (Phase 2), not during data prep.
         # See locate.py _pre_filter_outlier_residuals for the Phase-2 implementation.
 
-    # else:
-        # Residual filter is applied only during sampling (Phase 2), not during data prep.
-        # See locate.py _pre_filter_outlier_residuals for the Phase-2 implementation.
+    # Residual filter at the initial catalog locations (ΔX=0), if configured with phase="before".
+    # (phase="after_phase1", the default, is applied at the end of Phase 1 in locate._finalize_phase1.)
+    if str(params.get("residual_filter_phase", "after_phase1")).strip().lower() == "before":
+        _maybe_residual_outlier_filter_dtimes()
 
     # Remove duplicates if requested
     if bool(params.get("remove_duplicates", False)):

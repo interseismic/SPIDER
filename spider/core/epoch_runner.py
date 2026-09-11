@@ -203,12 +203,17 @@ def _ddp_allreduce_grads(optimizer: torch.optim.Optimizer) -> None:
     # Fail fast if different ranks have different parameter sets / grad sizes.
     # IMPORTANT: avoid ReduceOp.MIN/MAX on int64 here — some NCCL stacks return garbage for those.
     # Instead, all_gather the scalar totals and compare exactly.
-    total_t = torch.tensor([int(total)], device=dev0, dtype=torch.int64)
     try:
         ws = int(dist.get_world_size())
     except Exception:
         ws = 0
-    if ws > 1:
+    # The parameter set is invariant across steps, so run the cross-rank size
+    # check only when this rank's total changes (first step, or a genuine
+    # parameter-set change — which happens on all ranks together, keeping the
+    # collective schedule aligned). Skipping it removes an all_gather plus
+    # world_size host syncs per step.
+    if ws > 1 and getattr(optimizer, "_ddp_grad_total_checked", None) != int(total):
+        total_t = torch.tensor([int(total)], device=dev0, dtype=torch.int64)
         totals = [torch.empty_like(total_t) for _ in range(ws)]
         dist.all_gather(totals, total_t)
         vals = [int(t.item()) for t in totals]
@@ -219,6 +224,10 @@ def _ddp_allreduce_grads(optimizer: torch.optim.Optimizer) -> None:
                 + ". This usually means some rank is missing a Parameter (e.g., optional latent disabled) or "
                 "a rank hit an exception and skipped initializing part of the model."
             )
+        try:
+            setattr(optimizer, "_ddp_grad_total_checked", int(total))
+        except Exception:
+            pass
 
     # If *all* ranks have total==0, there's nothing to reduce this step.
     # (But we still did the all_gather above to keep the collective schedule aligned.)
@@ -260,6 +269,47 @@ def _ddp_allreduce_grads(optimizer: torch.optim.Optimizer) -> None:
         n = int(gg.numel())
         gg.copy_(buf[off : off + n].view_as(gg))
         off += n
+
+
+@torch.no_grad()
+def _validate_epoch_indices(state: "LocateState") -> None:
+    """
+    Range-check all loop-invariant index arrays once per epoch with a single
+    host sync. Raises ValueError on the first out-of-range array.
+
+    Covers: event indices in state.II (II_epoch/_bucket_II are permutations of
+    it), bucket row order, and station index arrays.
+    """
+    checks: list[tuple[str, torch.Tensor, int]] = []  # (label, tensor, upper_exclusive)
+    try:
+        Ne = int(state.X_src.shape[0])
+    except Exception:
+        Ne = 0
+    II = getattr(state, "II", None)
+    if isinstance(II, torch.Tensor) and II.numel() > 0 and Ne > 0:
+        checks.append(("II event indices (n_events)", II, Ne))
+    N_rows = int(II.shape[0]) if isinstance(II, torch.Tensor) else 0
+    rows = getattr(state, "_bucket_rows_order", None)
+    if isinstance(rows, torch.Tensor) and rows.numel() > 0 and N_rows > 0:
+        checks.append(("owner_buckets row indices (N)", rows, N_rows))
+    n_sta = int(getattr(state, "n_stations", 0) or 0)
+    if n_sta > 0:
+        for label, t in (
+            ("row_station_index (n_stations)", getattr(state, "row_station_index", None)),
+            ("bucket station index (n_stations)", getattr(state, "_bucket_station_index", None)),
+        ):
+            if isinstance(t, torch.Tensor) and t.numel() > 0:
+                checks.append((label, t, n_sta))
+    if not checks:
+        return
+    stats = torch.stack(
+        [torch.stack([t.min().to(torch.int64), t.max().to(torch.int64)]) for _, t, _ in checks]
+    ).cpu()  # single host sync for all checks
+    for (label, _t, hi), (mn, mx) in zip(checks, stats.tolist()):
+        if int(mn) < 0 or int(mx) >= int(hi):
+            raise ValueError(
+                f"Out-of-range {label}: min={int(mn)} max={int(mx)} limit={int(hi)}"
+            )
 
 
 def _ddp_set_step_seed(params: dict, step: int, *, device: torch.device) -> None:
@@ -405,32 +455,13 @@ def _run_epoch(
     # Weighted loss aggregation (by number of rows/edges in each batch) so epoch "loss"
     # is comparable across batch sizes / event-batch partitioning.
     total_loss_weighted_sum: float = 0.0
+    # Batches skipped by the finiteness guards (non-finite loss / non-finite gradients). If every batch
+    # in an epoch is skipped, parameters freeze silently; we surface that below instead of logging L=0.
+    n_skipped_loss: int = 0
+    n_skipped_grad: int = 0
+    n_batches_seen: int = 0
     total_loss_weighted_denom: int = 0
 
-    # Optional: uncollapsed shared-event latent diagnostics (accumulated across minibatches; one sync at end).
-    b_delta_sum = None
-    b_delta_sumsq = None
-    b_delta_maxabs = None
-    b_delta_count = None
-    # Also track RMS of *event-level* latent endpoints b(e1), b(e2) used by DD rows.
-    # This is more interpretable than RMS of the underlying parameter tensor in inducing_gp mode
-    b_end_sumsq_p = None
-    b_end_sumsq_s = None
-    b_end_count_p = None
-    b_end_count_s = None
-    # slowness_inducing_gp: track RMS of the *event-level u vectors* at endpoints (more interpretable than dual coeffs).
-    u_end_sumsq_p = None
-    u_end_sumsq_s = None
-    u_end_count_p = None
-    u_end_count_s = None
-    u_end_maxnorm_p = None
-    u_end_maxnorm_s = None
-    corr_dc_sumsq_p = None
-    corr_dc_sumsq_s = None
-    corr_dc_count_p = None
-    corr_dc_count_s = None
-    corr_dc_maxabs_p = None
-    corr_dc_maxabs_s = None
     # Online ESS metrics are computed only when enough *saved samples* exist and the cadence triggers.
     # To avoid gaps in W&B time series (epochs where ESS isn't recomputed), we cache the last metrics
     # on the state object and re-log them each epoch.
@@ -513,22 +544,6 @@ def _run_epoch(
             state.params["_se_re_groups_fallback_sum"] = 0
             state.params["_se_re_max_rows_max"] = 0
             state.params["_se_re_max_nodes_max"] = 0
-            # Runtime gate read by modeling.py
-            try:
-                if isinstance(K_full, torch.Tensor) and K_full.ndim == 2:
-                    M_static = int(K_full.shape[0])
-                else:
-                    if isinstance(K_blocks, list) and K_blocks:
-                        ms = []
-                        for K in K_blocks:
-                            if isinstance(K, torch.Tensor) and K.ndim == 2:
-                                ms.append(int(K.shape[0]))
-                        if ms:
-                            M_static = int(max(ms))
-            except Exception:
-                M_static = 0
-            state.params["_sl_re_max_M_static"] = int(M_static)
-            state.params["_sl_re_max_M_max"] = int(M_static)
     except Exception:
         pass
 
@@ -559,6 +574,12 @@ def _run_epoch(
     except Exception:
         total_batches = None
 
+    # ---- Fail-fast index validation (prevents opaque CUDA IndexKernel asserts) ----
+    # Every batch variant below derives its rows from these loop-invariant arrays,
+    # so one fused range check per epoch (single host sync) replaces the previous
+    # per-batch min/max .item() checks, which stalled the CUDA pipeline every step.
+    _validate_epoch_indices(state)
+
     # Inner Loop
     for bi, batch_item in enumerate(batch_iter):
         optimizer.zero_grad(set_to_none=True)
@@ -567,9 +588,15 @@ def _run_epoch(
         # Prepare batch data
         if use_event_batches:
             if use_buckets:
-                # batch_item is index in offsets
-                i0 = int(state._bucket_offsets[batch_item].item())
-                i1 = int(state._bucket_offsets[batch_item + 1].item())
+                # batch_item is index in offsets. Offsets are consumed as Python
+                # ints, so mirror them to a CPU list once per bucket build
+                # (cache keyed on tensor identity) instead of syncing per batch.
+                _off_cache = getattr(state, "_bucket_offsets_cpu_cache", None)
+                if _off_cache is None or _off_cache[0] is not state._bucket_offsets:
+                    _off_cache = (state._bucket_offsets, state._bucket_offsets.tolist())
+                    state._bucket_offsets_cpu_cache = _off_cache
+                i0 = int(_off_cache[1][batch_item])
+                i1 = int(_off_cache[1][batch_item + 1])
                 if i1 <= i0: continue
                 
                 if reorder_all and state._bucket_II is not None:
@@ -577,20 +604,8 @@ def _run_epoch(
                     YY_b = state._bucket_YY[i0:i1, :]
                     rows = None
                 else:
+                    # Row-index range is validated once per epoch in _validate_epoch_indices.
                     rows = state._bucket_rows_order[i0:i1]
-                    # Fail fast with a clear error if bucket row indices are invalid.
-                    try:
-                        N_rt = int(state.II.shape[0])
-                        if isinstance(rows, torch.Tensor) and rows.numel() > 0:
-                            mn = int(rows.min().item())
-                            mx = int(rows.max().item())
-                            if mn < 0 or mx >= N_rt:
-                                raise ValueError(
-                                    f"owner_buckets produced out-of-range row indices: min={mn} max={mx} N={N_rt} "
-                                    f"(bucket={int(batch_item)} slice=[{i0}:{i1}])"
-                                )
-                    except Exception:
-                        raise
                     II_b = state.II.index_select(0, rows)
                     YY_b = state.YY.index_select(0, rows)
                 # Expose stable bucket id to lower-level code (e.g., correlated likelihood caching).
@@ -606,7 +621,11 @@ def _run_epoch(
                     state.params["_runtime_bucket_gen"] = -1
                 try:
                     if reorder_all and getattr(state, "_bucket_p_counts", None) is not None:
-                        state.params["_runtime_bucket_p_count"] = int(state._bucket_p_counts[batch_item].item())
+                        _pc_cache = getattr(state, "_bucket_p_counts_cpu_cache", None)
+                        if _pc_cache is None or _pc_cache[0] is not state._bucket_p_counts:
+                            _pc_cache = (state._bucket_p_counts, state._bucket_p_counts.tolist())
+                            state._bucket_p_counts_cpu_cache = _pc_cache
+                        state.params["_runtime_bucket_p_count"] = int(_pc_cache[1][batch_item])
                     else:
                         state.params["_runtime_bucket_p_count"] = -1
                 except Exception:
@@ -768,297 +787,11 @@ def _run_epoch(
         # Noise scales for loss
         σp, σs = _current_noise_scales(state)
 
-        # ---- Fail-fast index validation (prevents opaque CUDA IndexKernel asserts) ----
-        # Validate event indices in II_b are within [0, n_events).
-        # This MUST run outside any try/except that might swallow the error.
-        try:
-            Ne_rt = int(state.X_src.shape[0])
-            if Ne_rt > 0 and isinstance(II_b, torch.Tensor) and II_b.numel() > 0:
-                e1_rt = II_b[:, 0].to(torch.int64)
-                e2_rt = II_b[:, 1].to(torch.int64)
-                mn = int(torch.minimum(e1_rt.min(), e2_rt.min()).item())
-                mx = int(torch.maximum(e1_rt.max(), e2_rt.max()).item())
-                if mn < 0 or mx >= Ne_rt:
-                    raise ValueError(f"Batch II has out-of-range event indices: min={mn} max={mx} n_events={Ne_rt}")
-        except Exception:
-            raise
+        # NOTE: event/station index range validation happens once per epoch in
+        # _validate_epoch_indices (II_b and the station slice are derived from
+        # those validated arrays), so no per-batch min/max syncs here.
 
-        # Validate station indices (if present) are within [0, n_stations).
-        try:
-            sta_rt = state.params.get("_runtime_bucket_station_index", None)
-            n_stations_rt = int(getattr(state, "n_stations", 0))
-            if isinstance(sta_rt, torch.Tensor) and sta_rt.numel() > 0 and n_stations_rt > 0:
-                mn = int(sta_rt.min().item())
-                mx = int(sta_rt.max().item())
-                if mn < 0 or mx >= n_stations_rt:
-                    raise ValueError(f"Batch station index out of range: min={mn} max={mx} n_stations={n_stations_rt}")
-        except Exception:
-            raise
-        
         nuisance_delta = None
-        prof_se_lat = False
-        se_lat_t0 = None
-        try:
-            diag = _get_diagnostics_cfg(state.params)
-        except Exception:
-            prof_se_lat = False
-
-        # Optional: uncollapsed shared-event latent random effects b[s,event,phase] (sampled).
-        # Adds nuisance term: (b_{s,e2,phase} - b_{s,e1,phase}) to predicted differential time.
-        try:
-            if prof_se_lat:
-                import time as _time
-                if state.device.type == "cuda":
-                    try:
-                        torch.cuda.synchronize()
-                    except Exception:
-                        pass
-                se_lat_t0 = _time.perf_counter()
-                sta_b = state.params.get("_runtime_bucket_station_index", None)
-                if isinstance(sta_b, torch.Tensor) and int(sta_b.shape[0]) == int(II_b.shape[0]) and isinstance(b_lat, torch.Tensor):
-                    e1 = II_b[:, 0].to(torch.int64)
-                    e2 = II_b[:, 1].to(torch.int64)
-                    sta_bi = sta_b.to(torch.int64)
-                    ph = YY_b[:, 4]
-                    is_s = (ph >= 0.5)
-
-                    # Fail fast if event indices are out of range for any event-indexed tensors.
-                    # This prevents CUDA device-side asserts inside index_select on per-event arrays.
-                    try:
-                        Ne_rt = int(state.X_src.shape[0])
-                        if Ne_rt > 0 and e1.numel() > 0:
-                            mn = int(torch.minimum(e1.min(), e2.min()).item())
-                            mx = int(torch.maximum(e1.max(), e2.max()).item())
-                            if mn < 0 or mx >= Ne_rt:
-                                raise ValueError(f"II contains out-of-range event indices in batch: min={mn} max={mx} n_events={Ne_rt}")
-                    except Exception:
-                        raise
-
-                    if mode == "inducing_gp":
-                        # Inducing-point GP (predictive-process mean):
-                        # b(e) ≈ Σ_j k(e,u_j) * c_j, where c are inducing coefficients and k is an RBF kernel.
-                        # We store per-event neighbor inducing indices + kernel values from Stage 3.
-                        # Optional Stage 5 (FITC): inflate per-observation noise by the diagonal residual variance
-                        #   Var[ε_e] = (1 - Q_ee) * τ^2, so for a differential (e1,e2): Var[ε_e2 - ε_e1] = (r2 + r1) * τ^2.
-                        try:
-                                if isinstance(resid, torch.Tensor) and resid.ndim == 1:
-                                    r1 = resid.index_select(0, e1).to(torch.float32)
-                                    r2 = resid.index_select(0, e2).to(torch.float32)
-                                    rsum = (r1 + r2).clamp_min(0.0)
-                                    tau_p = float(tau_ps[0]); tau_s = float(tau_ps[1])
-                                    extra = torch.where(is_s, rsum * (tau_s * tau_s), rsum * (tau_p * tau_p)).to(torch.float32)
-                        except Exception:
-                            pass
-                        if isinstance(nei_idx, torch.Tensor) and isinstance(nei_k, torch.Tensor) and b_lat.ndim == 3 and int(b_lat.shape[2]) == 2:
-                            # Two modes:
-                            # - per-station coefficients (b_lat shape (n_stations, M, 2))
-                            # - station-basis coefficients (b_lat shape (R, M, 2) + W_sta shape (n_stations, R))
-                            # Robust mode selection to avoid OOB indexing:
-                            # - If b_lat[0] matches n_stations -> per-station
-                            # - Else if W exists and b_lat[0] matches W.shape[1] -> basis
-                            # - Else -> disable this contribution (better than crashing CUDA)
-                            n_stations_rt = int(getattr(state, "n_stations", 0))
-                            is_per_station = (n_stations_rt > 0) and (int(b_lat.shape[0]) == int(n_stations_rt))
-                            is_basis = (
-                                isinstance(W_sta, torch.Tensor)
-                                and W_sta.ndim == 2
-                                and int(b_lat.shape[0]) == int(W_sta.shape[1])
-                                and int(W_sta.shape[0]) == int(n_stations_rt)
-                            )
-
-                            # Defensive: ensure station indices are in range before any index_select.
-                            # Avoid CUDA device-side asserts; if violated, skip this nuisance term.
-                            ok_sta = True
-                            try:
-                                if n_stations_rt <= 0:
-                                    ok_sta = False
-                                elif sta_bi.numel() > 0:
-                                    mn = int(sta_bi.min().item())
-                                    mx = int(sta_bi.max().item())
-                                    if mn < 0 or mx >= n_stations_rt:
-                                        ok_sta = False
-                            except Exception:
-                                ok_sta = False
-                            if not ok_sta:
-                                delta_b = None
-                            else:
-                                # Also defensively check neighbor inducing indices against M_total for this parameterization.
-                                # This catches mismatches between interpolation NPZ and coefficient tensor shape without crashing CUDA.
-                                ok_nei = True
-                                try:
-                                    M_total_rt = int(b_lat.shape[1])
-                                    if M_total_rt <= 0:
-                                        ok_nei = False
-                                    else:
-                                        # sample check on the two endpoint sets (cheap relative to failing later)
-                                        idx1 = nei_idx.index_select(0, e1)
-                                        idx2 = nei_idx.index_select(0, e2)
-                                        mx1 = int(idx1.max().item()) if idx1.numel() > 0 else -1
-                                        mx2 = int(idx2.max().item()) if idx2.numel() > 0 else -1
-                                        mn1 = int(idx1.min().item()) if idx1.numel() > 0 else 0
-                                        mn2 = int(idx2.min().item()) if idx2.numel() > 0 else 0
-                                        mx_all = max(mx1, mx2)
-                                        mn_all = min(mn1, mn2)
-                                        # -1 is allowed padding; anything >= M_total is invalid
-                                        if mx_all >= M_total_rt or mn_all < -1:
-                                            ok_nei = False
-                                except Exception:
-                                    ok_nei = False
-                                if not ok_nei:
-                                    delta_b = None
-                                elif is_basis:
-                                    # Basis mode: b(s,e,phase) = Σ_r W[s,r] * a_r(e,phase)
-                                    #
-                                    # Performance note: the naive implementation gathers per-rank coefficients and then
-                                    # weights by W, which costs ~O(R) extra work. Since n_stations is small (e.g. ~52),
-                                    # it is faster to first compute per-station inducing coefficients via matmul:
-                                    #   C_sta[:, j, phase] = W[:, :] @ A[:, j, phase]   (U x M)
-                                    # and then do the same gather+weighted-sum as the per-station path.
-                                    A = b_lat.to(torch.float32)  # (R,M,2)
-                                    R = int(A.shape[0])
-                                    M = int(A.shape[1])
-                                    # Compress stations in this minibatch
-                                    sta_u, sta_inv = torch.unique(sta_bi, sorted=False, return_inverse=True)  # (U,), (B,)
-                                    W_u = W_sta.index_select(0, sta_u).to(torch.float32)  # (U,R)
-                                    # (U,M) per phase
-                                    C_u_P = torch.matmul(W_u, A[:, :, 0])  # (U,M)
-                                    C_u_S = torch.matmul(W_u, A[:, :, 1])  # (U,M)
-
-                                    def _recon_endpoint_scalar(C_u: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
-                                        # C_u: (U,M), returns (B,)
-                                        idx = nei_idx.index_select(0, e)  # (B,m)
-                                        kk = nei_k.index_select(0, e).to(torch.float32)  # (B,m)
-                                        msk = (idx >= 0)
-                                        idxc = idx.clamp_min(0)
-                                        w = kk * msk.to(torch.float32)  # (B,m)
-                                        # Gather per-row station-specific coefficients at neighbor indices:
-                                        # (B,m) = C_u[sta_inv[:,None], idxc]
-                                        vals = C_u[sta_inv.unsqueeze(1), idxc]
-                                        return (vals * w).sum(dim=1)  # (B,)
-
-                                    b1P = _recon_endpoint_scalar(C_u_P, e1)
-                                    b2P = _recon_endpoint_scalar(C_u_P, e2)
-                                    b1S = _recon_endpoint_scalar(C_u_S, e1)
-                                    b2S = _recon_endpoint_scalar(C_u_S, e2)
-                                    # Keep endpoint tensors for diagnostics below
-                                    b1 = torch.stack([b1P, b1S], dim=1)
-                                    b2 = torch.stack([b2P, b2S], dim=1)
-                                    dP = (b2P - b1P).to(torch.float32)
-                                    dS = (b2S - b1S).to(torch.float32)
-                                    delta_b = torch.where(is_s, dS, dP)
-                                elif is_per_station:
-                                    # Per-station coefficients: compute both channels for all rows (single fused gather).
-                                    ev12 = torch.cat([e1, e2], dim=0)
-                                    idx12 = nei_idx.index_select(0, ev12)  # (2B,m)
-                                    k12 = nei_k.index_select(0, ev12)      # (2B,m)
-                                    idx12c = idx12.clamp_min(0)
-                                    w12 = k12.to(torch.float32) * (idx12 >= 0).to(torch.float32)
-
-                                    b_lat_sta = b_lat.index_select(0, sta_bi).to(torch.float32)  # (B,M,2)
-                                    m = int(idx12c.shape[1])
-                                    idx12c3 = idx12c.view(2, -1, m).unsqueeze(-1).expand(-1, -1, -1, 2)  # (2,B,m,2)
-                                    g12 = torch.gather(b_lat_sta.unsqueeze(0).expand(2, -1, -1, -1), 2, idx12c3)  # (2,B,m,2)
-                                    b12 = (g12 * w12.view(2, -1, m).unsqueeze(-1)).sum(dim=2)  # (2,B,2)
-                                    b1 = b12[0]
-                                    b2 = b12[1]
-
-                                    d = (b2 - b1)
-                                    delta_b = torch.where(is_s, d[:, 1], d[:, 0])
-                                else:
-                                    delta_b = None
-                        else:
-                            delta_b = None
-                    else:
-                        # Explicit event-latent parameterization (full / graph_gmrf):
-                        # - per-station: b_lat shape (n_stations, n_events, 2)
-                        # - station-basis: b_lat shape (R, n_events, 2) with W_sta (n_stations, R)
-                        if b_lat.ndim == 3 and int(b_lat.shape[2]) == 2:
-                            n_stations_rt = int(getattr(state, "n_stations", 0))
-                            is_per_station = (n_stations_rt > 0) and (int(b_lat.shape[0]) == int(n_stations_rt))
-                            is_basis = (
-                                isinstance(W_sta, torch.Tensor)
-                                and W_sta.ndim == 2
-                                and int(W_sta.shape[0]) == int(n_stations_rt)
-                                and int(b_lat.shape[0]) == int(W_sta.shape[1])
-                            )
-
-                            if is_basis:
-                                # b(s,e,phase) = Σ_r W[s,r] * a_r(e,phase)
-                                A = b_lat.to(torch.float32)  # (R,Ne,2)
-                                W = W_sta.index_select(0, sta_bi).to(torch.float32)  # (B,R)
-                                # Gather event endpoints in basis space: (R,B,2) -> (B,R,2)
-                                A1 = A.index_select(1, e1).transpose(0, 1).contiguous()
-                                A2 = A.index_select(1, e2).transpose(0, 1).contiguous()
-                                b1 = (W.unsqueeze(-1) * A1).sum(dim=1)  # (B,2)
-                                b2 = (W.unsqueeze(-1) * A2).sum(dim=1)  # (B,2)
-                                d = (b2 - b1).to(torch.float32)
-                                delta_b = torch.where(is_s, d[:, 1], d[:, 0])
-                            elif is_per_station:
-                                # Direct per-station coefficients
-                                b1 = b_lat[sta_bi, e1]  # (B,2)
-                                b2 = b_lat[sta_bi, e2]  # (B,2)
-                                d = (b2 - b1).to(torch.float32)
-                                delta_b = torch.where(is_s, d[:, 1], d[:, 0])
-                            else:
-                                delta_b = None
-                        else:
-                            delta_b = None
-
-                    if isinstance(delta_b, torch.Tensor):
-                        nuisance_delta = delta_b if nuisance_delta is None else (nuisance_delta + delta_b)
-                        if want_lat_diag:
-                            if b_delta_sum is None:
-                                b_delta_sum = torch.zeros((), device=delta_b.device, dtype=torch.float32)
-                                b_delta_sumsq = torch.zeros((), device=delta_b.device, dtype=torch.float32)
-                                b_delta_maxabs = torch.zeros((), device=delta_b.device, dtype=torch.float32)
-                                b_delta_count = torch.zeros((), device=delta_b.device, dtype=torch.float32)
-                                b_end_sumsq_p = torch.zeros((), device=delta_b.device, dtype=torch.float32)
-                                b_end_sumsq_s = torch.zeros((), device=delta_b.device, dtype=torch.float32)
-                                b_end_count_p = torch.zeros((), device=delta_b.device, dtype=torch.float32)
-                                b_end_count_s = torch.zeros((), device=delta_b.device, dtype=torch.float32)
-                            b_delta_sum = b_delta_sum + delta_b.sum()
-                            b_delta_sumsq = b_delta_sumsq + (delta_b * delta_b).sum()
-                            b_delta_maxabs = torch.maximum(b_delta_maxabs, delta_b.abs().max())
-                            b_delta_count = b_delta_count + float(delta_b.numel())
-                            # Endpoint RMS diagnostics:
-                            # For each DD row, we can also track the RMS of the *event-level* latent values at both endpoints.
-                            # This remains meaningful for both parameterizations:
-                            #   - full: bP1/bP2/bS1/bS2 are direct event-level values
-                            #   - inducing_gp: b1P/b2P/b1S/b2S are reconstructed event-level values via interpolation
-                            try:
-                                _bP1 = b1[:, 0].to(torch.float32)
-                                _bP2 = b2[:, 0].to(torch.float32)
-                                _bS1 = b1[:, 1].to(torch.float32)
-                                _bS2 = b2[:, 1].to(torch.float32)
-                                is_p_f = (~is_s).to(torch.float32)
-                                is_s_f = is_s.to(torch.float32)
-                                b_end_sumsq_p = b_end_sumsq_p + ((_bP1 * _bP1 + _bP2 * _bP2) * is_p_f).sum()
-                                b_end_sumsq_s = b_end_sumsq_s + ((_bS1 * _bS1 + _bS2 * _bS2) * is_s_f).sum()
-                                # Each row contributes two endpoints
-                                b_end_count_p = b_end_count_p + (2.0 * is_p_f.sum())
-                                b_end_count_s = b_end_count_s + (2.0 * is_s_f.sum())
-                            except Exception:
-                                pass
-        except Exception:
-            pass
-        finally:
-            if prof_se_lat and (se_lat_t0 is not None):
-                try:
-                    import time as _time
-                    if state.device.type == "cuda":
-                        try:
-                            torch.cuda.synchronize()
-                        except Exception:
-                            pass
-                    dt_ms = 1000.0 * float(_time.perf_counter() - se_lat_t0)
-                    # Accumulate per-epoch; emit once at end like other per-epoch metrics.
-                    if "_se_lat_time_ms_sum" not in state.params:
-                        state.params["_se_lat_time_ms_sum"] = 0.0
-                        state.params["_se_lat_time_ms_count"] = 0
-                    state.params["_se_lat_time_ms_sum"] = float(state.params["_se_lat_time_ms_sum"]) + float(dt_ms)
-                    state.params["_se_lat_time_ms_count"] = int(state.params["_se_lat_time_ms_count"]) + 1
-                except Exception:
-                    pass
 
         # sigma_inflation removed (start fresh).
 
@@ -1086,22 +819,12 @@ def _run_epoch(
                 except Exception:
                     prof_se_re = False
                 se_re_t0 = None
-                sl_re_t0 = None
-                try:
-                    diag = _get_diagnostics_cfg(state.params)
-                except Exception:
-                    prof_sl_re = False
                 if prof_se_re and bool(state.params.get("_shared_event_re_enabled", False)):
                     try:
                         import time as _time
                         se_re_t0 = _time.perf_counter()
                     except Exception:
                         se_re_t0 = None
-                    try:
-                        import time as _time
-                        sl_re_t0 = _time.perf_counter()
-                    except Exception:
-                        sl_re_t0 = None
                 quiet_w_logs = _quiet_whitening_logs(state.params)
                 if (
                     bool(state.params.get("_shared_event_re_enabled", False))
@@ -1369,23 +1092,6 @@ def _run_epoch(
                         state.params["_se_re_max_nodes_max"] = max(int(state.params.get("_se_re_max_nodes_max", 0) or 0), mn)
                     except Exception:
                         pass
-                    try:
-                        import time as _time
-                        if state.device.type == "cuda":
-                            try:
-                                torch.cuda.synchronize()
-                            except Exception:
-                                pass
-                        dt_ms = 1000.0 * float(_time.perf_counter() - sl_re_t0)
-                        # Workload stats from modeling.py (set per-call)
-                        state.params["_sl_re_groups_sum"] = int(state.params.get("_sl_re_groups_sum", 0) or 0) + g
-                        state.params["_sl_re_groups_woodbury_sum"] = int(state.params.get("_sl_re_groups_woodbury_sum", 0) or 0) + g_w
-                        state.params["_sl_re_groups_fallback_sum"] = int(state.params.get("_sl_re_groups_fallback_sum", 0) or 0) + g_fb
-                        state.params["_sl_re_max_rows_max"] = max(int(state.params.get("_sl_re_max_rows_max", 0) or 0), mr)
-                        state.params["_sl_re_max_nodes_max"] = max(int(state.params.get("_sl_re_max_nodes_max", 0) or 0), mn)
-                        state.params["_sl_re_max_M_max"] = max(int(state.params.get("_sl_re_max_M_max", 0) or 0), int(state.params.get("_sl_re_max_M_static", 0) or 0))
-                    except Exception:
-                        pass
             else:
                 loss_like = torch.tensor(0.0, device=state.device, dtype=torch.float32)
 
@@ -1418,20 +1124,13 @@ def _run_epoch(
                     prof_se_re = bool(diag.get("profile_shared_event_re", False)) if isinstance(diag, dict) else False
                 except Exception:
                     prof_se_re = False
-                    prof_sl_re = False
                 se_re_t0 = None
-                sl_re_t0 = None
                 if prof_se_re and bool(state.params.get("_shared_event_re_enabled", False)):
                     try:
                         import time as _time
                         se_re_t0 = _time.perf_counter()
                     except Exception:
                         se_re_t0 = None
-                    try:
-                        import time as _time
-                        sl_re_t0 = _time.perf_counter()
-                    except Exception:
-                        sl_re_t0 = None
                 quiet_w_logs = _quiet_whitening_logs(state.params)
                 if (
                     bool(state.params.get("_shared_event_re_enabled", False))
@@ -1578,22 +1277,6 @@ def _run_epoch(
                         state.params["_se_re_max_nodes_max"] = max(int(state.params.get("_se_re_max_nodes_max", 0) or 0), mn)
                     except Exception:
                         pass
-                    try:
-                        import time as _time
-                        if state.device.type == "cuda":
-                            try:
-                                torch.cuda.synchronize()
-                            except Exception:
-                                pass
-                        dt_ms = 1000.0 * float(_time.perf_counter() - sl_re_t0)
-                        state.params["_sl_re_groups_sum"] = int(state.params.get("_sl_re_groups_sum", 0) or 0) + g
-                        state.params["_sl_re_groups_woodbury_sum"] = int(state.params.get("_sl_re_groups_woodbury_sum", 0) or 0) + g_w
-                        state.params["_sl_re_groups_fallback_sum"] = int(state.params.get("_sl_re_groups_fallback_sum", 0) or 0) + g_fb
-                        state.params["_sl_re_max_rows_max"] = max(int(state.params.get("_sl_re_max_rows_max", 0) or 0), mr)
-                        state.params["_sl_re_max_nodes_max"] = max(int(state.params.get("_sl_re_max_nodes_max", 0) or 0), mn)
-                        state.params["_sl_re_max_M_max"] = max(int(state.params.get("_sl_re_max_M_max", 0) or 0), int(state.params.get("_sl_re_max_M_static", 0) or 0))
-                    except Exception:
-                        pass
             else:
                 loss_like = torch.tensor(0.0, device=state.device, dtype=torch.float32)
 
@@ -1639,9 +1322,14 @@ def _run_epoch(
         # Fix: in DDP mode, detect non-finite loss, synchronize a `bad_loss` flag, and if any
         # rank is bad, run a *dummy* backward that touches all parameters (zero gradients) so
         # the collective schedule stays aligned. Then skip the optimizer step on all ranks.
+        # Single host sync per batch: read the loss value once and reuse it both
+        # for the finiteness gate here and for the epoch statistics below.
+        n_batches_seen += 1
         bad_loss = 0
+        loss_f = float("nan")
         try:
-            bad_loss = 0 if bool(torch.isfinite(loss).item()) else 1
+            loss_f = float(loss.detach().item())
+            bad_loss = 0 if math.isfinite(loss_f) else 1
         except Exception:
             bad_loss = 1
         if ddp_enabled:
@@ -1653,6 +1341,7 @@ def _run_epoch(
                 bad_loss = 1
         if (not ddp_enabled) and bad_loss:
             # Non-DDP: keep historical behavior (skip this batch).
+            n_skipped_loss += 1
             continue
 
         if ddp_enabled and bad_loss:
@@ -1673,31 +1362,35 @@ def _run_epoch(
         # DDP: all-reduce gradients (SUM) so all ranks take identical optimizer steps.
         if ddp_enabled:
             _ddp_allreduce_grads(optimizer)
-            # Abort step if any rank produced non-finite gradients
-            bad = 0
+            # Abort step if any rank produced non-finite gradients.
+            # Collect one finiteness flag per grad on-device and sync exactly once
+            # (the old per-parameter `if not torch.isfinite(...).all()` forced one
+            # host sync per parameter per step).
             try:
+                flags = []
                 for g in optimizer.param_groups:  # type: ignore[attr-defined]
                     for p in g.get("params", []):
                         if p is None or getattr(p, "grad", None) is None:
                             continue
-                        if not torch.isfinite(p.grad).all():
-                            bad = 1
-                            break
-                    if bad:
-                        break
+                        flags.append(torch.isfinite(p.grad).all())
+                if flags:
+                    bad_t = (~torch.stack(flags).all()).to(device=state.device, dtype=torch.int32).reshape(1)
+                else:
+                    bad_t = torch.zeros(1, device=state.device, dtype=torch.int32)
             except Exception:
-                bad = 1
+                bad_t = torch.ones(1, device=state.device, dtype=torch.int32)
             try:
-                bad_t = torch.tensor([bad], device=state.device, dtype=torch.int32)
                 dist.all_reduce(bad_t, op=dist.ReduceOp.MAX)
                 bad = int(bad_t.item())
             except Exception:
                 bad = 1
             if bad:
+                n_skipped_grad += 1
                 optimizer.zero_grad(set_to_none=True)
                 continue
             # Also skip the step if any rank had a non-finite loss (handled via dummy backward above).
             if bad_loss:
+                n_skipped_loss += 1
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
@@ -1725,6 +1418,7 @@ def _run_epoch(
 
         # Grad Checks
         if state.dX_src.grad is not None and not torch.isfinite(state.dX_src.grad).all():
+            n_skipped_grad += 1
             optimizer.zero_grad(set_to_none=True)
             continue
 
@@ -1744,10 +1438,10 @@ def _run_epoch(
         optimizer.step()
         _maybe_apply_gauge_projection_to_momentum_buffers(state, optimizer)
         
-        # Safety Check
-        if not torch.isfinite(state.dX_src).all():
-             with torch.no_grad():
-                 state.dX_src.data = torch.nan_to_num(state.dX_src.data, nan=0.0, posinf=0.0, neginf=0.0)
+        # Safety Check: nan_to_num_ is the identity on finite values, so applying
+        # it unconditionally avoids a per-batch host sync on the isfinite check.
+        with torch.no_grad():
+            torch.nan_to_num_(state.dX_src.data, nan=0.0, posinf=0.0, neginf=0.0)
         
         _clamp_dX_inplace(state)
         
@@ -1766,7 +1460,9 @@ def _run_epoch(
                     except Exception:
                         pass
 
-                    state.samples.append(state.dX_src.detach().cpu().clone())
+                    # to(copy=True) yields exactly one copy (cpu().clone() made two
+                    # on CUDA, and cpu() alone would alias dX_src on CPU runs).
+                    state.samples.append(state.dX_src.detach().to("cpu", copy=True))
                     # Noise learning removed (fixed phase_unc only).
 
                     # Optional online ESS/IACT diagnostic using the in-memory samples buffer.
@@ -1860,8 +1556,7 @@ def _run_epoch(
                 loss_f = float(loss_sum.item())
             except Exception:
                 loss_f = float("nan")
-        else:
-            loss_f = float(loss.item())
+        # Non-DDP: loss_f was already read above (loss is unchanged since then).
         if (not ddp_enabled) or ddp_is_main:
             total_loss_vals.append(loss_f)
         try:
@@ -1908,14 +1603,22 @@ def _run_epoch(
 
                     if state.cluster_ids is not None and state.cluster_counts is not None:
                         K = int(state.cluster_counts.shape[0])
+                        # Group events by cluster with one stable sort instead of a
+                        # boolean mask scan over all events per cluster (O(K*Ne)).
+                        # Stable sort keeps within-cluster row order, so each dX_k
+                        # is identical to the old masked selection.
+                        cid64 = state.cluster_ids.to(torch.int64)
+                        order_k = torch.argsort(cid64, stable=True)
+                        dX_sorted = state.dX_src.detach().index_select(0, order_k)
+                        counts_k = torch.bincount(cid64, minlength=K)
+                        bounds_l = [0] + torch.cumsum(counts_k, dim=0).tolist()
                         new_P0s = []
                         for k in range(K):
-                            mask_k = (state.cluster_ids == k)
-                            dX_k = state.dX_src[mask_k]
-                            if dX_k.shape[0] == 0:
+                            s_k, e_k = bounds_l[k], bounds_l[k + 1]
+                            if e_k <= s_k:
                                 new_P0s.append(V_inv_common * (1.0 / max(nu, 1e-12)))
                                 continue
-                            P0_k = update_precision_hyperparameter(dX_k.detach(), nu, V_inv_common, mode="sample")
+                            P0_k = update_precision_hyperparameter(dX_sorted[s_k:e_k], nu, V_inv_common, mode="sample")
                             new_P0s.append(P0_k)
                         state.event_precision_matrix = torch.stack(new_P0s, dim=0)
                     else:
@@ -1948,7 +1651,16 @@ def _run_epoch(
         if total_loss_weighted_denom > 0:
             total_loss_mean = total_loss_weighted_sum / float(total_loss_weighted_denom)
         else:
-            total_loss_mean = (sum(total_loss_vals) / len(total_loss_vals)) if total_loss_vals else 0.0
+            # No batch contributed a step this epoch: report NaN rather than a misleading 0.0.
+            total_loss_mean = (sum(total_loss_vals) / len(total_loss_vals)) if total_loss_vals else float("nan")
+        n_skipped = int(n_skipped_loss + n_skipped_grad)
+        if n_skipped > 0 and ((not ddp_enabled) or ddp_is_main):
+            msg = (f"epoch {epoch_index}: skipped {n_skipped}/{n_batches_seen} batches "
+                   f"(non-finite loss={n_skipped_loss}, non-finite grad={n_skipped_grad}); parameters unchanged for those batches.")
+            if n_batches_seen > 0 and n_skipped >= n_batches_seen:
+                msg += (" ALL batches skipped -> optimization is frozen. Typical cause: a NaN gradient from a source that has"
+                        " converged onto a receiver (zero horizontal offset in the travel-time model); check events located on stations.")
+            warn(msg, section="RUN")
         epoch_time = time.time() - epoch_start_time
         
         # Phase 1 MAP CSV
@@ -2025,6 +1737,7 @@ def _run_epoch(
         
         metrics = {
             "loss": total_loss_mean,
+            "skipped_batches": float(n_skipped_loss + n_skipped_grad),
             "epoch_time": epoch_time,
             "permute_time": float(permute_time_s),
             "dx_mean": stats_cpu[0],

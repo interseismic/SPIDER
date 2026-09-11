@@ -237,6 +237,9 @@ def _pcg_solve_whitening(
     p = z.clone()
     rz = torch.dot(r, z)
     b_norm = torch.sqrt(torch.dot(b, b)).clamp_min(1e-12)
+    # Hoist the convergence threshold to the host once (one sync) instead of
+    # syncing b_norm again on every iteration.
+    thresh = float(tol) * float(b_norm.item())
     converged = False
     it = 0
     for it in range(max_iters):
@@ -246,7 +249,7 @@ def _pcg_solve_whitening(
         x = x + alpha_cg * p
         r = r - alpha_cg * Ap
         r_norm = torch.sqrt(torch.dot(r, r))
-        if (it + 1) >= min_iters and float(r_norm.item()) <= float(tol) * float(b_norm.item()):
+        if (it + 1) >= min_iters and float(r_norm.item()) <= thresh:
             converged = True
             break
         z = r / diag
@@ -271,6 +274,9 @@ def _pcg_solve_whitening_batched(
     min_iters: int = 0,
     x0: Optional[torch.Tensor] = None,
     micro_profile: Optional[dict[str, float]] = None,
+    u_flat: Optional[torch.Tensor] = None,
+    v_flat: Optional[torch.Tensor] = None,
+    check_every: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Batched PCG for multiple groups with padded edges/nodes.
@@ -292,10 +298,13 @@ def _pcg_solve_whitening_batched(
     beta = beta.reshape(-1, 1).to(device=b.device, dtype=b.dtype)
     diag = (alpha + beta * deg.to(dtype=b.dtype, device=b.device)).clamp_min(1e-12)
 
-    # Flattened edge indices for batched scatter
-    offsets = (torch.arange(B, device=b.device, dtype=u.dtype) * N).view(-1, 1)
-    u_flat = (u + offsets).reshape(-1)
-    v_flat = (v + offsets).reshape(-1)
+    # Flattened edge indices for batched scatter (callers holding a bucket
+    # template pass them in precomputed).
+    if not (isinstance(u_flat, torch.Tensor) and isinstance(v_flat, torch.Tensor)
+            and int(u_flat.numel()) == int(u.numel()) and int(v_flat.numel()) == int(v.numel())):
+        offsets = (torch.arange(B, device=b.device, dtype=u.dtype) * N).view(-1, 1)
+        u_flat = (u + offsets).reshape(-1)
+        v_flat = (v + offsets).reshape(-1)
     w_flat = w.reshape(-1).to(device=b.device, dtype=b.dtype)
 
     profile_on = isinstance(micro_profile, dict)
@@ -342,7 +351,12 @@ def _pcg_solve_whitening_batched(
         ok = ok | new_ok
         if profile_on:
             micro_profile["vecops_ms"] = float(micro_profile.get("vecops_ms", 0.0) + 1000.0 * (time.perf_counter() - t_ops0))
-        if bool(ok.all()):
+        # The all-converged early exit forces a host sync, so poll it every
+        # `check_every` iterations. ok/iters are tracked on-device every
+        # iteration regardless, so per-group convergence metrics are unchanged;
+        # converged groups may just run a few extra (harmless) refinement steps.
+        ce = max(1, int(check_every))
+        if ((it + 1) % ce == 0 or (it + 1) >= max_iters) and bool(ok.all()):
             break
         z = r / diag
         rz_new = (r * z).sum(dim=1)
@@ -391,18 +405,41 @@ def _build_group_cache(
     n_groups = int(starts.numel())
     groups = []
     idx_perm_all = idx.index_select(0, perm) if isinstance(perm, torch.Tensor) and int(perm.numel()) > 0 else idx.new_zeros((0, 2))
+    # Pull per-group scalars to the host once (4 syncs per cache build) instead
+    # of 3+ `.item()` syncs per group, which serialized the GPU pipeline on
+    # every rebuild.
+    starts_l = starts.tolist() if n_groups > 0 else []
+    ends_l = ends.tolist() if n_groups > 0 else []
+    ph_l = group_ph.tolist() if int(group_ph.numel()) > 0 else []
+    nn_l = (
+        n_nodes_all.tolist()
+        if isinstance(n_nodes_all, torch.Tensor) and int(n_nodes_all.numel()) >= n_groups
+        else [0] * n_groups
+    )
+    # Per-group sigma-derived tensors are precomputed once here so the per-step
+    # hot loop in compute_quad_whitening never launches scalar kernels.
+    sigma_pre: dict[bool, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    for is_p_phase, sig in ((True, sigma_p), (False, sigma_s)):
+        sc = sig.clamp_min(1e-12)
+        s2 = sc.square().clamp_min(1e-24)
+        sigma_pre[is_p_phase] = (sc, s2, 1.0 / s2)
+    # Deferred w_mean/w_max stats: collected as 0-dim tensors and synced once
+    # after the loop.
+    w_stat_slots: list[tuple[int, torch.Tensor, torch.Tensor]] = []
     for g in range(n_groups):
-        s = int(starts[g].item())
-        e = int(ends[g].item())
+        s = int(starts_l[g])
+        e = int(ends_l[g])
         if e <= s:
             groups.append(None)
             continue
         idx_g = idx_perm_all[s:e, :]
         e1 = idx_g[:, 0].to(torch.int64)
         e2 = idx_g[:, 1].to(torch.int64)
-        ph_g = float(group_ph[g].item()) if group_ph.numel() > 0 else 0.0
-        sigma_g = sigma_p if ph_g < 0.5 else sigma_s
-        tau_g = float(tau_p) if ph_g < 0.5 else float(tau_s)
+        ph_g = float(ph_l[g]) if ph_l else 0.0
+        is_p_g = ph_g < 0.5
+        sigma_g = sigma_p if is_p_g else sigma_s
+        sigma_c_g, sigma2_g, beta_g = sigma_pre[is_p_g]
+        tau_g = float(tau_p) if is_p_g else float(tau_s)
 
         if not (tau_g > 0.0):
             groups.append(
@@ -412,6 +449,9 @@ def _build_group_cache(
                     "n_nodes": int(0),
                     "chol": None,
                     "sigma": sigma_g,
+                    "sigma_clamped": sigma_c_g,
+                    "sigma2": sigma2_g,
+                    "beta": beta_g,
                     "tau": tau_g,
                     "start": s,
                     "end": e,
@@ -419,7 +459,7 @@ def _build_group_cache(
             )
             continue
 
-        n_nodes = int(n_nodes_all[g].item()) if isinstance(n_nodes_all, torch.Tensor) and int(n_nodes_all.numel()) > g else 0
+        n_nodes = int(nn_l[g])
         if (e - s) > int(max_rows_per_group) or n_nodes > int(max_nodes_per_group):
             groups.append(
                 {
@@ -428,6 +468,9 @@ def _build_group_cache(
                     "n_nodes": n_nodes,
                     "chol": None,
                     "sigma": sigma_g,
+                    "sigma_clamped": sigma_c_g,
+                    "sigma2": sigma2_g,
+                    "beta": beta_g,
                     "tau": tau_g,
                     "start": s,
                     "end": e,
@@ -481,8 +524,8 @@ def _build_group_cache(
             except Exception:
                 chol = None
 
-        w_mean = float(w.mean().detach().item()) if w.numel() > 0 else float("nan")
-        w_max = float(w.max().detach().item()) if w.numel() > 0 else float("nan")
+        if w.numel() > 0:
+            w_stat_slots.append((len(groups), w.mean().detach(), w.max().detach()))
         w_sqrt = torch.sqrt(w.clamp_min(0.0))
         groups.append(
             {
@@ -491,17 +534,27 @@ def _build_group_cache(
                 "n_nodes": n_nodes,
                 "chol": chol,
                 "sigma": sigma_g,
+                "sigma_clamped": sigma_c_g,
+                "sigma2": sigma2_g,
+                "beta": beta_g,
                 "tau": tau_g,
                 "start": s,
                 "end": e,
                 "deg": deg,
                 "w": w,
-                "w_mean": w_mean,
-                "w_max": w_max,
+                "w_mean": float("nan"),
+                "w_max": float("nan"),
                 "w_count": int(w.numel()),
                 "w_sqrt": w_sqrt,
             }
         )
+
+    # Single host sync for all per-group weight stats.
+    if w_stat_slots:
+        stats = torch.stack([torch.stack([m, x]) for _, m, x in w_stat_slots]).tolist()
+        for (slot, _m, _x), (mv, xv) in zip(w_stat_slots, stats):
+            groups[slot]["w_mean"] = float(mv)
+            groups[slot]["w_max"] = float(xv)
 
     return {
         "perm": perm,
@@ -665,6 +718,11 @@ def compute_quad_whitening(
         batch_context=batch_context,
         cache_key_extra=cache_key_extra,
     )
+    # Volatile contexts (shuffled standard batching) embed epoch/batch_seq in
+    # the key, so a stored entry can never be hit again — don't store those,
+    # otherwise the cache accumulates one dead entry of GPU tensors per step.
+    _ctx_tuple = _extract_batch_context_tuple(batch_context)
+    _ctx_volatile = bool(_ctx_tuple) and str(_ctx_tuple[0]) in {"volatile", "unknown"}
     t_build0 = time.perf_counter()
     cache_entry = cache.get(cache_key, None) if isinstance(cache, (dict, OrderedDict)) else None
     if not isinstance(cache_entry, dict):
@@ -691,9 +749,13 @@ def compute_quad_whitening(
             X_event=X_event,
             grouping_cache=grouping_cache,
         )
-        cache[cache_key] = cache_entry
-        if int(cache_max_entries) > 0:
-            while len(cache) > int(cache_max_entries):
+        if not _ctx_volatile:
+            cache[cache_key] = cache_entry
+            # Cap the cache even when the caller passes cache_max_entries<=0:
+            # stable keys still churn across bucket generations, so an
+            # unbounded cache is a slow memory leak, never a win.
+            cap = int(cache_max_entries) if int(cache_max_entries) > 0 else 8
+            while len(cache) > cap:
                 cache.popitem(last=False)
     else:
         metrics.cache_hit = 1
@@ -723,7 +785,14 @@ def compute_quad_whitening(
         if e <= s:
             continue
         r_g = resid_perm[s:e]
-        sigma_g = gd["sigma"].clamp_min(1e-12)
+        # sigma-derived tensors are precomputed at cache build; fall back to
+        # computing them here only for defensiveness.
+        sigma_g = gd.get("sigma_clamped", None)
+        if not isinstance(sigma_g, torch.Tensor):
+            sigma_g = gd["sigma"].clamp_min(1e-12)
+        sigma2_g = gd.get("sigma2", None)
+        if not isinstance(sigma2_g, torch.Tensor):
+            sigma2_g = sigma_g.square().clamp_min(1e-24)
         tau_g = float(gd["tau"])
         n_nodes = int(gd["n_nodes"])
         metrics.max_rows_seen = max(metrics.max_rows_seen, int(e - s))
@@ -744,7 +813,7 @@ def compute_quad_whitening(
             w_max_all = max(w_max_all, w_max) if math.isfinite(w_max_all) else w_max
         if (not (tau_g > 0.0)) or (n_nodes <= 0):
             metrics.n_groups_fallback_diag += 1
-            quad_sum = quad_sum + _CollapsedQuadNoGrad.apply(r_g, r_g / sigma_g.square().clamp_min(1e-24))
+            quad_sum = quad_sum + _CollapsedQuadNoGrad.apply(r_g, r_g / sigma2_g)
             continue
 
         local_u = gd["local_u"]
@@ -752,13 +821,17 @@ def compute_quad_whitening(
         w_sqrt = gd.get("w_sqrt", None)
         if not isinstance(w_sqrt, torch.Tensor) or w_sqrt.numel() != r_g.numel():
             w_sqrt = torch.ones_like(r_g)
-        beta = (1.0 / sigma_g.square().clamp_min(1e-24)).to(r_g.dtype)
+        beta_pre = gd.get("beta", None)
+        if isinstance(beta_pre, torch.Tensor):
+            beta = beta_pre.to(r_g.dtype)
+        else:
+            beta = (1.0 / sigma2_g).to(r_g.dtype)
 
         solver_use = str(solver).strip().lower()
         if solver_use == "pcg" and bool(pcg_batched):
             if (not isinstance(local_u, torch.Tensor)) or (not isinstance(local_v, torch.Tensor)):
                 metrics.n_groups_fallback_diag += 1
-                quad_sum = quad_sum + _CollapsedQuadNoGrad.apply(r_g, r_g / sigma_g.square().clamp_min(1e-24))
+                quad_sum = quad_sum + _CollapsedQuadNoGrad.apply(r_g, r_g / sigma2_g)
                 continue
             n_nodes_g = int(n_nodes)
             m_rows_g = int(r_g.numel())
@@ -812,13 +885,13 @@ def compute_quad_whitening(
             if not ok:
                 metrics.n_groups_pcg_fail += 1
                 metrics.n_groups_fallback_diag += 1
-                quad_sum = quad_sum + _CollapsedQuadNoGrad.apply(r_g, r_g / sigma_g.square().clamp_min(1e-24))
+                quad_sum = quad_sum + _CollapsedQuadNoGrad.apply(r_g, r_g / sigma2_g)
                 continue
         else:
             chol = gd["chol"]
             if (not isinstance(chol, torch.Tensor)) or (not (tau_g > 0.0)) or (n_nodes <= 0):
                 metrics.n_groups_fallback_diag += 1
-                quad_sum = quad_sum + _CollapsedQuadNoGrad.apply(r_g, r_g / sigma_g.square().clamp_min(1e-24))
+                quad_sum = quad_sum + _CollapsedQuadNoGrad.apply(r_g, r_g / sigma2_g)
                 continue
             metrics.n_groups_chol += 1
             b = _edge_to_node(local_u, local_v, beta * w_sqrt * r_g, n_nodes=n_nodes)
@@ -826,7 +899,7 @@ def compute_quad_whitening(
                 x = torch.cholesky_solve(b.unsqueeze(1), chol).squeeze(1)
             except Exception:
                 metrics.n_groups_fallback_diag += 1
-                quad_sum = quad_sum + _CollapsedQuadNoGrad.apply(r_g, r_g / sigma_g.square().clamp_min(1e-24))
+                quad_sum = quad_sum + _CollapsedQuadNoGrad.apply(r_g, r_g / sigma2_g)
                 continue
         ax = _node_to_edge(local_u, local_v, x)
         u_edge = beta * (r_g - (w_sqrt * ax))
@@ -838,55 +911,73 @@ def compute_quad_whitening(
         if not isinstance(pcg_bucket_nodes, list) or not pcg_bucket_nodes:
             pcg_bucket_nodes = [512, 1024, 2048, 4096, 8192, 16384, 32768]
         bucket_nodes = sorted({int(x) for x in pcg_bucket_nodes if int(x) > 0})
-        # Assign groups to node and edge-size buckets to reduce padding waste.
-        bucket_map: dict[tuple[int, int], list[int]] = {}
-        leftovers: list[int] = []
-        for gi, gd in enumerate(pcg_groups):
-            n = int(gd["n_nodes"])
-            m = max(1, int(gd["r"].numel()))
-            bsz = None
-            for bn in bucket_nodes:
-                if n <= bn:
-                    bsz = bn
-                    break
-            if bsz is None:
-                leftovers.append(gi)
-            else:
-                edge_bin = 1 << int(max(0, int(m - 1)).bit_length())
-                bucket_map.setdefault((int(bsz), int(edge_bin)), []).append(gi)
-        metrics.pcg_bucket_assign_ms += float(1000.0 * (time.perf_counter() - t_assign0))
-        # Merge sparse edge bins within each node bucket to improve occupancy.
-        t_merge0 = time.perf_counter()
-        if bool(pcg_merge_sparse_edge_bins) and len(bucket_map) > 1:
-            try:
-                min_groups = max(1, int(pcg_min_groups_per_edge_bin))
-                max_bins = max(1, int(pcg_max_edge_bins_per_node))
-                node_to_bins: dict[int, list[tuple[int, list[int]]]] = {}
-                for (bsz, edge_bin), gids in bucket_map.items():
-                    node_to_bins.setdefault(int(bsz), []).append((int(edge_bin), list(gids)))
-                merged_map: dict[tuple[int, int], list[int]] = {}
-                for bsz, bins in node_to_bins.items():
-                    bins_sorted = sorted(bins, key=lambda x: x[0])
-                    keep_bins: list[tuple[int, list[int]]] = []
-                    merge_ids: list[int] = []
-                    for edge_bin, gids in bins_sorted:
-                        if int(len(gids)) >= min_groups:
-                            keep_bins.append((int(edge_bin), list(gids)))
-                        else:
-                            merge_ids.extend(gids)
-                    while len(keep_bins) > max_bins:
-                        j = min(range(len(keep_bins)), key=lambda i: int(len(keep_bins[i][1])))
-                        merge_ids.extend(keep_bins[j][1])
-                        del keep_bins[j]
-                    for edge_bin, gids in keep_bins:
-                        if gids:
-                            merged_map[(int(bsz), int(edge_bin))] = list(gids)
-                    if merge_ids:
-                        merged_map.setdefault((int(bsz), 0), []).extend(merge_ids)
-                bucket_map = merged_map
-            except Exception:
-                pass
-        metrics.pcg_bucket_merge_ms += float(1000.0 * (time.perf_counter() - t_merge0))
+        # The bucket assignment is a pure function of the cache entry's group
+        # sizes and the bucketing config, so compute it once per cache entry
+        # and reuse it on every subsequent step.
+        assign_key = (
+            tuple(bucket_nodes),
+            bool(pcg_merge_sparse_edge_bins),
+            int(pcg_min_groups_per_edge_bin),
+            int(pcg_max_edge_bins_per_node),
+            int(len(pcg_groups)),
+        )
+        cached_assign = cache_entry.get("pcg_bucket_assign", None) if isinstance(cache_entry, dict) else None
+        if isinstance(cached_assign, tuple) and len(cached_assign) == 3 and cached_assign[0] == assign_key:
+            bucket_map = cached_assign[1]
+            leftovers = cached_assign[2]
+            metrics.pcg_bucket_assign_ms += float(1000.0 * (time.perf_counter() - t_assign0))
+        else:
+            # Assign groups to node and edge-size buckets to reduce padding waste.
+            bucket_map = {}
+            leftovers = []
+            for gi, gd in enumerate(pcg_groups):
+                n = int(gd["n_nodes"])
+                m = max(1, int(gd["r"].numel()))
+                bsz = None
+                for bn in bucket_nodes:
+                    if n <= bn:
+                        bsz = bn
+                        break
+                if bsz is None:
+                    leftovers.append(gi)
+                else:
+                    edge_bin = 1 << int(max(0, int(m - 1)).bit_length())
+                    bucket_map.setdefault((int(bsz), int(edge_bin)), []).append(gi)
+            metrics.pcg_bucket_assign_ms += float(1000.0 * (time.perf_counter() - t_assign0))
+            # Merge sparse edge bins within each node bucket to improve occupancy.
+            t_merge0 = time.perf_counter()
+            if bool(pcg_merge_sparse_edge_bins) and len(bucket_map) > 1:
+                try:
+                    min_groups = max(1, int(pcg_min_groups_per_edge_bin))
+                    max_bins = max(1, int(pcg_max_edge_bins_per_node))
+                    node_to_bins: dict[int, list[tuple[int, list[int]]]] = {}
+                    for (bsz, edge_bin), gids in bucket_map.items():
+                        node_to_bins.setdefault(int(bsz), []).append((int(edge_bin), list(gids)))
+                    merged_map: dict[tuple[int, int], list[int]] = {}
+                    for bsz, bins in node_to_bins.items():
+                        bins_sorted = sorted(bins, key=lambda x: x[0])
+                        keep_bins: list[tuple[int, list[int]]] = []
+                        merge_ids: list[int] = []
+                        for edge_bin, gids in bins_sorted:
+                            if int(len(gids)) >= min_groups:
+                                keep_bins.append((int(edge_bin), list(gids)))
+                            else:
+                                merge_ids.extend(gids)
+                        while len(keep_bins) > max_bins:
+                            j = min(range(len(keep_bins)), key=lambda i: int(len(keep_bins[i][1])))
+                            merge_ids.extend(keep_bins[j][1])
+                            del keep_bins[j]
+                        for edge_bin, gids in keep_bins:
+                            if gids:
+                                merged_map[(int(bsz), int(edge_bin))] = list(gids)
+                        if merge_ids:
+                            merged_map.setdefault((int(bsz), 0), []).extend(merge_ids)
+                    bucket_map = merged_map
+                except Exception:
+                    pass
+            metrics.pcg_bucket_merge_ms += float(1000.0 * (time.perf_counter() - t_merge0))
+            if isinstance(cache_entry, dict):
+                cache_entry["pcg_bucket_assign"] = (assign_key, bucket_map, leftovers)
         metrics.bucket_group_hist = {}
         for (bsz, _edge_bin), gids in bucket_map.items():
             metrics.bucket_group_hist[int(bsz)] = int(metrics.bucket_group_hist.get(int(bsz), 0) + int(len(gids)))
@@ -1115,6 +1206,8 @@ def compute_quad_whitening(
                 min_iters=int(pcg_min_iters),
                 x0=x0_batch,
                 micro_profile=micro,
+                u_flat=tmpl["u_off"],
+                v_flat=tmpl["v_off"],
             )
             metrics.pcg_kernel_ms += float(1000.0 * (time.perf_counter() - t_kernel0))
             if isinstance(micro, dict):
@@ -1139,11 +1232,15 @@ def compute_quad_whitening(
                     cache_entry["pcg_x0"] = x0_cache.detach()
                 except Exception:
                     pass
+            # One host sync for all three scalar metrics (was four).
+            it_sum, it_max, n_bad = torch.stack(
+                [iters.sum(), iters.max(), (~ok).sum().to(iters.dtype)]
+            ).tolist()
             metrics.n_groups_pcg += int(B)
-            metrics.pcg_iters_sum += int(iters.sum().item())
-            metrics.pcg_iters_max = max(int(metrics.pcg_iters_max), int(iters.max().item()))
-            metrics.n_groups_pcg_fail += int((~ok).sum().item())
-            metrics.n_groups_fallback_diag += int((~ok).sum().item())
+            metrics.pcg_iters_sum += int(it_sum)
+            metrics.pcg_iters_max = max(int(metrics.pcg_iters_max), int(it_max))
+            metrics.n_groups_pcg_fail += int(n_bad)
+            metrics.n_groups_fallback_diag += int(n_bad)
 
             t_unpack0 = time.perf_counter()
             ax = x.gather(1, v) - x.gather(1, u)

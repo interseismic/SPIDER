@@ -393,8 +393,26 @@ def compute_travel_times(idx, y, X_src, ΔX_src, model, params: Optional[dict[st
     batch_input[n:, 3:6] = X_rec
     batch_input[n:, 6:7] = phase
 
-    # 4. Model Forward Pass (EikoNet)
-    T_pred_all = model(batch_input).squeeze()
+    # 4. Model Forward Pass (EikoNet).
+    # Each row is a (source, receiver, phase) tuple; in pair-based batches the
+    # same tuple appears in many pairs (both endpoints of every pair sharing an
+    # event and station), so run the network once per *unique* input row and
+    # gather results back. This is exact: duplicate rows are bitwise identical
+    # (built from the same X_src/ΔX_src/station rows), and the gather's
+    # backward sums duplicate gradients into the shared source rows.
+    dedup = True
+    if isinstance(params, dict):
+        dedup = bool(params.get("travel_time_dedup", True))
+    if dedup and n > 1:
+        with torch.no_grad():
+            uniq_rows, inv = torch.unique(batch_input, dim=0, return_inverse=True)
+            n_uniq = int(uniq_rows.shape[0])
+            rep = torch.empty((n_uniq,), dtype=torch.int64, device=inv.device)
+            rep.scatter_(0, inv, torch.arange(inv.numel(), dtype=torch.int64, device=inv.device))
+        T_uniq = model(batch_input.index_select(0, rep)).reshape(-1)
+        T_pred_all = T_uniq.index_select(0, inv)
+    else:
+        T_pred_all = model(batch_input).squeeze()
     # Split back into T1 and T2
     T1 = T_pred_all[:n]
     T2 = T_pred_all[n:]
@@ -627,8 +645,6 @@ def compute_likelihood_loss(
     # 3. Standardized Residuals
     # Clamp sigma to avoid division by zero
     sigma = sigma.clamp_min(1e-12)
-    sigma2 = sigma.square()
-    sigma = sigma2.sqrt().clamp_min(1e-12)
     resid = dt_obs - dt_pred
     scaled_resid = resid / sigma
     # Optional: collapsed shared-event random effects (Gaussian; marginalized b).
@@ -786,7 +802,7 @@ def compute_likelihood_loss(
 
             # One-time runtime log so users can confirm activation and grouping.
             # Resolve GPU enable: if unset, default to CUDA availability for this batch.
-                gpu_enable = bool(resid.is_cuda)
+            gpu_enable = bool(resid.is_cuda)
 
             if not bool(params.get("_shared_event_re_logged", False)):
                 params["_shared_event_re_logged"] = True

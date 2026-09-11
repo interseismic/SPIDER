@@ -29,4 +29,5 @@ troubleshooting
 
 api-reference
 citation
+legacy-materials
 ```

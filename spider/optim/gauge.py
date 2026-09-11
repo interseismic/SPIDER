@@ -81,6 +81,12 @@ def project_event_mean_inplace(
         if want_cluster and (cluster_counts.device != x.device):
             want_cluster = False
 
+    # Common case: dims are the leading contiguous columns (e.g. (0,1,2)) —
+    # subtract the mean from the whole column block in one kernel instead of
+    # one strided kernel per dim.
+    k = len(dims_i)
+    leading_block = (dims_i == list(range(k)))
+
     if want_cluster:
         cid = cluster_ids.to(dtype=torch.int64)
         # cluster_counts may be (K,1) or (K,)
@@ -95,13 +101,19 @@ def project_event_mean_inplace(
             denom = cc.clamp_min(1.0).view(-1, 1)
             means = sums / denom
             mu = means.index_select(0, cid)  # (N,D)
-            for d in dims_i:
-                x[:, d].sub_(mu[:, d])
+            if leading_block:
+                x[:, :k].sub_(mu[:, :k])
+            else:
+                for d in dims_i:
+                    x[:, d].sub_(mu[:, d])
             return x
 
     # Global
     mu = x.mean(dim=0, keepdim=True)  # (1,D)
-    for d in dims_i:
-        x[:, d].sub_(mu[:, d])
+    if leading_block:
+        x[:, :k].sub_(mu[:, :k])
+    else:
+        for d in dims_i:
+            x[:, d].sub_(mu[:, d])
     return x
 

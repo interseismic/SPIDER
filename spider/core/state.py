@@ -260,15 +260,26 @@ def _clamp_dX_inplace(state: LocateState) -> None:
     """Clamp ΔX_src in-place per-dimension if clamp is configured.
 
     Any non-finite or non-positive clamp entries are treated as disabled.
+    This runs once per batch, so the effective bounds tensor is cached
+    (disabled dims become +inf) and applied as a single vectorized clamp
+    with no host-device syncs.
     """
     clamp = state.clamp_abs_dX
     if clamp is None:
         return
-    for dim in range(4):
-        c = float(clamp[dim].item())
-        if not math.isfinite(c) or c <= 0.0:
-            continue
-        state.dX_src[:, dim].clamp_(-c, c)
+    cache = getattr(state, "_clamp_abs_dX_eff", None)
+    if cache is None or cache[0] is not clamp:
+        eff = clamp.detach().to(device=state.dX_src.device, dtype=state.dX_src.dtype).clone()
+        disabled = (~torch.isfinite(eff)) | (eff <= 0.0)
+        eff[disabled] = float("inf")
+        if bool(disabled.all().item()):
+            eff = None
+        cache = (clamp, eff)
+        state._clamp_abs_dX_eff = cache
+    eff = cache[1]
+    if eff is None:
+        return
+    state.dX_src.clamp_(min=-eff, max=eff)
 
 
 def _current_noise_scales(state: LocateState) -> tuple[torch.Tensor, torch.Tensor]:

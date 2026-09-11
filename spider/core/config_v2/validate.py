@@ -27,7 +27,7 @@ from .types import (
 )
 
 
-_TOPLEVEL_KEYS = {"io", "model", "inference", "observability"}
+_TOPLEVEL_KEYS = {"io", "model", "inference", "observability", "synth"}
 _SAMPLER_BACKENDS = {"psgld", "sghmc"}
 
 
@@ -328,6 +328,8 @@ def _parse_sampler(raw: Mapping[str, Any]) -> SamplerConfig:
             "preconditioning",
             "reparameterization",
             "overrides",
+            "lr_schedule",
+            "phase1_two_pass",
         },
     )
     backend = _require_str(raw, "backend", path).lower()
@@ -430,6 +432,61 @@ def _parse_sampler(raw: Mapping[str, Any]) -> SamplerConfig:
                 code="value_error",
                 message="Must be > 0",
             )
+    # Optional Phase-1 (MAP) learning-rate schedule.
+    lr_schedule = raw.get("lr_schedule", {})
+    if lr_schedule is None:
+        lr_schedule = {}
+    if not isinstance(lr_schedule, dict):
+        raise single_issue_error(path="inference.sampler.lr_schedule", code="type_error", message="Expected object/dict")
+    _reject_unknown_keys("inference.sampler.lr_schedule", lr_schedule, {"phase1"})
+    p1_sched = lr_schedule.get("phase1", {})
+    if p1_sched is None:
+        p1_sched = {}
+    if not isinstance(p1_sched, dict):
+        raise single_issue_error(path="inference.sampler.lr_schedule.phase1", code="type_error", message="Expected object/dict")
+    _reject_unknown_keys("inference.sampler.lr_schedule.phase1", p1_sched, {"type", "eta_min", "T_max"})
+    p1_sched_type = str(p1_sched.get("type", "none")).strip().lower()
+    if p1_sched_type not in {"none", "cosine"}:
+        raise single_issue_error(
+            path="inference.sampler.lr_schedule.phase1.type",
+            code="enum_error",
+            message="Supported values are: none, cosine",
+        )
+    if "eta_min" in p1_sched:
+        eta_min = _optional_num(p1_sched, "eta_min", "inference.sampler.lr_schedule.phase1")
+        if eta_min is not None and eta_min < 0.0:
+            raise single_issue_error(
+                path="inference.sampler.lr_schedule.phase1.eta_min", code="value_error", message="Must be >= 0"
+            )
+    t_max = p1_sched.get("T_max", None)
+    if t_max is not None:
+        if isinstance(t_max, bool) or not isinstance(t_max, int) or t_max < 1:
+            raise single_issue_error(
+                path="inference.sampler.lr_schedule.phase1.T_max",
+                code="value_error",
+                message="Must be null or an integer >= 1",
+            )
+
+    # Optional Phase-1 two-pass MAP: MAP -> post-MAP filters at relocated positions -> MAP again.
+    two_pass = raw.get("phase1_two_pass", {})
+    if two_pass is None:
+        two_pass = {}
+    if not isinstance(two_pass, dict):
+        raise single_issue_error(path="inference.sampler.phase1_two_pass", code="type_error", message="Expected object/dict")
+    _reject_unknown_keys("inference.sampler.phase1_two_pass", two_pass, {"enabled", "epochs", "warm_start"})
+    if "enabled" in two_pass and not isinstance(two_pass.get("enabled"), bool):
+        raise single_issue_error(path="inference.sampler.phase1_two_pass.enabled", code="type_error", message="Expected bool")
+    if "warm_start" in two_pass and not isinstance(two_pass.get("warm_start"), bool):
+        raise single_issue_error(path="inference.sampler.phase1_two_pass.warm_start", code="type_error", message="Expected bool")
+    tp_epochs = two_pass.get("epochs", None)
+    if tp_epochs is not None:
+        if isinstance(tp_epochs, bool) or not isinstance(tp_epochs, int) or tp_epochs < 1:
+            raise single_issue_error(
+                path="inference.sampler.phase1_two_pass.epochs",
+                code="value_error",
+                message="Must be null (defaults to epochs_per_phase[0]) or an integer >= 1",
+            )
+
     return SamplerConfig(
         backend=backend,
         epochs_per_phase=epochs,
@@ -443,7 +500,12 @@ def _parse_sampler(raw: Mapping[str, Any]) -> SamplerConfig:
         grad_clip_norm=grad_clip_norm,
         preconditioning=dict(preconditioning),
         overrides=dict(overrides),
-        extras={"reparameterization": dict(reparameterization), "reparameterization_enabled": bool(reparam_enabled)},
+        extras={
+            "reparameterization": dict(reparameterization),
+            "reparameterization_enabled": bool(reparam_enabled),
+            "lr_schedule": {"phase1": dict(p1_sched)},
+            "phase1_two_pass": dict(two_pass),
+        },
     )
 
 
@@ -579,11 +641,16 @@ def parse_canonical_config(raw: Mapping[str, Any]) -> CanonicalConfig:
     model = _parse_model(_as_dict(raw.get("model"), "model"))
     inference = _parse_inference(_as_dict(raw.get("inference"), "inference"))
     observability = _parse_observability(_as_dict(raw.get("observability"), "observability"))
+    # Optional `synth` block (consumed only by `spider synth`); pass-through dict, keys validated by the CLI.
+    synth = raw.get("synth", None)
+    if synth is not None and not isinstance(synth, Mapping):
+        raise single_issue_error(path="synth", code="type_error", message="Expected object/dict or omit the block")
     return CanonicalConfig(
         io=io,
         model=model,
         inference=inference,
         observability=observability,
+        synth=(dict(synth) if synth is not None else None),
     )
 
 

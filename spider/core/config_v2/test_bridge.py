@@ -283,6 +283,105 @@ class ConfigBridgeTests(unittest.TestCase):
         self.assertAlmostEqual(legacy["sampler_reparam_blocked_spatial_scale"], 0.5)
         self.assertAlmostEqual(legacy["sampler_reparam_blocked_dt_scale"], 2.0)
 
+    def test_phase1_lr_schedule_materialization(self) -> None:
+        cfg = _base_config()
+        # Default: no schedule -> constant lr
+        resolved = load_config(cfg, mode="sample")
+        legacy = to_legacy_runtime_params(resolved, profile="all", require_priors=False)
+        self.assertFalse(legacy["phase1_use_cosine"])
+        self.assertIsNone(legacy["phase1_cosine_T_max"])  # resolved per MAP pass at runtime
+        # Cosine with explicit floor and horizon
+        cfg["inference"]["sampler"]["lr_schedule"] = {"phase1": {"type": "cosine", "eta_min": 1e-5, "T_max": 400}}
+        resolved = load_config(cfg, mode="sample")
+        legacy = to_legacy_runtime_params(resolved, profile="all", require_priors=False)
+        self.assertTrue(legacy["phase1_use_cosine"])
+        self.assertAlmostEqual(legacy["phase1_cosine_eta_min"], 1e-5)
+        self.assertEqual(legacy["phase1_cosine_T_max"], 400)
+        # Invalid type / values are rejected
+        cfg["inference"]["sampler"]["lr_schedule"] = {"phase1": {"type": "step"}}
+        with self.assertRaises(Exception):
+            load_config(cfg, mode="sample")
+        cfg["inference"]["sampler"]["lr_schedule"] = {"phase1": {"type": "cosine", "eta_min": -1.0}}
+        with self.assertRaises(Exception):
+            load_config(cfg, mode="sample")
+        cfg["inference"]["sampler"]["lr_schedule"] = {"phase2": {"type": "cosine"}}
+        with self.assertRaises(Exception):
+            load_config(cfg, mode="sample")
+
+    def test_phase1_two_pass_materialization(self) -> None:
+        cfg = _base_config()
+        resolved = load_config(cfg, mode="sample")
+        legacy = to_legacy_runtime_params(resolved, profile="all", require_priors=False)
+        self.assertFalse(legacy["phase1_two_pass_enable"])
+        self.assertTrue(legacy["phase1_two_pass_warm_start"])
+        self.assertEqual(legacy["phase1_two_pass_epochs"], cfg["inference"]["sampler"]["epochs_per_phase"][0])
+        cfg["inference"]["sampler"]["phase1_two_pass"] = {"enabled": True, "epochs": 250, "warm_start": False}
+        resolved = load_config(cfg, mode="sample")
+        legacy = to_legacy_runtime_params(resolved, profile="all", require_priors=False)
+        self.assertTrue(legacy["phase1_two_pass_enable"])
+        self.assertEqual(legacy["phase1_two_pass_epochs"], 250)
+        self.assertFalse(legacy["phase1_two_pass_warm_start"])
+        cfg["inference"]["sampler"]["phase1_two_pass"] = {"enabled": True, "epochs": 0}
+        with self.assertRaises(Exception):
+            load_config(cfg, mode="sample")
+        cfg["inference"]["sampler"]["phase1_two_pass"] = {"enabled": "yes"}
+        with self.assertRaises(Exception):
+            load_config(cfg, mode="sample")
+
+    def test_residual_filter_phase_materialization(self) -> None:
+        cfg = _base_config()
+        resolved = load_config(cfg, mode="sample")
+        legacy = to_legacy_runtime_params(resolved, profile="all", require_priors=False)
+        self.assertTrue(legacy["residual_filter_enable"])
+        self.assertEqual(legacy["residual_filter_phase"], "after_phase1")
+        cfg["model"]["filters"]["residual"]["phase"] = "before"
+        resolved = load_config(cfg, mode="sample")
+        legacy = to_legacy_runtime_params(resolved, profile="all", require_priors=False)
+        self.assertEqual(legacy["residual_filter_phase"], "before")
+        cfg["model"]["filters"]["residual"]["phase"] = "phase2"
+        resolved = load_config(cfg, mode="sample")
+        with self.assertRaises(ValueError):
+            to_legacy_runtime_params(resolved, profile="all", require_priors=False)
+
+    def test_grad_clip_norm_phase_mapping(self) -> None:
+        cfg = _base_config()
+        cfg["inference"]["sampler"].pop("grad_clip_norm", None)
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertAlmostEqual(legacy["sampler_grad_clip_norm"], 0.0)   # sampler phases: disabled when unset
+        self.assertAlmostEqual(legacy["grad_clip_norm"], 100.0)         # Phase 1: legacy default when unset
+        cfg["inference"]["sampler"]["grad_clip_norm"] = 5.0
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertAlmostEqual(legacy["sampler_grad_clip_norm"], 5.0)
+        self.assertAlmostEqual(legacy["grad_clip_norm"], 5.0)
+        cfg["inference"]["sampler"]["grad_clip_norm"] = 0.0
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertAlmostEqual(legacy["grad_clip_norm"], 0.0)
+
+    def test_synth_block_passthrough(self) -> None:
+        cfg = _base_config()
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="synth"), profile="synth", require_priors=False)
+        self.assertIsNone(legacy.get("synth"))
+        cfg["synth"] = {"seed": 7, "outfile": "dt_synth.csv", "apply_filters": False}
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="synth"), profile="synth", require_priors=False)
+        self.assertEqual(legacy["synth"]["seed"], 7)
+        self.assertEqual(legacy["synth"]["outfile"], "dt_synth.csv")
+        cfg["synth"] = "not-a-dict"
+        with self.assertRaises(Exception):
+            load_config(cfg, mode="synth")
+
+    def test_event_bounds_mapping(self) -> None:
+        cfg = _base_config()
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertNotIn("event_lat_bounds", legacy)
+        cfg["model"]["filters"]["events"]["lat_bounds"] = [32.0, 34.5]
+        cfg["model"]["filters"]["events"]["lon_bounds"] = [-118.0, -115.0]
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertEqual(legacy["event_lat_bounds"], [32.0, 34.5])
+        self.assertEqual(legacy["event_lon_bounds"], [-118.0, -115.0])
+        cfg["model"]["filters"]["events"]["lat_bounds"] = [34.5, 32.0]
+        with self.assertRaises(ValueError):
+            to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+
     def test_synth_profile_skips_sampler_materialization(self) -> None:
         cfg = _base_config()
         resolved = load_config(cfg, mode="synth")

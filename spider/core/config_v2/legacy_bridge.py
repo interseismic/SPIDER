@@ -161,9 +161,12 @@ def _materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     params["sampler_backend"] = str(backend)
     params["sampler_temperature"] = float(sampler.get("temperature", 1.0))
     noise_scale_mult = sampler.get("noise_scale_mult", 1.0)
-    grad_clip_norm = sampler.get("grad_clip_norm", 0.0)
+    grad_clip_norm = sampler.get("grad_clip_norm", None)
     params["sampler_noise_scale_mult"] = float(1.0 if noise_scale_mult is None else noise_scale_mult)
+    # Phases 2-4 (sampler): unset -> 0.0 (disabled). Phase 1 (Adam/MAP): unset -> legacy 100.0.
+    # When the key is set explicitly it applies to all phases (0 disables clipping everywhere).
     params["sampler_grad_clip_norm"] = float(0.0 if grad_clip_norm is None else grad_clip_norm)
+    params["grad_clip_norm"] = float(100.0 if grad_clip_norm is None else grad_clip_norm)
     params["sampler_preconditioning"] = bool(precond_enabled)
     params["sampler_preconditioner"] = str(precond_type)
     params["sampler_beta"] = float(sampler.get("beta", 0.99))
@@ -199,6 +202,34 @@ def _materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     params["sampler_reparam_blocked_enable"] = bool(reparam_enabled)
     params["sampler_reparam_blocked_spatial_scale"] = float(reparam_spatial_scale)
     params["sampler_reparam_blocked_dt_scale"] = float(reparam_dt_scale)
+
+    # Phase-1 (MAP) learning-rate schedule -> legacy runtime keys consumed by locate._phase1_map_warmup.
+    extras = sampler.get("extras", {})
+    if not isinstance(extras, dict):
+        extras = {}
+    lr_sched = sampler.get("lr_schedule", extras.get("lr_schedule", {}))
+    if not isinstance(lr_sched, dict):
+        lr_sched = {}
+    p1_sched = lr_sched.get("phase1", {})
+    if not isinstance(p1_sched, dict):
+        p1_sched = {}
+    p1_sched_type = str(p1_sched.get("type", "none")).strip().lower()
+    if p1_sched_type not in {"none", "cosine"}:
+        raise ValueError("Invalid config at `inference.sampler.lr_schedule.phase1.type`: supported values are 'none' or 'cosine'")
+    params["phase1_use_cosine"] = bool(p1_sched_type == "cosine")
+    params["phase1_cosine_eta_min"] = float(p1_sched.get("eta_min", 0.0) or 0.0)
+    p1_t_max = p1_sched.get("T_max", None)
+    # None -> resolved at runtime to the epoch count of the current MAP pass (so a second pass gets its own horizon).
+    params["phase1_cosine_T_max"] = int(p1_t_max) if p1_t_max is not None else None
+
+    # Phase-1 two-pass MAP (MAP -> post-MAP filters at relocated positions -> MAP again).
+    two_pass = sampler.get("phase1_two_pass", extras.get("phase1_two_pass", {}))
+    if not isinstance(two_pass, dict):
+        two_pass = {}
+    tp_epochs = two_pass.get("epochs", None)
+    params["phase1_two_pass_enable"] = bool(two_pass.get("enabled", False))
+    params["phase1_two_pass_epochs"] = int(tp_epochs) if tp_epochs is not None else int(epochs[0])
+    params["phase1_two_pass_warm_start"] = bool(two_pass.get("warm_start", True))
 
     overrides = sampler.get("overrides", {})
     if not isinstance(overrides, dict):
@@ -408,6 +439,20 @@ def _materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     max_pair_station_ratio = float(fe.get("max_pair_station_ratio", 1.0))
     ratio_filter_phase = str(fe.get("ratio_filter_phase", "before")).strip().lower()
 
+    def _bounds(key: str):
+        v = fe.get(key, None)
+        if v is None:
+            return None
+        if not isinstance(v, (list, tuple)) or len(v) != 2:
+            raise ValueError(f"Invalid config at `model.filters.events.{key}`: expected null or [min, max]")
+        lo, hi = float(v[0]), float(v[1])
+        if not (math.isfinite(lo) and math.isfinite(hi)) or lo >= hi:
+            raise ValueError(f"Invalid config at `model.filters.events.{key}`: expected finite min < max")
+        return [lo, hi]
+
+    event_lat_bounds = _bounds("lat_bounds")
+    event_lon_bounds = _bounds("lon_bounds")
+
     lin_cfg = fe.get("linearization_error", {})
     if not isinstance(lin_cfg, dict):
         lin_cfg = {}
@@ -423,6 +468,14 @@ def _materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     residual_method = str(fr.get("method", "mad")).lower() if residual_enabled else None
     residual_mad_sigma = float(fr.get("mad_sigma", 6.0)) if residual_enabled else None
     residual_abs_max = float(fr.get("abs_max", 99999.0)) if residual_enabled else None
+    # When to apply the residual filter:
+    #   "before"       -> at data prep, residuals evaluated at the initial catalog locations (ΔX=0)
+    #   "after_phase1" -> at the end of Phase 1 (MAP), residuals evaluated at the MAP locations (default)
+    residual_phase = str(fr.get("phase", "after_phase1")).strip().lower()
+    if residual_phase not in {"before", "after_phase1"}:
+        raise ValueError(
+            "Invalid config at `model.filters.residual.phase`: supported values are 'before' or 'after_phase1'"
+        )
 
     # Batching
     bt = _require_dict(inf.get("batching"), "inference.batching")
@@ -452,6 +505,11 @@ def _materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["min_event_degree"] = int(min_event_degree)
     params["min_events_per_cluster"] = int(min_events_per_cluster)
     params["max_pair_station_ratio"] = float(max_pair_station_ratio)
+    # Optional catalog subset by geographic bounds (consumed by data.spatial_cat_subset).
+    if event_lat_bounds is not None:
+        params["event_lat_bounds"] = list(event_lat_bounds)
+    if event_lon_bounds is not None:
+        params["event_lon_bounds"] = list(event_lon_bounds)
     params["ratio_filter_phase"] = str(ratio_filter_phase)
 
     params["_shared_event_re_enabled"] = bool(se_enabled)
@@ -526,6 +584,7 @@ def _materialize_block3(params: Dict[str, Any]) -> Dict[str, Any]:
     params["residual_filter_method"] = residual_method
     params["residual_filter_mad_sigma"] = residual_mad_sigma
     params["residual_filter_abs_max"] = residual_abs_max
+    params["residual_filter_phase"] = residual_phase
     params["batch_size_warmup"] = int(batch_size_warmup)
     params["batch_size_sgld"] = int(batch_size_sgld)
     params["batch_shuffle"] = bool(batch_shuffle)

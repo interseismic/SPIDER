@@ -24,36 +24,42 @@ def _build_initial_state(
 ) -> LocateState:
     """Prepare tensors, priors, and optimizer."""
 
-    evid_to_row = {row["evid"]: idx for idx, row in enumerate(origins0.iter_rows(named=True))}
-
-    try:
-        evid1_idx = [evid_to_row[x] for x in dtimes["evid1"]]
-        evid2_idx = [evid_to_row[x] for x in dtimes["evid2"]]
-    except KeyError as e:
+    # Vectorized evid -> origin-row mapping via polars joins. (The previous
+    # Python dict + per-element list comprehensions took minutes and gigabytes
+    # of transient objects at 1e8 dtime rows.) keep="last" matches the old
+    # dict-overwrite semantics if origins0 ever contained duplicate evids.
+    idx_map = (
+        origins0.select(pl.col("evid"))
+        .with_row_index("__origin_row")
+        .unique(subset="evid", keep="last", maintain_order=True)
+    )
+    n_rows0 = int(dtimes.shape[0])
+    joined = (
+        dtimes.with_row_index("__dt_row")
+        .join(idx_map.rename({"evid": "evid1", "__origin_row": "evid1_idx"}), on="evid1", how="left")
+        .join(idx_map.rename({"evid": "evid2", "__origin_row": "evid2_idx"}), on="evid2", how="left")
+        .sort("__dt_row")
+        .drop("__dt_row")
+    )
+    missing_e1_count = int(joined["evid1_idx"].null_count())
+    missing_e2_count = int(joined["evid2_idx"].null_count())
+    if missing_e1_count > 0 or missing_e2_count > 0 or int(joined.shape[0]) != n_rows0:
         # Provide a clear consistency error instead of a raw KeyError.
         # This usually means dtimes references events not present in origins0,
         # or evid dtypes differ (e.g., int vs string ids).
-        missing_e1_examples: list[object] = []
-        missing_e2_examples: list[object] = []
-        missing_e1_count = 0
-        missing_e2_count = 0
-        for x in dtimes["evid1"]:
-            if x not in evid_to_row:
-                missing_e1_count += 1
-                if len(missing_e1_examples) < 5:
-                    missing_e1_examples.append(x)
-        for x in dtimes["evid2"]:
-            if x not in evid_to_row:
-                missing_e2_count += 1
-                if len(missing_e2_examples) < 5:
-                    missing_e2_examples.append(x)
+        try:
+            missing_e1_examples = joined.filter(pl.col("evid1_idx").is_null())["evid1"].head(5).to_list()
+            missing_e2_examples = joined.filter(pl.col("evid2_idx").is_null())["evid2"].head(5).to_list()
+        except Exception:
+            missing_e1_examples = []
+            missing_e2_examples = []
 
         origin_evid_type = "unknown"
-        if evid_to_row:
-            try:
-                origin_evid_type = type(next(iter(evid_to_row.keys()))).__name__
-            except Exception:
-                origin_evid_type = "unknown"
+        try:
+            if origins0.shape[0] > 0:
+                origin_evid_type = type(origins0["evid"][0]).__name__
+        except Exception:
+            origin_evid_type = "unknown"
 
         dt_e1_type = "unknown"
         dt_e2_type = "unknown"
@@ -64,10 +70,10 @@ def _build_initial_state(
         except Exception:
             pass
 
-        missing_value = e.args[0] if len(e.args) > 0 else "<unknown>"
+        missing_value = (missing_e1_examples + missing_e2_examples)[:1] or ["<unknown>"]
         raise ValueError(
             "Inconsistent event ids between origins0 and dtimes while building initial state. "
-            f"Missing evid example={missing_value!r}; "
+            f"Missing evid example={missing_value[0]!r}; "
             f"missing counts: evid1={missing_e1_count}, evid2={missing_e2_count}; "
             f"example missing evid1={missing_e1_examples}, evid2={missing_e2_examples}. "
             f"Observed types: origins0.evid={origin_evid_type}, "
@@ -75,12 +81,12 @@ def _build_initial_state(
             "Likely causes: (1) dtimes references events absent from origins0, "
             "(2) origins0/dtimes came from different filtering steps or bundle files, "
             "(3) evid dtype mismatch (e.g., int vs string)."
-        ) from e
-    dtimes = dtimes.with_columns(
+        )
+    dtimes = joined.with_columns(
         [
-            pl.Series(evid1_idx).alias("evid1_idx"),
-            pl.Series(evid2_idx).alias("evid2_idx"),
-            pl.Series(np.arange(dtimes.shape[0])).alias("arid"),
+            pl.col("evid1_idx").cast(pl.Int64),
+            pl.col("evid2_idx").cast(pl.Int64),
+            pl.Series(np.arange(n_rows0)).alias("arid"),
         ]
     )
 
@@ -133,12 +139,10 @@ def _build_initial_state(
     dX_src.requires_grad_()
     dX_src = torch.nn.Parameter(dX_src)
 
-    II = torch.tensor(
-        dtimes[["evid1_idx", "evid2_idx"]].to_numpy(),
-        dtype=torch.int64,
-        device=device,
-    )
+    # Materialize the index block once and reuse it for both the device tensor
+    # and the CPU mirror (this was previously two full to_numpy() passes).
     II_cpu_np = dtimes[["evid1_idx", "evid2_idx"]].to_numpy().astype(np.int64, copy=False)
+    II = torch.from_numpy(np.ascontiguousarray(II_cpu_np)).to(device=device)
     YY = torch.tensor(
         dtimes[["dt", "X", "Y", "Z", "phase"]].to_numpy(),
         dtype=torch.float32,
@@ -195,8 +199,8 @@ def _build_initial_state(
     # Cluster analysis for connected components (used by gauge projection and graph-aware priors)
     # Build adjacency matrix from event pairings
     n_events = origins0.shape[0]
-    row = np.array(evid1_idx)
-    col = np.array(evid2_idx)
+    row = II_cpu_np[:, 0]
+    col = II_cpu_np[:, 1]
     # Undirected graph: adjacency is symmetric
     data = np.ones(len(row), dtype=int)
     adj = coo_matrix((data, (row, col)), shape=(n_events, n_events))
@@ -279,8 +283,8 @@ def _build_initial_state(
             warn(f"shared_event_re component clustering failed; falling back to no clustering: {e}", section="GRAPH")
     elif se_cluster_mode == "dd_khop":
         try:
-            row_np = np.asarray(evid1_idx, dtype=np.int64)
-            col_np = np.asarray(evid2_idx, dtype=np.int64)
+            row_np = II_cpu_np[:, 0]
+            col_np = II_cpu_np[:, 1]
             if row_np.size > 0:
                 row_all = np.concatenate([row_np, col_np], axis=0)
                 col_all = np.concatenate([col_np, row_np], axis=0)
@@ -443,19 +447,24 @@ def _build_initial_state(
                 pl.col("phase").alias("phase"),
             ])
         )
-        unique_sp = sta_keys.unique(maintain_order=True)
-        sp_keys = [(row["sta"], int(row["phase"])) for row in unique_sp.iter_rows(named=True)]
-        sp_to_idx = {k: idx for idx, k in enumerate(sp_keys)}
-        k_list = []
-        for row in sta_keys.iter_rows(named=True):
-            k_list.append(sp_to_idx[(row["sta"], int(row["phase"]))])
-        nuisance_k_index = torch.tensor(k_list, dtype=torch.int64, device=device).contiguous()
+        # Vectorized (sta, phase) -> index mapping via a join (order-preserving);
+        # the previous per-row Python loop was O(n_dtimes) dict/tuple churn.
+        unique_sp = sta_keys.unique(maintain_order=True).with_row_index("__sp_idx")
+        n_sp = int(unique_sp.shape[0])
+        k_np = (
+            sta_keys.with_row_index("__row")
+            .join(unique_sp, on=["sta", "phase"], how="left")
+            .sort("__row")["__sp_idx"]
+            .to_numpy()
+            .astype(np.int64, copy=False)
+        )
+        nuisance_k_index = torch.tensor(k_np, dtype=torch.int64, device=device).contiguous()
         nuisance_basis = str(params.get("nuisance_basis", "poly1"))
         if nuisance_basis == "poly2":
             nuisance_M = 9
         else:
             nuisance_M = 3
-        nuisance_alpha = torch.nn.Parameter(torch.zeros(len(sp_keys), nuisance_M, dtype=torch.float32, device=device))
+        nuisance_alpha = torch.nn.Parameter(torch.zeros(n_sp, nuisance_M, dtype=torch.float32, device=device))
         state.nuisance_enable = True
         state.nuisance_alpha = nuisance_alpha
         state.nuisance_k_index = nuisance_k_index
