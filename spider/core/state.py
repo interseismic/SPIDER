@@ -91,6 +91,9 @@ class LocateState:
     # Hierarchical Prior (Global Precision Matrix)
     hierarchical_prior_enable: bool = False
     event_precision_matrix: Optional[torch.Tensor] = None  # shape (K, 4, 4) P0 per cluster
+    # MAP rows (write_output schema + `dropped_after_phase1`=1) of events removed by the post-Phase-1
+    # event filter (no dtimes left / component below min_events_per_cluster); appended to `_MAP.csv`.
+    dropped_after_phase1: Optional[pl.DataFrame] = None
 
     # Event-centric batching
     event_batch_enable: bool = False

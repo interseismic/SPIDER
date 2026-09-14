@@ -202,6 +202,20 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
         ev_hyper_every = int(_require_pos_float(_require(ev_hyper_update, "every_epochs", "priors.event.hyper.update"), "priors.event.hyper.update.every_epochs"))
         if ev_hyper_every < 1:
             raise _err("priors.event.hyper.update.every_epochs", "must be >= 1")
+        # Optional warm-up: keep the fixed Gaussian prior (params.std) until this epoch of each MAP pass /
+        # sampling phase before the first Wishart update. Prevents the hierarchical collapse that occurs when
+        # P0 is estimated from ΔX≈0 at the very start of optimization.
+        ev_hyper_start = ev_hyper_update.get("start_epoch", 0)
+        if isinstance(ev_hyper_start, bool) or not isinstance(ev_hyper_start, (int, float)) or int(ev_hyper_start) < 0:
+            raise _err("priors.event.hyper.update.start_epoch", "must be an integer >= 0")
+        ev_hyper_start = int(ev_hyper_start)
+        # Optional pooling: connected components with fewer than this many events do not get their own
+        # Wishart estimate (a handful of ΔX cannot pin a 4x4 precision; as the component drifts its own P0
+        # loosens and the drift runs away) but use the precision estimated from all events instead.
+        ev_hyper_min_cluster = ev_hyper_update.get("min_cluster_events", 0)
+        if isinstance(ev_hyper_min_cluster, bool) or not isinstance(ev_hyper_min_cluster, (int, float)) or int(ev_hyper_min_cluster) < 0:
+            raise _err("priors.event.hyper.update.min_cluster_events", "must be an integer >= 0")
+        ev_hyper_min_cluster = int(ev_hyper_min_cluster)
         # Hard break: per-phase hyper-update scheduling removed; updates run in all phases when enabled.
         if "active_phases" in ev_hyper_update:
             raise _err(
@@ -212,6 +226,8 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
         ev_hyper_df = None
         ev_hyper_scale_std = None
         ev_hyper_every = None
+        ev_hyper_start = None
+        ev_hyper_min_cluster = None
 
     # ---- Centroid prior (optional) ----
     centroid = priors.get("centroid", None)
@@ -251,6 +267,8 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
         params["hierarchical_prior_dof"] = float(ev_hyper_df)
         params["_hierarchical_scale_std"] = ev_hyper_scale_std
         params["_hierarchical_update_every_epochs"] = int(ev_hyper_every)
+        params["_hierarchical_update_start_epoch"] = int(ev_hyper_start)
+        params["_hierarchical_min_cluster_events"] = int(ev_hyper_min_cluster)
 
     # Centroid prior (optional)
     params["prior_centroid_enable"] = bool(centroid_enabled)

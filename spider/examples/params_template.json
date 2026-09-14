@@ -33,19 +33,21 @@
                     ]
                 },
                 "hyper": {
-                    "enabled": false,
+                    "enabled": true,
                     "type": "wishart_precision",
                     "params": {
-                        "df": 1000,
+                        "df": 10.0,
                         "scale_std": [
-                            0.01,
-                            0.01,
-                            0.01,
-                            0.01
+                            0.5,
+                            0.5,
+                            0.5,
+                            0.2
                         ]
                     },
                     "update": {
-                        "every_epochs": 1
+                        "every_epochs": 10,
+                        "start_epoch": 200,
+                        "min_cluster_events": 100
                     }
                 }
             },

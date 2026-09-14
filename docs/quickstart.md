@@ -44,6 +44,11 @@ The example config runs Phase 1 with a cosine MAP learning-rate schedule
 (`inference.sampler.phase1_two_pass`), so you will see two Phase-1 passes in the log and both
 `<catalog_outfile>_MAP_pass1.csv` and `<catalog_outfile>_MAP.csv` on disk. See
 {doc}`configuration-reference` to disable either.
+It also enables the hierarchical event prior (`model.priors.event.hyper`): the loose fixed prior only
+acts early in Phase 1, after which the event-shift scale is learned from the catalog per connected
+component and carried into the sampling phases (log lines `Hierarchical event prior updated` and, at
+`sample` start, `Adopted hierarchical event-prior precision from bundle`). This is the recommended setup;
+see {doc}`probability-model` for why a single fixed prior cannot serve both the MAP and the sampler.
 
 Multi-GPU independent chains (run `locate-map` first):
 

@@ -36,6 +36,9 @@ class Phase2Bundle:
     # True when the residual outlier filter was already applied to `dtimes` (at data prep or at the
     # end of Phase 1). Lets sampling runs skip re-applying it to the already-filtered bundle.
     residual_filter_applied: bool = False
+    # Learned hierarchical event-prior precision at the end of Phase 1: (K,4,4) per connected component,
+    # or (4,4). None for bundles written without the hierarchical prior (or by older versions).
+    event_precision_matrix: Optional[torch.Tensor] = None
 
 
 def save_phase2_bundle(
@@ -49,6 +52,7 @@ def save_phase2_bundle(
     phase1_optimizer_state_dict: Optional[Dict[str, Any]] = None,
     global_step_count: int = 0,
     residual_filter_applied: bool = False,
+    event_precision_matrix: Optional[torch.Tensor] = None,
 ) -> str:
     """
     Save a Phase-2 bundle.
@@ -90,6 +94,8 @@ def save_phase2_bundle(
         payload["phase1_optimizer_state_dict"] = phase1_optimizer_state_dict
     if int(global_step_count) != 0:
         payload["global_step_count"] = int(global_step_count)
+    if isinstance(event_precision_matrix, torch.Tensor):
+        payload["event_precision_matrix"] = event_precision_matrix.detach().to("cpu", dtype=torch.float32).contiguous()
     torch.save(payload, path)
     return path
 
@@ -136,6 +142,9 @@ def load_phase2_bundle(*, path: str) -> Phase2Bundle:
     if opt_state is not None and not isinstance(opt_state, dict):
         opt_state = None
     gsc = int(payload.get("global_step_count", 0))
+    epm = payload.get("event_precision_matrix", None)
+    if epm is not None and not isinstance(epm, torch.Tensor):
+        epm = None
     return Phase2Bundle(
         params=params,
         origins0=origins0,
@@ -145,6 +154,7 @@ def load_phase2_bundle(*, path: str) -> Phase2Bundle:
         phase1_optimizer_state_dict=opt_state,
         residual_filter_applied=bool(payload.get("residual_filter_applied", False)),
         global_step_count=gsc,
+        event_precision_matrix=(epm.to(torch.float32) if epm is not None else None),
     )
 
 

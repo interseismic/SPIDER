@@ -382,6 +382,41 @@ class ConfigBridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
 
+    def test_hierarchical_prior_start_epoch(self) -> None:
+        cfg = _base_config()
+        cfg["model"]["priors"] = {
+            "event": {"enabled": True, "type": "gaussian", "params": {"std": [5.0, 5.0, 5.0, 2.0]},
+                      "hyper": {"enabled": True, "type": "wishart_precision",
+                                "params": {"df": 10.0, "scale_std": [0.5, 0.5, 0.5, 0.2]},
+                                "update": {"every_epochs": 10}}},
+        }
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="locate-map"), profile="all", require_priors=True)
+        self.assertTrue(legacy["hierarchical_event_prior"])
+        self.assertEqual(legacy["_hierarchical_update_start_epoch"], 0)
+        cfg["model"]["priors"]["event"]["hyper"]["update"]["start_epoch"] = 200
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="locate-map"), profile="all", require_priors=True)
+        self.assertEqual(legacy["_hierarchical_update_start_epoch"], 200)
+        cfg["model"]["priors"]["event"]["hyper"]["update"]["start_epoch"] = -1
+        with self.assertRaises(Exception):
+            to_legacy_runtime_params(load_config(cfg, mode="locate-map"), profile="all", require_priors=True)
+
+    def test_hierarchical_prior_min_cluster_events(self) -> None:
+        cfg = _base_config()
+        cfg["model"]["priors"] = {
+            "event": {"enabled": True, "type": "gaussian", "params": {"std": [5.0, 5.0, 5.0, 2.0]},
+                      "hyper": {"enabled": True, "type": "wishart_precision",
+                                "params": {"df": 10.0, "scale_std": [0.5, 0.5, 0.5, 0.2]},
+                                "update": {"every_epochs": 10}}},
+        }
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="locate-map"), profile="all", require_priors=True)
+        self.assertEqual(legacy["_hierarchical_min_cluster_events"], 0)
+        cfg["model"]["priors"]["event"]["hyper"]["update"]["min_cluster_events"] = 100
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="locate-map"), profile="all", require_priors=True)
+        self.assertEqual(legacy["_hierarchical_min_cluster_events"], 100)
+        cfg["model"]["priors"]["event"]["hyper"]["update"]["min_cluster_events"] = -5
+        with self.assertRaises(Exception):
+            to_legacy_runtime_params(load_config(cfg, mode="locate-map"), profile="all", require_priors=True)
+
     def test_synth_profile_skips_sampler_materialization(self) -> None:
         cfg = _base_config()
         resolved = load_config(cfg, mode="synth")

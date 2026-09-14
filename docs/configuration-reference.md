@@ -63,9 +63,36 @@ Not key-checked by `validate-config`, but strictly validated at runtime by
 
 - `event` (**required**): `enabled` (bool), `type` (`gaussian`), `params.std` (list[4]
   `[σx, σy, σz, σt]`, required when `enabled`). A Gaussian prior on each event's shift from its
-  initial catalog location.
-  - `event.hyper` (optional hierarchical prior): `enabled` (bool), `type` (`wishart_precision`),
-    `params.df` (`> 3`), `params.scale_std` (list[4]), `update.every_epochs` (int `>= 1`).
+  initial catalog location. **Use it together with `event.hyper` (below); a fixed `params.std` alone is
+  not recommended.** With the hierarchical prior enabled, `params.std` only acts until the first Wishart
+  update (Phase 1 up to `update.start_epoch`), so keep it loose (several km, seconds) — a tight fixed
+  prior fights the differential data and blurs fine structure in the MAP.
+  - `event.hyper` (**recommended** hierarchical prior): `enabled` (bool), `type` (`wishart_precision`),
+    `params.df` (`> 3`), `params.scale_std` (list[4]), `update.every_epochs` (int `>= 1`),
+    `update.start_epoch` (int `>= 0`, default 0: epochs to keep the fixed `params.std` Gaussian before the
+    first Wishart update — use a few hundred so the scale is not estimated from ΔX≈0),
+    `update.min_cluster_events` (int `>= 0`, default 0: connected components with fewer events than this
+    share the precision estimated from all events instead of their own — a handful of ΔX cannot pin a
+    4×4 precision, and a small component that drifts loosens its own prior and runs away). The learned
+    covariance is per connected cluster; `df` is the pseudo-count weight of `scale_std`.
+
+    Why: the MAP wants a loose prior, but the sampling phases need a realistic one, otherwise the injected
+    noise walks weakly constrained events away from the data. A single fixed `params.std` cannot be both.
+    The hierarchical prior learns the event-shift scale from the catalog itself (typically a few hundred
+    metres) and carries it from the Phase-2 bundle into sampling, so no hand tuning is needed. Recommended
+    block:
+
+    ```json
+    "event": {
+      "enabled": true, "type": "gaussian", "params": {"std": [5.0, 5.0, 5.0, 2.0]},
+      "hyper": {
+        "enabled": true, "type": "wishart_precision",
+        "params": {"df": 10.0, "scale_std": [0.5, 0.5, 0.5, 0.2]},
+        "update": {"every_epochs": 10, "start_epoch": 200, "min_cluster_events": 100}
+      }
+    }
+    ```
+
 - `centroid` (optional): `enabled`, `type` (`gaussian`), `params.std` (list[4]). A Gaussian prior
   on each connected cluster's mean shift; this is what fixes the translation gauge, so keep it
   tight (for example `0.01`) when loosening `event.params.std`.
@@ -113,7 +140,7 @@ them are silently ignored):
 | `events.min_unique_phase_per_event` | 1 | minimum distinct (station, phase) per event |
 | `events.min_dtimes_per_pair` | 1 | minimum rows per unordered pair (applied right after `cc_min`) |
 | `events.min_event_degree` | 0 | minimum number of connected events (iterative) |
-| `events.min_events_per_cluster` | 0 | drop connected components smaller than this (only when `> 1`) |
+| `events.min_events_per_cluster` | 0 | drop connected components smaller than this (only when `> 1`). Re-applied at the end of Phase 1 after the post-MAP row filters; events left with no dtimes are always dropped there (see below) |
 | `events.max_pair_station_ratio` | 1.0 | drop pairs whose separation exceeds this fraction of the pair–station distance |
 | `events.lat_bounds`, `events.lon_bounds` | null | optional `[min, max]` (degrees) catalog subset applied before everything else; dtimes referencing dropped events are removed |
 | `events.ratio_filter_phase` | `before` | `before` (data prep) or `after_phase1` (end of Phase 1). Unlike `residual.phase`, an unrecognized value is not rejected — it silently disables the filter |
@@ -163,6 +190,15 @@ Data preparation (`prepare_input_dfs`):
 15. `min_event_degree`
 16. `min_events_per_cluster`
 17. drop catalog events with no remaining dtimes
+
+After Phase 1 the row filters that run at the MAP solution (`residual` with `phase: after_phase1`,
+`linearization_error`, `max_pair_station_ratio` with `ratio_filter_phase: after_phase1`) can leave
+events with no dtimes at all, or in components smaller than `min_events_per_cluster`. Such events
+are removed from the event set before the optional second MAP pass and the Phase-2 bundle: with no
+likelihood, the preconditioned sampler noise walks them to the `inference.safety.max_abs_dX` clamp
+box and, through the centroid prior, shifts every other event. Their MAP locations are kept in
+`<catalog_outfile>_MAP.csv` with `dropped_after_phase1 = 1` (see outputs); the log reports the count
+under `[FILTER] Post-Phase-1 event filter`. This step is skipped under torchrun/DDP.
 
 Note that thinning (`dtime_thin_frac`) runs before `cc_min` and the `min_*` event filters, so it
 affects which events survive.

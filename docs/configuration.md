@@ -23,7 +23,7 @@ Input/output file paths and checkpoint controls. `io.catalog_outfile` is a prefi
 
 - EikoNet checkpoint path (`model_file`) and loader settings (`eikonet`).
 - Domain origin/bounds/scale (`domain`).
-- Priors (`priors`: `event`, optional `centroid`, optional `event.hyper`).
+- Priors (`priors`: `event` with the recommended hierarchical `event.hyper` scale, optional `centroid`).
 - Likelihoods for MAP (`likelihoods.locate_map`) and sampling (`likelihoods.sample`).
 - Data filters (`filters.dtimes`, `filters.events`, `filters.residual`).
 

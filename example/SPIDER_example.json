@@ -38,6 +38,24 @@
                         5.0,
                         2.0
                     ]
+                },
+                "hyper": {
+                    "enabled": true,
+                    "type": "wishart_precision",
+                    "params": {
+                        "df": 10.0,
+                        "scale_std": [
+                            0.5,
+                            0.5,
+                            0.5,
+                            0.2
+                        ]
+                    },
+                    "update": {
+                        "every_epochs": 10,
+                        "start_epoch": 200,
+                        "min_cluster_events": 100
+                    }
                 }
             },
             "centroid": {

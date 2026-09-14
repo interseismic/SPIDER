@@ -21,7 +21,17 @@ If `dr_max` in the Phase-1 log equals the norm of `inference.safety.max_abs_dX` 
 some events are being held at the clamp rather than at their data-preferred positions. Widen the
 clamp (e.g. `[10, 10, 10, 3]`); it is a safety net, not a prior. Likewise, if the median shifts
 (`dx/dy/dz/dT`) exceed `model.priors.event.params.std`, the event prior is fighting the data for
-most of the catalog — loosen it and rely on the centroid prior to fix the gauge.
+most of the catalog — loosen it, rely on the centroid prior to fix the gauge, and let the hierarchical
+hyperprior (`model.priors.event.hyper`, recommended) learn the realistic scale for the sampling phases
+instead of tightening the fixed prior by hand.
+
+If instead the pinned events appear only in the *sampling* phases (posterior means ~`max_abs_dX`
+away from the catalog while the MAP looked fine), check the `[FILTER] Post-Phase-1 event filter`
+line: events that lose all their dtimes to the post-MAP residual / linearization filters have no
+likelihood and random-walk to the clamp under the preconditioned noise, dragging the centroid prior
+(and hence every other event, by a few hundred metres) with them. SPIDER now drops such events
+before the bundle is written and flags them in `_MAP.csv` (`dropped_after_phase1 = 1`); bundles
+produced by older versions should be regenerated with `spider locate-map`.
 
 ## Second MAP pass never runs
 
@@ -46,6 +56,13 @@ lines.
 
 The latest checkpoint in `io.checkpoint_dir` is from Phases 2–4. Either delete the checkpoints or
 set `inference.runtime.reset_batch_numbers: true` to start fresh.
+
+## `Checkpoint ... does not match the requested architecture`
+
+The EikoNet state dict at `model.model_file` was trained with a different architecture (or the
+pre-package EikoNet code). Fix `model.eikonet.{n_hidden, n_blocks, n_fourier, phase_emb_dim,
+model_kind}` to match the training config, or retrain with the current `eikonet` package. Older
+loaders accepted such files while loading no weights at all.
 
 ## Config validation errors
 

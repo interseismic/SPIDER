@@ -24,6 +24,8 @@ import shutil
 
 import numpy as np
 import polars as pl
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -976,14 +978,196 @@ def _run_phase1(state: LocateState, start_epoch: int = 0, wandb_logger=None) -> 
         state.params["_phase1_pass"] = 1
 
 
+
+def _invalidate_row_caches(state: LocateState) -> None:
+    """Drop cached batching structures that reference dtimes row indices (call after II/YY change)."""
+    for name in (
+        "_II_cpu", "II_epoch", "YY_epoch", "row_station_index_epoch", "_perm_epoch",
+        "_bucket_rows_order", "_bucket_offsets", "_bucket_II", "_bucket_YY", "_bucket_station_index",
+        "_bucket_comp_index", "_bucket_p_counts", "_bucket_nodes_p", "_bucket_u_p", "_bucket_v_p",
+        "_bucket_nodes_s", "_bucket_u_s", "_bucket_v_s", "_bucket_chunks_p", "_bucket_chunks_s",
+        "_bucket_last_epoch", "shared_event_re_whitening_cache",
+    ):
+        try:
+            setattr(state, name, None)
+        except Exception:
+            pass
+
+
+def _write_map_catalog(state: LocateState) -> pl.DataFrame:
+    """
+    Write `<catalog_outfile>_MAP.csv` for the current event set. Events removed by the post-Phase-1
+    event filter (see `_drop_events_without_data_after_phase1`) are appended with their pass-1 MAP
+    location and `dropped_after_phase1 = 1` (current events get 0). Returns the current-event rows only.
+    """
+    X_src1 = (state.X_src + state.dX_src).detach().cpu().numpy()
+    origins = write_output(state.origins0, X_src1, state.X_src.detach().cpu().numpy(), state.projector)
+    out = origins
+    dropped = getattr(state, "dropped_after_phase1", None)
+    if isinstance(dropped, pl.DataFrame) and dropped.shape[0] > 0:
+        try:
+            out = origins.with_columns(pl.lit(0).cast(pl.Int8).alias("dropped_after_phase1"))
+            out = pl.concat([out, dropped.select(out.columns)], how="vertical_relaxed")
+            if "idx" in out.columns:
+                out = out.sort("idx")
+        except Exception as e:
+            warn(f"Could not append dropped events to _MAP.csv: {e}", section="FILTER")
+            out = origins
+    out.write_csv(f"{state.params['catalog_outfile']}_MAP.csv")
+    return origins
+
+
+def _drop_events_without_data_after_phase1(state: LocateState) -> None:
+    """
+    Re-apply the event-graph rule after the post-Phase-1 row filters (residual, linearization error,
+    pair/station ratio). Those filters can leave events with no dtimes at all, or in tiny connected
+    components. Such events have (almost) no likelihood; in the sampling phases the preconditioned noise
+    walks them to the `max_abs_dX` clamp box, and through the centroid prior they shift every other
+    event. They are removed from the event set here -- before the optional second MAP pass and the
+    Phase-2 bundle -- using the same `min_events_per_cluster` rule as the load-time filter (events with
+    zero remaining dtimes are always removed). Their MAP locations are preserved on
+    `state.dropped_after_phase1` and written to `_MAP.csv` with `dropped_after_phase1 = 1`.
+    """
+    if _ddp_enabled(state.params):
+        warn("Post-Phase-1 event filter skipped under torchrun/DDP (event set must stay identical across ranks).", section="FILTER")
+        return
+    n_ev = int(state.dX_src.shape[0])
+    if n_ev == 0 or int(state.N) == 0:
+        return
+    II_cpu = state.II.detach().cpu().numpy().astype(np.int64, copy=False)
+    degree = np.bincount(II_cpu[:, 0], minlength=n_ev) + np.bincount(II_cpu[:, 1], minlength=n_ev)
+    n_min = int(state.params.get("min_events_per_cluster", 0) or 0)
+    adj = coo_matrix((np.ones(II_cpu.shape[0], dtype=np.int8), (II_cpu[:, 0], II_cpu[:, 1])), shape=(n_ev, n_ev))
+    _, labels = connected_components(adj, directed=False, return_labels=True)
+    comp_size = np.bincount(labels)[labels]
+    drop_zero = degree == 0
+    drop_small = ((comp_size < n_min) & ~drop_zero) if n_min > 1 else np.zeros(n_ev, dtype=bool)
+    drop = drop_zero | drop_small
+    n_drop = int(drop.sum())
+    if n_drop == 0:
+        info("Post-Phase-1 event filter: all events keep >=1 dtime and satisfy min_events_per_cluster.", section="FILTER")
+        return
+    keep = ~drop
+    info(
+        f"Post-Phase-1 event filter: dropping {n_drop}/{n_ev} events "
+        f"({int(drop_zero.sum())} with no remaining dtimes, {int(drop_small.sum())} in components < "
+        f"min_events_per_cluster={n_min}); their MAP locations stay in _MAP.csv with dropped_after_phase1=1.",
+        section="FILTER",
+    )
+    keep_idx_np = np.nonzero(keep)[0]
+    drop_idx_np = np.nonzero(drop)[0]
+
+    # Preserve the MAP locations of the dropped events (write_output schema + flag).
+    try:
+        X_src1 = (state.X_src + state.dX_src).detach().cpu().numpy()
+        X0 = state.X_src.detach().cpu().numpy()
+        o_drop = (
+            state.origins0.with_row_index("__row")
+            .filter(pl.col("__row").is_in(pl.Series(drop_idx_np)))
+            .drop("__row")
+        )
+        dropped_map = write_output(o_drop, X_src1[drop_idx_np], X0[drop_idx_np], state.projector)
+        dropped_map = dropped_map.with_columns(pl.lit(1).cast(pl.Int8).alias("dropped_after_phase1"))
+        prev = getattr(state, "dropped_after_phase1", None)
+        state.dropped_after_phase1 = (
+            dropped_map if not isinstance(prev, pl.DataFrame) else pl.concat([prev, dropped_map], how="vertical_relaxed")
+        )
+    except Exception as e:
+        warn(f"Could not preserve MAP rows of dropped events: {e}", section="FILTER")
+
+    # Rows: whole components are dropped, so a row's two events are either both kept or both dropped.
+    dev = state.II.device
+    keep_t = torch.as_tensor(keep, device=dev)
+    row_keep = keep_t[state.II[:, 0]]
+    if not bool(torch.equal(row_keep, keep_t[state.II[:, 1]])):
+        raise RuntimeError("Post-Phase-1 event filter: inconsistent row/event keep masks")
+    row_idx = torch.nonzero(row_keep).squeeze(-1)
+    state.II = state.II.index_select(0, row_idx).contiguous()
+    state.YY = state.YY.index_select(0, row_idx).contiguous()
+    if state.row_station_index is not None:
+        try:
+            state.row_station_index = state.row_station_index.index_select(0, row_idx).contiguous()
+        except Exception:
+            state.row_station_index = None
+            state.n_stations = 0
+    try:
+        state.dtimes = state.dtimes.filter(pl.Series(row_keep.detach().cpu().numpy()))
+    except Exception as e:
+        warn(f"Post-Phase-1 event filter: could not filter dtimes DataFrame: {e}", section="FILTER")
+    state.N = int(state.II.shape[0])
+
+    # Events: compact indices.
+    new_index = np.full(n_ev, -1, dtype=np.int64)
+    new_index[keep_idx_np] = np.arange(int(keep_idx_np.shape[0]), dtype=np.int64)
+    state.II = torch.as_tensor(new_index, device=dev)[state.II].contiguous()
+    # The dtimes table carries origin row positions (evid1_idx/evid2_idx) that the bundle path and
+    # _build_initial_state rely on; keep them in sync with the compacted indices.
+    try:
+        if "evid1_idx" in state.dtimes.columns and int(state.dtimes.shape[0]) == int(state.II.shape[0]):
+            II_new_cpu = state.II.detach().cpu().numpy()
+            state.dtimes = state.dtimes.with_columns(
+                pl.Series("evid1_idx", II_new_cpu[:, 0]).cast(state.dtimes["evid1_idx"].dtype),
+                pl.Series("evid2_idx", II_new_cpu[:, 1]).cast(state.dtimes["evid2_idx"].dtype),
+            )
+    except Exception as e:
+        warn(f"Post-Phase-1 event filter: could not refresh evid*_idx columns: {e}", section="FILTER")
+    keep_idx_t = torch.as_tensor(keep_idx_np, device=state.X_src.device)
+    state.X_src = state.X_src.index_select(0, keep_idx_t).contiguous()
+    state.dX_src = torch.nn.Parameter(state.dX_src.detach().index_select(0, keep_idx_t).clone())
+    state.origins0 = (
+        state.origins0.with_row_index("__row")
+        .filter(pl.col("__row").is_in(pl.Series(keep_idx_np)))
+        .drop("__row")
+    )
+    # The Phase-1 optimizer references the old parameter (pass 2 rebuilds it anyway).
+    state.optimizer = torch.optim.Adam([state.dX_src], lr=float(state.params["lr_warmup"]))
+
+    # Clusters (connected components) and per-cluster hierarchical precision.
+    n_keep = int(keep_idx_np.shape[0])
+    II_new = state.II.detach().cpu().numpy()
+    adj_new = coo_matrix((np.ones(II_new.shape[0], dtype=np.int8), (II_new[:, 0], II_new[:, 1])), shape=(n_keep, n_keep))
+    n_comp_new, labels_new = connected_components(adj_new, directed=False, return_labels=True)
+    old_cid = state.cluster_ids.detach().cpu().numpy()[keep_idx_np] if state.cluster_ids is not None else None
+    state.cluster_ids = torch.tensor(labels_new, dtype=torch.int64, device=state.device)
+    state.cluster_counts = torch.bincount(state.cluster_ids, minlength=int(n_comp_new)).float().unsqueeze(1)
+    epm = state.event_precision_matrix
+    if isinstance(epm, torch.Tensor) and epm.ndim == 3 and old_cid is not None and int(epm.shape[0]) > int(old_cid.max()):
+        # Dropping events only splits components, so every new component lies inside one old one.
+        old_of_new = np.zeros(int(n_comp_new), dtype=np.int64)
+        old_of_new[labels_new] = old_cid
+        state.event_precision_matrix = epm.index_select(0, torch.as_tensor(old_of_new, device=epm.device)).contiguous()
+    try:
+        state.params["_runtime_event_cluster_ids"] = state.cluster_ids
+        state.params["_runtime_n_components"] = int(n_comp_new)
+        se_ids = state.params.get("_shared_event_re_cluster_ids", None)
+        if isinstance(se_ids, torch.Tensor) and int(se_ids.shape[0]) == n_ev:
+            sub = se_ids.detach().cpu()[torch.as_tensor(keep_idx_np)]
+            _, inv = torch.unique(sub, return_inverse=True)
+            state.params["_shared_event_re_cluster_ids"] = inv.to(dtype=torch.int64, device=state.device)
+    except Exception as e:
+        warn(f"Post-Phase-1 event filter: could not refresh cluster params: {e}", section="FILTER")
+    info(
+        f"Post-Phase-1 event filter: events={n_keep} dtimes={state.N} components={int(n_comp_new)} "
+        f"(largest={int(state.cluster_counts.max().item())})",
+        section="FILTER",
+    )
+    _invalidate_row_caches(state)
+    if state.event_batch_enable:
+        try:
+            _build_event_to_row_map(state)
+        except Exception as e:
+            warn(f"Post-Phase-1 event filter: could not rebuild event->row map: {e}", section="FILTER")
+    # Refresh the MAP catalog so the flag column is present even without a second pass.
+    try:
+        _write_map_catalog(state)
+    except Exception as e:
+        warn(f"Post-Phase-1 event filter: could not refresh _MAP.csv: {e}", section="FILTER")
+
+
 def _finalize_phase1(state: LocateState) -> None:
     if state.params["phase1_epochs"] <= 0:
         return
-    X_src1 = (state.X_src + state.dX_src).detach().cpu().numpy()
-    origins = write_output(
-        state.origins0, X_src1, state.X_src.detach().cpu().numpy(), state.projector
-    )
-    origins.write_csv(f"{state.params['catalog_outfile']}_MAP.csv")
+    origins = _write_map_catalog(state)
     try:
         save_map_locations(state.params, state.origins0, state.X_src, state.dX_src, state.projector)
     except Exception as e:
@@ -1065,6 +1249,10 @@ def _finalize_phase1(state: LocateState) -> None:
 
         # Apply linearization error filter if configured for after Phase 1
         _apply_linearization_filter(state, "after_phase1")
+
+        # Events left without data (or in tiny components) by the filters above must not enter the
+        # second MAP pass / sampling phases: they would random-walk to the clamp box.
+        _drop_events_without_data_after_phase1(state)
 
         # Run one-shot spatial diagnostic after final filtering
         try:
@@ -4637,6 +4825,11 @@ def locate_map(
                         state.params.get("_residual_filter_applied_in_phase2", False)
                         or state.params.get("_residual_filter_applied_in_prepare_input_dfs", False)
                     ),
+                    # Learned hierarchical prior scale (if enabled) so Phases 2-4 start from it instead of the
+                    # base params.std until the first Wishart update.
+                    event_precision_matrix=(
+                        state.event_precision_matrix if bool(getattr(state, "hierarchical_prior_enable", False)) else None
+                    ),
             )
             info(f"Wrote Phase-2 bundle -> {bundle_out}", section="BUNDLE")
         except Exception as e:
@@ -4722,6 +4915,40 @@ def locate_sample_from_bundle(
     # Restore MAP solution
     state.dX_src.data.copy_(bun.dX_src.to(device=state.device, dtype=torch.float32))
     state.global_step_count = 0
+
+    # Restore the learned hierarchical event-prior precision (per connected component). Without it the
+    # sampling phases would run under the base `params.std` Gaussian until the first Wishart update
+    # (`hyper.update.start_epoch` epochs into Phase 4), i.e. under a much looser prior than the MAP saw.
+    if bool(getattr(state, "hierarchical_prior_enable", False)):
+        epm = getattr(bun, "event_precision_matrix", None)
+        cur = state.event_precision_matrix
+        if isinstance(epm, torch.Tensor) and isinstance(cur, torch.Tensor) and tuple(epm.shape) == tuple(cur.shape):
+            state.event_precision_matrix = epm.to(device=state.device, dtype=torch.float32).contiguous()
+            try:
+                P0_rep = state.event_precision_matrix
+                if P0_rep.ndim == 3:
+                    cc = state.cluster_counts
+                    k_max = int(torch.argmax(cc.flatten()).item()) if isinstance(cc, torch.Tensor) and int(cc.numel()) == int(P0_rep.shape[0]) else 0
+                    P0_rep = P0_rep[k_max]
+                stds = torch.sqrt(torch.diag(torch.linalg.inv(P0_rep)))
+                info(
+                    f"Adopted hierarchical event-prior precision from bundle: std≈[{stds[0]:.3g},{stds[1]:.3g},{stds[2]:.3g},{stds[3]:.3g}] (largest component)",
+                    section="PRIORS",
+                )
+            except Exception:
+                info("Adopted hierarchical event-prior precision from bundle.", section="PRIORS")
+        elif isinstance(epm, torch.Tensor):
+            warn(
+                f"Bundle precision matrix shape {tuple(epm.shape)} does not match the rebuilt clusters {tuple(cur.shape) if isinstance(cur, torch.Tensor) else None}; "
+                "starting from the base event prior until the first Wishart update.",
+                section="PRIORS",
+            )
+        else:
+            warn(
+                "Bundle carries no hierarchical precision (written before this feature or without the hyper prior); "
+                "sampling starts from the base event prior until the first Wishart update. Regenerate the bundle with `spider locate-map`.",
+                section="PRIORS",
+            )
 
     # From here, behave as if Phase 1 just finished.
     phase = "phase2"

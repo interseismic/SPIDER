@@ -1592,7 +1592,8 @@ def _run_epoch(
                     raise KeyError("Hierarchical event hyperprior requires priors.event.hyper.update.every_epochs")
                 update_every = int(state.params["_hierarchical_update_every_epochs"])
                 update_every = max(1, update_every)
-                do_hier_update = (epoch_index % update_every) == 0
+                start_epoch = int(state.params.get("_hierarchical_update_start_epoch", 0) or 0)
+                do_hier_update = (epoch_index >= start_epoch) and ((epoch_index % update_every) == 0)
             except Exception:
                 do_hier_update = False
             if do_hier_update:
@@ -1612,9 +1613,20 @@ def _run_epoch(
                         dX_sorted = state.dX_src.detach().index_select(0, order_k)
                         counts_k = torch.bincount(cid64, minlength=K)
                         bounds_l = [0] + torch.cumsum(counts_k, dim=0).tolist()
+                        counts_l = counts_k.tolist()
+                        # Components with fewer than `min_cluster_events` events share the precision estimated
+                        # from all events (priors.event.hyper.update.min_cluster_events; 0 = every component
+                        # estimates its own).
+                        min_cluster = int(state.params.get("_hierarchical_min_cluster_events", 0) or 0)
+                        P0_pool = None
+                        if min_cluster > 0 and any(int(c) < min_cluster for c in counts_l):
+                            P0_pool = update_precision_hyperparameter(state.dX_src.detach(), nu, V_inv_common, mode="sample")
                         new_P0s = []
                         for k in range(K):
                             s_k, e_k = bounds_l[k], bounds_l[k + 1]
+                            if P0_pool is not None and int(counts_l[k]) < min_cluster:
+                                new_P0s.append(P0_pool)
+                                continue
                             if e_k <= s_k:
                                 new_P0s.append(V_inv_common * (1.0 / max(nu, 1e-12)))
                                 continue
@@ -1632,13 +1644,25 @@ def _run_epoch(
                         log_every = max(1, log_every)
                         if (epoch_index % log_every) == 0:
                             P0_all = state.event_precision_matrix
-                            P0_mean = P0_all.mean(dim=0) if isinstance(P0_all, torch.Tensor) and P0_all.ndim == 3 else P0_all
-                            Cov = torch.linalg.inv(P0_mean)
+                            tag = ""
+                            if isinstance(P0_all, torch.Tensor) and P0_all.ndim == 3:
+                                cc = getattr(state, "cluster_counts", None)
+                                if isinstance(cc, torch.Tensor) and int(cc.numel()) == int(P0_all.shape[0]) and int(P0_all.shape[0]) > 1:
+                                    # Report the largest component: the mean of per-cluster precisions is dominated
+                                    # by tiny components and misrepresents the scale most events feel.
+                                    k_max = int(torch.argmax(cc.flatten()).item())
+                                    P0_rep = P0_all[k_max]
+                                    tag = f" [largest of {int(P0_all.shape[0])} clusters, n_events={int(cc.flatten()[k_max].item())}]"
+                                else:
+                                    P0_rep = P0_all[0] if int(P0_all.shape[0]) == 1 else P0_all.mean(dim=0)
+                            else:
+                                P0_rep = P0_all
+                            Cov = torch.linalg.inv(P0_rep)
                             stds = torch.sqrt(torch.diag(Cov)).clamp_min(torch.tensor(0.0, device=Cov.device, dtype=Cov.dtype))
                             corr_zt = float(Cov[2, 3].item()) / (float(stds[2].item()) * float(stds[3].item()) + 1e-12)
                             state.params["_hierarchical_event_std_est"] = [float(stds[0].item()), float(stds[1].item()), float(stds[2].item()), float(stds[3].item())]
                             info(
-                                f"Hierarchical event prior updated: std≈[{stds[0]:.3g},{stds[1]:.3g},{stds[2]:.3g},{stds[3]:.3g}] corr_zt≈{corr_zt:.3g}",
+                                f"Hierarchical event prior updated: std≈[{stds[0]:.3g},{stds[1]:.3g},{stds[2]:.3g},{stds[3]:.3g}] corr_zt≈{corr_zt:.3g}{tag}",
                                 section="PRIORS",
                             )
                     except Exception:

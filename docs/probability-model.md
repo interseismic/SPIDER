@@ -247,7 +247,7 @@ $$
 \mathbf{C}=\operatorname{diag}(c_x^2,c_y^2,c_z^2,c_t^2)
 $$
 
-### Optional hierarchical event precision prior
+### Hierarchical event precision prior (recommended)
 
 $$
 \Delta \mathbf{z}_i \mid \mathbf{\Lambda}_{k(i)}
@@ -259,6 +259,17 @@ $$
 $$
 
 where $k(i)$ maps event $i$ to its cluster index, $\mathbf{V}_0$ is constructed from scale hyperparameters, and $\nu_0$ is the Wishart degrees of freedom.
+
+This is the preferred formulation. A fixed $\mathbf{S}$ has to serve two incompatible roles: the MAP stage
+wants it loose so the differential data, not the starting catalog, sets the fine structure; the sampling
+stages want it realistic, because the injected noise otherwise walks weakly constrained events away from
+the data (and, through the centroid prior, shifts every other event). With the Wishart hyperprior the
+fixed $\mathbf{S}$ only acts until `update.start_epoch`, after which $\mathbf{\Lambda}_k$ is re-estimated
+from the current shifts of the events in component $k$ (a Gibbs step every `update.every_epochs`), the
+learned precision is written to the Phase-2 bundle and adopted by `sample`, and components with fewer than
+`update.min_cluster_events` events use the pooled estimate. On real catalogs the learned shift scale is
+typically a few hundred metres, several times tighter than a safe fixed prior and tighter than one would
+dare set by hand.
 
 ## 5) Training objective (negative log posterior)
 
@@ -318,10 +329,19 @@ is always the correlated Gaussian.
 | $\nu_0$ | Wishart hyperprior degrees of freedom | `model.priors.event.hyper.params.df` |
 | $\mathbf{V}_0$ scale controls | Wishart scale hyperparameters | `model.priors.event.hyper.params.scale_std` |
 | Hyperprior update cadence | Epoch cadence for precision updates | `model.priors.event.hyper.update.every_epochs` |
+| Hyperprior warm-up / pooling | First update epoch; min component size for its own estimate | `model.priors.event.hyper.update.start_epoch`, `update.min_cluster_events` |
+
+Recommended settings: `df = 10`, `scale_std = [0.5, 0.5, 0.5, 0.2]`, `every_epochs = 10`, `start_epoch = 200`,
+`min_cluster_events = 100`, with a loose base `params.std` such as `[5, 5, 5, 2]`.
 
 Configuration constraints for the hierarchical prior (`model.priors.event.hyper`): `type` must be
 `wishart_precision`; `params.df` must be **> 3** (Wishart dof constraint for the 4-D event prior);
-`params.scale_std` (length 4) and `update.every_epochs` (>= 1) are required when `enabled = true`.
+`params.scale_std` (length 4) and `update.every_epochs` (>= 1) are required when `enabled = true`;
+`update.start_epoch` (>= 0, default 0) delays the first update so the scale is not estimated from ΔX≈0.
+`update.min_cluster_events` (>= 0, default 0) makes connected components smaller than this use the
+precision estimated from all events rather than their own Wishart posterior (recommended ~100 when the
+graph has small satellite components: their own estimate is prior-dominated and, once the component
+drifts, loosens further).
 Per-phase scheduling was removed: `model.priors.event.schedule` and
 `model.priors.event.hyper.update.active_phases` are rejected, and priors/hyper-updates are active
 in all phases when enabled. The priors block must live under `model.priors`; a top-level `priors`

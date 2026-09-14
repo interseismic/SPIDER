@@ -25,6 +25,12 @@ correction in seconds — the `time` column is *not* shifted), `X`, `Y` (local L
 `unc_x`, `unc_y`, `unc_z` (currently always `NaN`; uncertainties come from the posterior samples,
 not this file).
 
+When the post-Phase-1 filters leave events with no dtimes (or in components smaller than
+`model.filters.events.min_events_per_cluster`), those events are removed from the second MAP pass,
+the Phase-2 bundle and the samples, but stay in `_MAP.csv` at their last MAP location with an extra
+column `dropped_after_phase1` (`1` for dropped events, `0` otherwise). The column is only present
+when at least one event was dropped.
+
 Nothing in SPIDER reads `_MAP.csv` back — resume uses checkpoints or the Phase-2 bundle.
 
 ## Samples HDF5 (`samples_outfile`)
@@ -90,7 +96,10 @@ Sidecar tables next to the bundle: `phase2_bundle.pth.origins0.parquet`,
 
 Payload (`bundle_version = 3`; the loader accepts 1–3): `bundle_version`, `created_unix_s`,
 `origins0_parquet`, `dtimes_parquet`, `dX_src`, `residual_filter_applied` (bool; lets `sample`
-skip re-applying the residual filter to already-filtered dtimes). Older bundles may additionally carry `params`,
+skip re-applying the residual filter to already-filtered dtimes), and, when the hierarchical event prior
+is enabled, `event_precision_matrix` (the learned per-component precision at the end of Phase 1, adopted
+by `sample` so Phases 2–4 do not fall back to the base `params.std` until the first Wishart update).
+Older bundles may additionally carry `params`,
 `noise_log_scale`, `phase1_optimizer_state_dict`, `global_step_count`; current runs deliberately
 omit them and rebuild all runtime state from the current config.
 
