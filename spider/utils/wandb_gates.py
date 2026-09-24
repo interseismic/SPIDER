@@ -18,8 +18,9 @@ def want_wandb_group(params: Mapping[str, Any], group: str) -> bool:
       - params["_wandb_runtime_enabled"] set in `spider/cli.py` after calling init_wandb_if_enabled().
 
     Config-controlled categories:
-      - params["_wandb_diag_enabled"] materialized from `inference.diagnostics.wandb.enabled` (default true)
-      - params["_wandb_diag_groups"] materialized from `inference.diagnostics.wandb.groups`
+      - params["_wandb_diag_enabled"] materialized from `observability.diagnostics.wandb.enabled` (default true)
+      - params["_wandb_diag_groups"] materialized from `observability.diagnostics.wandb.groups`
+        (dict of {group: bool} or list of names) by spider/core/config_v2/legacy_bridge.py.
         Default is {"all"} for backward compatibility.
     """
     try:

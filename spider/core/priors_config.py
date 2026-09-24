@@ -249,6 +249,11 @@ def validate_and_materialize_priors(params: Dict[str, Any]) -> Dict[str, Any]:
             )
         else:
             centroid_std = None
+        # The centroid prior acts on each connected component's mean shift (weighted by its event
+        # count). A global single-mean form used to exist implicitly; it coupled components that share
+        # no data and was removed. Reject the transitional key so old configs fail loudly.
+        if "scope" in centroid:
+            raise _err("priors.centroid.scope", "removed; the centroid prior is always per connected component (delete this key)")
 
     # Noise prior removed (start fresh): fixed phase_unc only, no σ learning.
     if "noise" in priors:

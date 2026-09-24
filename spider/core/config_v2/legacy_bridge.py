@@ -173,7 +173,9 @@ def _materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     params["sampler_eps"] = float(sampler.get("eps", 1e-8))
     params["freeze_preconditioner_sampling"] = bool(sampler.get("freeze_preconditioner_sampling", False))
     params["sghmc_alpha"] = float(sampler.get("sghmc_alpha", 0.0) or 0.0)
-    params["sampler_preconditioning_include_gamma"] = bool(precond.get("include_gamma", True))
+    # Gamma correction drift of pSGLD (optim/sgld.py). Default off: both shipped example configs
+    # disable it and the term is a diagonal approximation that mainly adds cost.
+    params["sampler_preconditioning_include_gamma"] = bool(precond.get("include_gamma", False))
     params["_sampler_lr_per_phase"] = list(lrs)
     params["sampler_preconditioning_lrd_rank"] = int(lrd_rank)
     params["sampler_preconditioning_lrd_mode"] = str(lrd_mode)
@@ -603,9 +605,32 @@ def _materialize_block4(params: Dict[str, Any]) -> Dict[str, Any]:
     saf = _require_dict(inf.get("safety"), "inference.safety")
 
     pair_count_stats_enable = bool(dg.get("pair_count_stats_enable", False))
-    sgld_log_gnoise = bool(dg.get("sgld_log_gnoise", False))
-    sgld_log_temperature = bool(dg.get("sgld_log_temperature", False))
+    # `sgld_log_gnoise` / `sgld_log_temperature` are accepted for backward compatibility but have
+    # no consumer in the runtime, so they are intentionally not materialized.
     display_precond_every = int(dg.get("display_precond_every", 50))
+
+    # End-of-Phase-1 residual diagnostics (spider/diagnostics/spatial.py, pathcorr.py).
+    sp_cfg = dg.get("spatial", {})
+    if not isinstance(sp_cfg, dict):
+        sp_cfg = {}
+    spatial_diag_enable = bool(sp_cfg.get("enabled", False))
+    spatial_diag_min_obs = int(sp_cfg.get("min_obs", 5))
+    spatial_diag_permutations = int(sp_cfg.get("permutations", 199))
+    spatial_diag_seed = int(sp_cfg.get("seed", 0))
+
+    pc_cfg = dg.get("pathcorr", {})
+    if not isinstance(pc_cfg, dict):
+        pc_cfg = {}
+    pathcorr_enable = bool(pc_cfg.get("enabled", False))
+    pathcorr_min_obs_per_event = int(pc_cfg.get("min_obs_per_event", 3))
+    pathcorr_seed = int(pc_cfg.get("seed", 0))
+    pathcorr_max_pairs = int(pc_cfg.get("max_pairs", 50000))
+    pathcorr_bin_width = float(pc_cfg.get("bin_width", 0.5))
+    pathcorr_top_k_print = int(pc_cfg.get("top_k_print", 8))
+    pathcorr_max_pi = pc_cfg.get("max_pi", None)
+    pathcorr_max_pi = None if pathcorr_max_pi is None else float(pathcorr_max_pi)
+    pathcorr_outfile = pc_cfg.get("outfile", None)
+    pathcorr_outfile = None if pathcorr_outfile is None else str(pathcorr_outfile)
 
     wb_cfg = dg.get("wandb", {})
     wb_diag_enabled = True
@@ -650,10 +675,37 @@ def _materialize_block4(params: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("Invalid config at `inference.safety.max_abs_dX`: expected null or list[4]")
         max_abs_dX = [float(x) for x in max_abs_dX]
 
+    # Shift guard (locate._shift_guard_check). validate.py stores the parsed block under
+    # SafetyConfig.extras["shift_guard"]; accept the flat form too for callers that bypass validate.
+    saf_extras = saf.get("extras", {})
+    sg_cfg = saf_extras.get("shift_guard", None) if isinstance(saf_extras, dict) else None
+    if sg_cfg is None:
+        sg_cfg = saf.get("shift_guard", None)
+    if not isinstance(sg_cfg, dict):
+        sg_cfg = {}
+    shift_guard_enable = bool(sg_cfg.get("enabled", False))
+    shift_guard_factor = float(sg_cfg.get("factor", 5.0))
+    if (not math.isfinite(shift_guard_factor)) or shift_guard_factor <= 0.0:
+        raise ValueError("Invalid config at `inference.safety.shift_guard.factor`: must be a finite number > 0")
+
     params["pair_count_stats_enable"] = bool(pair_count_stats_enable)
-    params["sgld_log_gnoise"] = bool(sgld_log_gnoise)
-    params["sgld_log_temperature"] = bool(sgld_log_temperature)
     params["display_precond_every"] = int(display_precond_every)
+    params["spatial_diag_enable"] = bool(spatial_diag_enable)
+    params["spatial_diag_min_obs"] = int(spatial_diag_min_obs)
+    params["spatial_diag_permutations"] = int(spatial_diag_permutations)
+    params["spatial_diag_seed"] = int(spatial_diag_seed)
+    params["pathcorr_enable"] = bool(pathcorr_enable)
+    params["pathcorr_min_obs_per_event"] = int(pathcorr_min_obs_per_event)
+    params["pathcorr_seed"] = int(pathcorr_seed)
+    params["pathcorr_max_pairs"] = int(pathcorr_max_pairs)
+    params["pathcorr_bin_width"] = float(pathcorr_bin_width)
+    params["pathcorr_top_k_print"] = int(pathcorr_top_k_print)
+    # pathcorr.py uses `params.get("pathcorr_max_pi", <data quantile>)`: only set when configured so
+    # the data-driven default still applies. `pathcorr_outfile` may be None (falls back to
+    # `<catalog_outfile>_pathcorr_phase1.csv`).
+    if pathcorr_max_pi is not None:
+        params["pathcorr_max_pi"] = float(pathcorr_max_pi)
+    params["pathcorr_outfile"] = pathcorr_outfile
     params["_wandb_diag_enabled"] = bool(wb_diag_enabled)
     params["_wandb_diag_groups"] = sorted(list(wb_groups))
     params["ess_online_enabled"] = bool(ess_online_enabled)
@@ -677,6 +729,10 @@ def _materialize_block4(params: Dict[str, Any]) -> Dict[str, Any]:
     params["gauge_project_apply_momentum"] = bool(gp_apply_momentum)
     if max_abs_dX is not None:
         params["max_abs_dX"] = list(max_abs_dX)
+    # CLI flags --shift-guard / --shift-guard-factor are applied by spider/cli.py after this
+    # materialization and therefore take precedence when given.
+    params["shift_guard_enable"] = bool(shift_guard_enable)
+    params["shift_guard_factor"] = float(shift_guard_factor)
     return params
 
 

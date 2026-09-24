@@ -1,0 +1,316 @@
+{
+    "io": {
+        "dtime_file": "./dtimes_with_noise_from_truth.csv",
+        "station_file": "./station.csv",
+        "catalog_infile": "./events_from_prior.csv",
+        "catalog_outfile": "./SPIDER_out.cat",
+        "samples_outfile": "./SPIDER_samples.h5",
+        "checkpoint_dir": "./checkpoints/",
+        "checkpoint_interval": 1000,
+        "save_every_n": 10,
+        "write_samples": true
+    },
+    "model": {
+        "model_file": "./model_state_dict.pt",
+        "eikonet": {
+            "n_hidden": 64,
+            "n_blocks": 4,
+            "n_fourier": 4,
+            "phase_emb_dim": 6,
+            "use_fourier": true,
+            "t2_log_scale": 0.1
+        },
+        "domain": {
+            "lon_min": -119.6127,
+            "lat_min": 33.8856,
+            "z_min": -5.0,
+            "z_max": 80.0,
+            "scale": 500.0
+        },
+        "priors": {
+            "event": {
+                "enabled": true,
+                "type": "gaussian",
+                "params": {
+                    "std": [
+                        5.0,
+                        5.0,
+                        5.0,
+                        2.0
+                    ]
+                },
+                "hyper": {
+                    "enabled": true,
+                    "type": "wishart_precision",
+                    "params": {
+                        "df": 10.0,
+                        "scale_std": [
+                            0.5,
+                            0.5,
+                            0.5,
+                            0.2
+                        ]
+                    },
+                    "update": {
+                        "every_epochs": 10,
+                        "start_epoch": 200,
+                        "min_cluster_events": 100
+                    }
+                }
+            },
+            "centroid": {
+                "enabled": true,
+                "type": "gaussian",
+                "params": {
+                    "std": [
+                        0.01,
+                        0.01,
+                        0.01,
+                        0.01
+                    ]
+                }
+            }
+        },
+        "likelihoods": {
+            "locate_map": {
+                "type": "laplace",
+                "phase_unc": [
+                    0.02,
+                    0.03
+                ]
+            },
+            "sample": {
+                "type": "correlated_gaussian",
+                "phase_unc": [
+                    0.02,
+                    0.03
+                ],
+                "shared_event_re": {
+                    "enabled": true,
+                    "model": {
+                        "group_by": "station_phase",
+                        "tau_s": [
+                            0.033,
+                            0.06
+                        ],
+                        "cluster": {
+                            "mode": "none",
+                            "k": 1
+                        }
+                    },
+                    "limits": {
+                        "max_nodes": 25000,
+                        "max_rows": 1500000
+                    },
+                    "fallback": {
+                        "to_diag": true,
+                        "abort_on_pcg_fallback": false
+                    },
+                    "numerics": {
+                        "jitter0": 1e-08,
+                        "jitter_max": 0.001
+                    },
+                    "solver": {
+                        "kind": "pcg",
+                        "max_iters": 100,
+                        "min_iters": 2,
+                        "tol": 0.0003,
+                        "batched": true,
+                        "node_bin_edges": [
+                            4096,
+                            16384,
+                            25000
+                        ],
+                        "warm_start": false,
+                        "cache_max_entries": 32,
+                        "profile_micro_steps": true,
+                        "merge_sparse_node_bins": true,
+                        "min_groups_per_node_bin": 32,
+                        "max_node_bins_per_node": 4,
+                        "precompute": {
+                            "enabled": true,
+                            "device": "gpu"
+                        }
+                    },
+                    "edge_weights": {
+                        "mode": "distance_power",
+                        "ell_km": 1.0,
+                        "power": 0.25,
+                        "scale_km": 40.0,
+                        "global_scale": 1.0,
+                        "normalize": true,
+                        "eps_km": 0.001
+                    },
+                    "autotune": {
+                        "enabled": true,
+                        "observe_epochs": 1,
+                        "latest_epoch": 2,
+                        "min_groups": 128,
+                        "max_node_bins": 8,
+                        "min_groups_per_node_bin": 24,
+                        "min_node_bin": 512,
+                        "min_gain": 0.08,
+                        "raise_nodes_cap": true,
+                        "nodes_cap_max": 65536
+                    },
+                    "logging": {
+                        "quiet": true,
+                        "stats_log_every_epochs": 0
+                    }
+                }
+            }
+        },
+        "filters": {
+            "dtimes": {
+                "remove_duplicates": true,
+                "max_abs_input_dt": 99999,
+                "dtime_thin_frac": 1.0,
+                "flip_dt_sign": false,
+                "cc_min": 0.0
+            },
+            "events": {
+                "min_dtimes": 1,
+                "min_unique_phase_per_event": 8,
+                "min_dtimes_per_pair": 1,
+                "min_event_degree": 3,
+                "min_events_per_cluster": 3,
+                "max_pair_station_ratio": 1.0,
+                "ratio_filter_phase": "before",
+                "linearization_error": {
+                    "enabled": true,
+                    "phase": "after_phase1",
+                    "max_ratio": 0.05,
+                    "batch_size": 50000,
+                    "sample_size": 200000,
+                    "log_every_batches": 25
+                }
+            },
+            "residual": {
+                "enabled": true,
+                "method": "abs",
+                "abs_max": 0.15,
+                "phase": "after_phase1"
+            }
+        }
+    },
+    "inference": {
+        "sampler": {
+            "backend": "sghmc",
+            "epochs_per_phase": [
+                10000,
+                200,
+                1000,
+                100000
+            ],
+            "lr": [
+                0.001,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "temperature": 1.0,
+            "eps": 1e-05,
+            "sghmc_alpha": 0.1,
+            "preconditioning": {
+                "enabled": true,
+                "type": "rmsprop",
+                "include_gamma": false
+            },
+            "reparameterization": {
+                "enabled": true,
+                "spatial_scale": 1.0,
+                "dt_scale": 0.3
+            },
+            "beta": 0.99,
+            "freeze_preconditioner_sampling": false,
+            "lr_schedule": {
+                "phase1": {
+                    "type": "cosine",
+                    "eta_min": 1e-05
+                }
+            },
+            "phase1_two_pass": {
+                "enabled": true,
+                "epochs": null,
+                "warm_start": true
+            }
+        },
+        "batching": {
+            "standard": {
+                "warmup": 1000000,
+                "sgld": 1000000,
+                "shuffle": false
+            },
+            "event_batches": {
+                "enabled": false,
+                "events_per_batch": 50,
+                "max_edges_per_batch": 200000,
+                "bucket_reorder_all": false,
+                "bucket_reuse_epochs": 1
+            }
+        },
+        "safety": {
+            "max_abs_dX": [
+                10.0,
+                10.0,
+                10.0,
+                3.0
+            ]
+        },
+        "runtime": {
+            "cuda_empty_cache_every": 0,
+            "reset_batch_numbers": true,
+            "clear_samples_on_reset": true,
+            "min_samples_to_save": 10,
+            "verbose": true,
+            "cluster_events": false,
+            "gauge_projection": {
+                "enabled": false,
+                "mode": "cluster",
+                "dims": [
+                    0,
+                    1,
+                    2,
+                    3
+                ],
+                "apply_noise": true,
+                "apply_momentum": true
+            }
+        }
+    },
+    "observability": {
+        "wandb": {
+            "enabled": false,
+            "project_name": "spider_paper",
+            "run_name": "ridgecrest_syn_sghmc"
+        },
+        "diagnostics": {
+            "pair_count_stats_enable": true,
+            "sgld_log_gnoise": false,
+            "sgld_log_temperature": false,
+            "display_precond_every": 50,
+            "profile_shared_event_re": false,
+            "wandb": {
+                "enabled": true,
+                "groups": {
+                    "core": true,
+                    "noise": true,
+                    "ess_online": true,
+                    "sampler": true,
+                    "precond": true,
+                    "fixed_eval": false,
+                    "resid_rms": true,
+                    "priors": true,
+                    "latent_field": false,
+                    "corr_error": true
+                }
+            },
+            "truth_catalog": {
+                "path": "./true_cat_from_yifan.csv",
+                "time_source": "map",
+                "time_ref": "min",
+                "require_all": false
+            }
+        }
+    }
+}

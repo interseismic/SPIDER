@@ -10,7 +10,7 @@ It then joins these into a single table (no pandas required) and prints summarie
 
 Example:
   python -m spider.analysis.diagnose_sticky_events \\
-    --params yifan_redo/SPIDER_yifan.json \\
+    --params example/SPIDER_example.json \\
     --burn-in 0 --thin 1 --top 50
 """
 

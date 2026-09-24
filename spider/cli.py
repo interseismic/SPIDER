@@ -27,6 +27,7 @@ from spider.core.config_v2 import ConfigError as ConfigV2Error
 from spider.core.config_v2 import load_config as load_config_v2
 from spider.core.config_v2 import load_config_file as load_config_file_v2
 from spider.core.config_v2 import to_legacy_runtime_params
+from spider.core.config_v2.validate import collect_unknown_key_warnings
 
 
 # Standardized stdout helper
@@ -87,6 +88,9 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
 		return 1
 
 	info(f"Config v2 validation OK: {args.params}", section="CFGv2")
+	# Non-fatal: unknown keys in pass-through blocks (silently ignored by the runtime).
+	for w in collect_unknown_key_warnings(_load_params_json(args.params)):
+		warn(str(w), section="CFGv2")
 	if resolved.defaults_applied:
 		for d in resolved.defaults_applied:
 			info(f"default applied: {d}", section="CFGv2")
@@ -216,28 +220,72 @@ def _device_from_id(device_id: int) -> torch.device:
 	return torch.device("cpu")
 
 
-def _parse_device_entry(x) -> int:
+DEVICE_HELP = "Compute device: CUDA id (e.g. 0), or 'cpu' / -1 for CPU"
+
+
+def _parse_device_spec(x) -> int:
 	"""
-	Parse a device entry from config into our canonical int representation:
+	Parse a device specifier (CLI flag or config entry) into the canonical int representation.
+
+	Canonical form:
 	  - CUDA device ids: non-negative ints
-	  - CPU: -1 (accepts -1 or 'cpu' or 'cuda:N' or numeric strings)
+	  - CPU: -1
+
+	Accepted inputs (case-insensitive for strings):
+	  - int or numeric string (e.g. 0, "3", "-1"); any negative id means CPU
+	  - "cpu"
+	  - "cuda:<int>" (e.g. "cuda:1")
 	"""
 	if x is None:
-		raise ValueError("Device entry is null")
+		raise ValueError("Device specifier is null (expected a CUDA id, 'cpu' or -1)")
+	if isinstance(x, bool):
+		raise ValueError(f"Invalid device specifier {x!r} (expected a CUDA id, 'cpu' or -1)")
 	if isinstance(x, int):
 		return int(x)
 	s = str(x).strip().lower()
+	if s == "":
+		raise ValueError("Empty device specifier (expected a CUDA id, 'cpu' or -1)")
 	if s == "cpu":
 		return -1
 	if s.startswith("cuda:"):
 		s2 = s.split("cuda:", 1)[1].strip()
 		if not s2.isdigit():
-			raise ValueError(f"Invalid device specifier {x!r} (expected 'cuda:<int>')")
+			raise ValueError(f"Invalid device specifier {x!r} (expected 'cuda:<int>', e.g. 'cuda:0')")
 		return int(s2)
-	# Accept numeric strings
+	if s == "cuda":
+		raise ValueError("Invalid device specifier 'cuda' (specify the id, e.g. 0 or 'cuda:0')")
 	if s.lstrip("-").isdigit():
 		return int(s)
-	raise ValueError(f"Invalid device specifier {x!r} (supported: int, -1/'cpu', 'cuda:<int>')")
+	raise ValueError(
+		f"Invalid device specifier {x!r}: expected a CUDA id (e.g. 0), 'cuda:<int>', 'cpu' or -1"
+	)
+
+
+# Backward-compatible name used for config `inference.compute.devices` entries.
+_parse_device_entry = _parse_device_spec
+
+
+def device_arg(s: str) -> int:
+	"""argparse `type=` for `--device`: returns canonical int id (CPU is -1)."""
+	try:
+		return _parse_device_spec(s)
+	except ValueError as e:
+		raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def devices_arg(s: str) -> list[int]:
+	"""argparse `type=` for `--devices`: comma-separated list of device specifiers -> list of canonical ids."""
+	parts = [p.strip() for p in str(s).split(",")]
+	parts = [p for p in parts if p != ""]
+	if not parts:
+		raise argparse.ArgumentTypeError("--devices must be a comma-separated list, e.g. '0,1' or 'cpu'")
+	out: list[int] = []
+	for p in parts:
+		try:
+			out.append(_parse_device_spec(p))
+		except ValueError as e:
+			raise argparse.ArgumentTypeError(f"in --devices {s!r}: {e}") from None
+	return out
 
 
 def _load_model(params: dict, device: int | str) -> torch.nn.Module:
@@ -339,8 +387,8 @@ def _cmd_locate_full(args: argparse.Namespace) -> int:
 	_apply_torch_runtime_settings(params)
 
 	if args.device is None:
-		raise ValueError("`spider locate-full` requires --device <CUDA_ID> (CLI-only device selection).")
-	device_id = int(args.device)
+		raise ValueError("`spider locate-full` requires --device <CUDA_ID|cpu> (CLI-only device selection).")
+	device_id = _parse_device_spec(args.device)
 	params["devices"] = [device_id]
 
 	# Resolve to an actual torch.device
@@ -392,8 +440,8 @@ def _cmd_locate_map(args: argparse.Namespace) -> int:
 	_apply_torch_runtime_settings(params)
 
 	if args.device is None:
-		raise ValueError("`spider locate-map` requires --device <CUDA_ID> (CLI-only device selection).")
-	device_id = int(args.device)
+		raise ValueError("`spider locate-map` requires --device <CUDA_ID|cpu> (CLI-only device selection).")
+	device_id = _parse_device_spec(args.device)
 	params["devices"] = [device_id]
 
 	device = _device_from_id(int(device_id))
@@ -451,8 +499,8 @@ def _cmd_sample(args: argparse.Namespace) -> int:
 	_apply_torch_runtime_settings(params)
 
 	if args.device is None:
-		raise ValueError("`spider sample` requires --device <CUDA_ID> (CLI-only device selection).")
-	device_id = int(args.device)
+		raise ValueError("`spider sample` requires --device <CUDA_ID|cpu> (CLI-only device selection).")
+	device_id = _parse_device_spec(args.device)
 	params["devices"] = [device_id]
 
 	device = _device_from_id(int(device_id))
@@ -524,8 +572,8 @@ def _cmd_analyze_resid(args: argparse.Namespace) -> int:
 	_apply_torch_runtime_settings(params)
 
 	if args.device is None:
-		raise ValueError("`spider analyze-resid` requires --device <CUDA_ID> (CLI-only device selection).")
-	device_id = int(args.device)
+		raise ValueError("`spider analyze-resid` requires --device <CUDA_ID|cpu> (CLI-only device selection).")
+	device_id = _parse_device_spec(args.device)
 	params["devices"] = [device_id]
 	device = _device_from_id(int(device_id))
 
@@ -550,7 +598,6 @@ def _cmd_analyze_resid(args: argparse.Namespace) -> int:
 		bundle_path=str(bundle_path),
 		model=model,
 		device=device,
-		plot_variograms=bool(getattr(args, "plot_variograms", True)),
 		plot_dir=(str(getattr(args, "plot_dir")) if getattr(args, "plot_dir", None) is not None else None),
 		use_latest_checkpoint=bool(getattr(args, "use_latest_checkpoint", False)),
 	)
@@ -564,14 +611,19 @@ def _cmd_sample_multi(args: argparse.Namespace) -> int:
 	with open(args.params, "r") as f:
 		base_params = json.load(f)
 
-	# Devices must be provided explicitly on CLI.
-	devs = None
-	if getattr(args, "devices", None):
-		devs = [_parse_device_entry(x.strip()) for x in str(args.devices).split(",") if str(x).strip()]
+	# Devices must be provided explicitly on CLI. argparse already parsed `--devices` into a list of
+	# canonical ids (CPU = -1); also accept a raw comma-separated string for programmatic callers.
+	devs_raw = getattr(args, "devices", None)
+	if isinstance(devs_raw, (list, tuple)):
+		devs = [int(_parse_device_spec(x)) for x in devs_raw]
+	elif devs_raw:
+		devs = list(devices_arg(str(devs_raw)))
 	else:
 		devs = []
 	if not devs:
-		raise ValueError("`spider sample-multi` requires --devices <id0,id1,...> (CLI-only device selection).")
+		raise ValueError(
+			"`spider sample-multi` requires --devices <id0,id1,...> (e.g. '0,1' or 'cpu'; CLI-only device selection)."
+		)
 
 	bundle_path = str(getattr(args, "bundle", "") or "").strip()
 	if not bundle_path:
@@ -719,13 +771,9 @@ def _cmd_synth(args: argparse.Namespace) -> int:
 	params = _validate_params_synth(_load_params_json(args.params))
 	_apply_torch_runtime_settings(params)
 	if args.device is None:
-		raise ValueError("`spider synth` requires --device <CUDA_ID> (CLI-only device selection).")
-	device_id = int(args.device)
-	if torch.cuda.is_available():
-		device = torch.device(f"cuda:{device_id}")
-	else:
-		warn("CUDA is not available; running on CPU.", section="RUN")
-		device = torch.device("cpu")
+		raise ValueError("`spider synth` requires --device <CUDA_ID|cpu> (CLI-only device selection).")
+	device_id = _parse_device_spec(args.device)
+	device = _device_from_id(int(device_id))
 
 	# Load model early (needed when apply_filters=True calls prepare_input_dfs(..., model=model)).
 	model = _load_model(params, device)
@@ -1087,6 +1135,176 @@ def _cmd_synth(args: argparse.Namespace) -> int:
 	return 0
 
 
+def _resolve_io_path(raw_params: dict, key: str) -> Optional[str]:
+	"""Read an io.<key> (nested config) or flat <key> (materialized params) value, or None."""
+	if not isinstance(raw_params, dict):
+		return None
+	io_cfg = raw_params.get("io", None)
+	if isinstance(io_cfg, dict) and io_cfg.get(key, None):
+		return str(io_cfg[key])
+	if raw_params.get(key, None):
+		return str(raw_params[key])
+	return None
+
+
+def _cmd_summarize(args: argparse.Namespace) -> int:
+	"""
+	Summarize posterior samples (io.samples_outfile) into a per-event catalog with uncertainties and ESS.
+
+	Pipeline: read_all_samples -> compute_cat_dd_and_xyz -> compute_ess_summary -> CSV.
+	"""
+	from spider.io import read_all_samples
+	from spider.analysis import compute_cat_dd_and_xyz, compute_ess_summary
+
+	raw_params = _load_params_json(args.params)
+	samples_path = _resolve_io_path(raw_params, "samples_outfile")
+	if not samples_path:
+		warn(f"Config {args.params} has no io.samples_outfile; nothing to summarize.", section="SUMMARY")
+		return 1
+
+	burn_in_raw = getattr(args, "burn_in", None)
+	thin_raw = getattr(args, "thin", None)
+	burn_in = int(burn_in_raw) if burn_in_raw is not None else 0
+	thin = int(thin_raw) if thin_raw is not None else 1
+	if burn_in < 0:
+		warn(f"--burn-in must be >= 0 (got {burn_in}).", section="SUMMARY")
+		return 2
+	if thin < 1:
+		warn(f"--thin must be >= 1 (got {thin}).", section="SUMMARY")
+		return 2
+	chain_mode = str(getattr(args, "chain_mode", "auto") or "auto").strip().lower()
+
+	device_id = _parse_device_spec(getattr(args, "device", "cpu"))
+	device = _device_from_id(int(device_id))
+	dev_str = str(device)
+
+	# Output path: default <catalog_outfile>_posterior.csv (mirrors the <catalog_outfile>_MAP.csv convention).
+	out_path = getattr(args, "out", None)
+	if not out_path:
+		cat_out = _resolve_io_path(raw_params, "catalog_outfile")
+		if not cat_out:
+			warn("Pass --out PATH: config has no io.catalog_outfile to derive the default output name from.", section="SUMMARY")
+			return 1
+		out_path = f"{cat_out}_posterior.csv"
+	out_path = str(out_path)
+
+	if not os.path.exists(samples_path):
+		warn(
+			f"Samples store not found: {samples_path}. Run `spider sample <params> --device ...` first "
+			"(or `spider locate-map` followed by `spider sample`).",
+			section="SUMMARY",
+		)
+		return 1
+
+	info(f"Reading samples from {samples_path}", section="SUMMARY")
+	# Thinning is applied together with burn-in in compute_cat_dd_and_xyz, so --burn-in counts raw
+	# samples per event (read-time thinning restarts per batch and would make burn-in ambiguous).
+	samples = read_all_samples({"samples_outfile": samples_path}, backend="numpy", thin=1)
+	if not samples or "X" not in samples:
+		warn(
+			f"No posterior samples found in {samples_path} (read_all_samples returned nothing). "
+			"Run `spider sample <params> --device ...` to generate samples.",
+			section="SUMMARY",
+		)
+		return 1
+
+	n_events, n_samples_total = (int(v) for v in np.asarray(samples["X"]).shape[:2])
+	map_only = ("_batch_names" not in samples) and (n_samples_total == 1)
+	if map_only:
+		warn(
+			f"Samples store {samples_path} contains only Phase-1 MAP locations (no batch_* sample groups). "
+			"Nothing to summarize: run `spider sample <params> --device ...` first. "
+			"The MAP catalog is already written as <catalog_outfile>_MAP.csv.",
+			section="SUMMARY",
+		)
+		return 1
+	if burn_in >= n_samples_total:
+		warn(
+			f"--burn-in {burn_in} >= samples per event ({n_samples_total}); nothing left to summarize.",
+			section="SUMMARY",
+		)
+		return 2
+
+	if chain_mode == "single":
+		samples.pop("_sample_chain_idx", None)
+	n_chains_in = 0
+	try:
+		sci = samples.get("_sample_chain_idx", None)
+		if sci is not None:
+			n_chains_in = int(len({int(c) for c in np.asarray(sci).reshape(-1).tolist() if int(c) >= 0}))
+	except Exception:
+		n_chains_in = 0
+
+	n_kept = (n_samples_total - burn_in + thin - 1) // thin
+	if n_kept < 2:
+		warn(
+			f"Only {n_kept} sample(s) per event left after burn_in={burn_in} thin={thin} "
+			f"(of {n_samples_total}); need at least 2 to compute spreads and ESS.",
+			section="SUMMARY",
+		)
+		return 2
+	info(
+		f"events={n_events} samples/event={n_samples_total} burn_in={burn_in} thin={thin} kept={n_kept} "
+		f"device={dev_str} chain_mode={chain_mode}" + (f" chains={n_chains_in}" if n_chains_in else ""),
+		section="SUMMARY",
+	)
+
+	summary = compute_cat_dd_and_xyz(
+		samples,
+		burn_in=burn_in,
+		thin=thin,
+		include=["X", "Y", "Z", "T", "cat_dd"],
+		uncertainty_metrics=["std", "sigma"],
+		device=dev_str,
+		show_progress=False,
+	)
+	cat_dd = summary.cat_dd
+	if cat_dd is None or summary.T is None:
+		warn("Summary computation returned no catalog.", section="SUMMARY")
+		return 1
+
+	# Time offset: cat_dd has no T columns, so add posterior mean/std of delta_t (seconds) here.
+	dt_arr = np.asarray(samples["delta_t"])[:, burn_in::thin]
+	cat_dd["delta_t"] = dt_arr.mean(axis=1).astype(np.float32)
+	cat_dd["std_t"] = np.std(summary.T, axis=1).astype(np.float32)
+
+	ess = compute_ess_summary(summary, device=dev_str, show_progress=False)
+	cat_dd["ess_x"] = np.asarray(ess["ess_per_event_x"], dtype=np.float32)
+	cat_dd["ess_y"] = np.asarray(ess["ess_per_event_y"], dtype=np.float32)
+	cat_dd["ess_z"] = np.asarray(ess["ess_per_event_z"], dtype=np.float32)
+	cat_dd["ess_t"] = np.asarray(ess["ess_per_event_t"], dtype=np.float32)
+	cat_dd["ess_xyzt_min"] = np.asarray(ess["ess_per_event_xyzt_min"], dtype=np.float32)
+	cat_dd["n_samples"] = int(ess["n_samples"])
+
+	# Compact report
+	def _q(col: str, q: float) -> float:
+		return float(np.nanpercentile(np.asarray(cat_dd[col], dtype=np.float64), q))
+
+	info(f"posterior std (median / p90): "
+		f"x={_q('std_x', 50):.4f}/{_q('std_x', 90):.4f} km  "
+		f"y={_q('std_y', 50):.4f}/{_q('std_y', 90):.4f} km  "
+		f"z={_q('std_z', 50):.4f}/{_q('std_z', 90):.4f} km  "
+		f"t={_q('std_t', 50):.4f}/{_q('std_t', 90):.4f} s",
+		section="SUMMARY")
+	info(
+		f"ESS: chain_mode={ess['chain_mode']} n_chains={ess['n_chains']} n_samples={ess['n_samples']} "
+		f"median_ess_xyzt_min={ess['median_ess_xyzt_min']:.1f} min_ess_xyzt_min={ess['min_ess_xyzt_min']:.1f} "
+		f"median_ess_x={ess['median_ess_x']:.1f} median_ess_y={ess['median_ess_y']:.1f} "
+		f"median_ess_z={ess['median_ess_z']:.1f} median_ess_t={ess['median_ess_t']:.1f}",
+		section="SUMMARY",
+	)
+	scalar_keys = sorted(k for k, v in ess.items() if isinstance(v, (int, float, str)))
+	info("ESS summary keys: " + ", ".join(scalar_keys), section="SUMMARY")
+
+	out_df = cat_dd.drop(columns=["_event_row"], errors="ignore")
+	out_dir = os.path.dirname(os.path.abspath(out_path))
+	if out_dir:
+		os.makedirs(out_dir, exist_ok=True)
+	out_df.to_csv(out_path, index=False)
+	info(f"Wrote posterior catalog -> {out_path} (rows={out_df.shape[0]}, cols={out_df.shape[1]})", section="SUMMARY")
+	return 0
+
+
 def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(prog=prog or "spider", description="SPIDER command-line interface")
 	subparsers = parser.add_subparsers(dest="command", metavar="command")
@@ -1094,7 +1312,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	# locate-map subcommand
 	p_map = subparsers.add_parser("locate-map", help="Run Phase 1 (MAP) only and dump a Phase-2 bundle")
 	p_map.add_argument("params", help="Path to parameter JSON file")
-	p_map.add_argument("--device", type=int, required=True, help="CUDA device id to use (required)")
+	p_map.add_argument("--device", type=device_arg, required=True, metavar="DEV", help=DEVICE_HELP + " (required)")
 	p_map.add_argument("--bundle-out", type=str, default=None, help="Output path for Phase-2 bundle (default: <checkpoint_dir>/phase2_bundle.pth)")
 	p_map.add_argument("--shift-guard", action="store_true", help="Abort if any event moves > factor × prior stds; prints offending observations")
 	p_map.add_argument("--shift-guard-factor", type=float, default=None, help="Factor relative to prior_event_std; default 5.0")
@@ -1103,7 +1321,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	# sample subcommand
 	p_samp = subparsers.add_parser("sample", help="Run Phase 2–4 (sampling) starting from a Phase-2 bundle")
 	p_samp.add_argument("params", help="Path to parameter JSON file")
-	p_samp.add_argument("--device", type=int, required=True, help="CUDA device id to use (required)")
+	p_samp.add_argument("--device", type=device_arg, required=True, metavar="DEV", help=DEVICE_HELP + " (required)")
 	p_samp.add_argument("--bundle", type=str, default=None, help="Path to Phase-2 bundle (default: <checkpoint_dir>/phase2_bundle.pth)")
 	p_samp.add_argument("--shift-guard", action="store_true", help="Abort if any event moves > factor × prior stds; prints offending observations")
 	p_samp.add_argument("--shift-guard-factor", type=float, default=None, help="Factor relative to prior_event_std; default 5.0")
@@ -1114,7 +1332,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	p_sm.add_argument("params", help="Path to parameter JSON file")
 	p_sm.add_argument("--bundle", type=str, default=None, help="Path to Phase-2 bundle (default: <checkpoint_dir>/phase2_bundle.pth)")
 	p_sm.add_argument("--chains", type=int, default=None, help="Number of chains to run (default: number of devices)")
-	p_sm.add_argument("--devices", type=str, required=True, help="Comma-separated CUDA device ids (required)")
+	p_sm.add_argument("--devices", type=devices_arg, required=True, metavar="DEV[,DEV...]", help="Comma-separated devices, one chain per entry, e.g. '0,1,2' or 'cpu' (CUDA ids, 'cpu' or -1; required)")
 	p_sm.add_argument("--seed0", type=int, default=0, help="Base seed for chain RNG offsets (default: 0)")
 	p_sm.add_argument("--out-dir", type=str, default=None, help="Directory to write chain param files (default: params directory)")
 	p_sm.add_argument("--dry-run", action="store_true", help="Print what would run, but do not start processes")
@@ -1124,30 +1342,20 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	# analyze-resid subcommand
 	p_ar = subparsers.add_parser("analyze-resid", help="Run residual diagnostics from an existing Phase-2 bundle (no MAP rerun)")
 	p_ar.add_argument("params", help="Path to parameters JSON file")
-	p_ar.add_argument("--device", type=int, required=True, help="CUDA device id to use (required)")
+	p_ar.add_argument("--device", type=device_arg, required=True, metavar="DEV", help=DEVICE_HELP + " (required)")
 	p_ar.add_argument("--bundle", type=str, default=None, help="Path to Phase-2 bundle (.pth). Default: checkpoint_dir/phase2_bundle.pth")
 	p_ar.add_argument(
 		"--use-latest-checkpoint",
 		action="store_true",
 		help="If set, load the most recent checkpoint from checkpoint_dir and evaluate diagnostics at that state (e.g., after `spider sample`).",
 	)
-	g_plot = p_ar.add_mutually_exclusive_group()
-	g_plot.add_argument("--plot-variograms", dest="plot_variograms", action="store_true", help="Write variogram PNG plots (default)")
-	g_plot.add_argument("--no-plot-variograms", dest="plot_variograms", action="store_false", help="Disable variogram plotting")
-	p_ar.set_defaults(plot_variograms=True)
-	p_ar.add_argument("--plot-dir", type=str, default=None, help="Directory for variogram PNGs (default: bundle directory)")
-
+	p_ar.add_argument("--plot-dir", type=str, default=None, help="Directory for diagnostic plots (residual QQ/histograms, correlation PNGs; default: bundle directory)")
 	p_ar.set_defaults(func=_cmd_analyze_resid)
 
 	# locate subcommand
 	p_locate = subparsers.add_parser("locate", help="Alias for `sample` (Phase 2–4). Use `locate-map` for Phase 1.")
 	p_locate.add_argument("params", help="Path to parameter JSON file")
-	p_locate.add_argument(
-		"--device",
-		type=int,
-		required=True,
-		help="CUDA device id to use (required)",
-	)
+	p_locate.add_argument("--device", type=device_arg, required=True, metavar="DEV", help=DEVICE_HELP + " (required)")
 	p_locate.add_argument("--shift-guard", action="store_true", help="Abort if any event moves > factor × prior stds; prints offending observations")
 	p_locate.add_argument("--shift-guard-factor", type=float, default=None, help="Factor relative to prior_event_std; default 5.0")
 	p_locate.set_defaults(func=_cmd_locate)
@@ -1157,7 +1365,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	p_multi.add_argument("params", help="Path to parameter JSON file")
 	p_multi.add_argument("--bundle", type=str, default=None, help="Path to Phase-2 bundle (default: <checkpoint_dir>/phase2_bundle.pth)")
 	p_multi.add_argument("--chains", type=int, default=None, help="Number of chains to run (default: number of devices)")
-	p_multi.add_argument("--devices", type=str, required=True, help="Comma-separated CUDA device ids (required)")
+	p_multi.add_argument("--devices", type=devices_arg, required=True, metavar="DEV[,DEV...]", help="Comma-separated devices, one chain per entry, e.g. '0,1,2' or 'cpu' (CUDA ids, 'cpu' or -1; required)")
 	p_multi.add_argument("--seed0", type=int, default=0, help="Base seed for chain RNG offsets (default: 0)")
 	p_multi.add_argument("--out-dir", type=str, default=None, help="Directory to write chain param files (default: params directory)")
 	p_multi.add_argument("--dry-run", action="store_true", help="Print what would run, but do not start processes")
@@ -1167,7 +1375,7 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	# locate-full subcommand (kept for one-shot legacy flows)
 	p_full = subparsers.add_parser("locate-full", help="Run full pipeline (Phase 1 + Phase 2–4) [legacy]")
 	p_full.add_argument("params", help="Path to parameter JSON file")
-	p_full.add_argument("--device", type=int, required=True, help="CUDA device id to use (required)")
+	p_full.add_argument("--device", type=device_arg, required=True, metavar="DEV", help=DEVICE_HELP + " (required)")
 	p_full.add_argument("--shift-guard", action="store_true", help="Abort if any event moves > factor × prior stds; prints offending observations")
 	p_full.add_argument("--shift-guard-factor", type=float, default=None, help="Factor relative to prior_event_std; default 5.0")
 	p_full.set_defaults(func=_cmd_locate_full)
@@ -1175,8 +1383,28 @@ def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
 	# synth subcommand
 	p_synth = subparsers.add_parser("synth", help="Generate a synthetic differential time dataset matching the current configuration")
 	p_synth.add_argument("params", help="Path to parameter JSON file")
-	p_synth.add_argument("--device", type=int, required=True, help="CUDA device id to use (required)")
+	p_synth.add_argument("--device", type=device_arg, required=True, metavar="DEV", help=DEVICE_HELP + " (required)")
 	p_synth.set_defaults(func=_cmd_synth)
+
+	# summarize subcommand (post-processing: samples -> posterior catalog CSV)
+	p_sum = subparsers.add_parser(
+		"summarize",
+		help="Summarize posterior samples (io.samples_outfile) into a per-event catalog CSV with uncertainties and ESS",
+	)
+	p_sum.add_argument("params", help="Path to parameter JSON file (only io.samples_outfile / io.catalog_outfile are read)")
+	p_sum.add_argument("--burn-in", dest="burn_in", type=int, default=0, help="Samples to discard per event before summarizing, counted in raw (unthinned) samples (default: 0)")
+	p_sum.add_argument("--thin", type=int, default=1, help="Keep every K-th sample after burn-in (default: 1)")
+	p_sum.add_argument("--out", type=str, default=None, help="Output CSV path (default: <io.catalog_outfile>_posterior.csv)")
+	p_sum.add_argument("--device", type=device_arg, default="cpu", metavar="DEV", help=DEVICE_HELP + " for the summary/ESS computation (default: cpu)")
+	p_sum.add_argument(
+		"--chain-mode",
+		dest="chain_mode",
+		type=str,
+		default="auto",
+		choices=["auto", "single"],
+		help="ESS chain handling: 'auto' computes ESS per chain and sums when the store has multi-chain provenance (sample-multi); 'single' ignores chain boundaries and treats all samples as one chain (default: auto)",
+	)
+	p_sum.set_defaults(func=_cmd_summarize)
 
 	# validate-config subcommand (config_v2 only)
 	p_val = subparsers.add_parser("validate-config", help="Validate params against canonical config_v2 schema (breaking, no compatibility layer)")

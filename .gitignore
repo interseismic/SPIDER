@@ -7,6 +7,14 @@
 !spider/**
 !docs/
 !docs/**
+# Quickstart example: only the inputs the walkthrough needs (outputs, checkpoints, W&B runs stay ignored)
+!example/
+!example/SPIDER_example.json
+!example/SPIDER_example_sghmc.json
+!example/model_state_dict.pt
+!example/dtimes_with_noise_from_truth.csv
+!example/events_from_prior.csv
+!example/station.csv
 !spider_old/
 !spider_old/**
 spider/**/__pycache__/
@@ -19,10 +27,5 @@ docs/*.log
 docs/*.out
 docs/*.toc
 docs/SPIDER_User_Guide.pdf
-docs/SPIDER_User_Guide.tex
-docs/COLLAPSED_GAUSSIAN_SHARED_EVENT_RE.md
-docs/EIKONET_TRAINING.md
-docs/EXAMPLES.md
-docs/API_REFERENCE.md
 docs/nuisance_field.tex
 docs/receiver_centric_autocorr.tex

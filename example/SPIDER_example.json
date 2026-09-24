@@ -11,9 +11,9 @@
         "write_samples": true
     },
     "model": {
-        "model_file": "/home/zross/git/SPIDER/cahuilla/experiments/eikonet_compact_hybrid_test/model_state_dict.pt",
+        "model_file": "./model_state_dict.pt",
         "eikonet": {
-            "n_hidden": 16,
+            "n_hidden": 64,
             "n_blocks": 4,
             "n_fourier": 4,
             "phase_emb_dim": 6,
@@ -173,7 +173,7 @@
                 "min_unique_phase_per_event": 8,
                 "min_dtimes_per_pair": 1,
                 "min_event_degree": 3,
-                "min_events_per_cluster": 0,
+                "min_events_per_cluster": 3,
                 "max_pair_station_ratio": 1.0,
                 "ratio_filter_phase": "before",
                 "linearization_error": {
@@ -280,7 +280,7 @@
     },
     "observability": {
         "wandb": {
-            "enabled": true,
+            "enabled": false,
             "project_name": "spider_paper",
             "run_name": "ridgecrest_syn"
         },
@@ -300,7 +300,7 @@
                     "precond": true,
                     "fixed_eval": false,
                     "resid_rms": true,
-                    "priors": false,
+                    "priors": true,
                     "latent_field": false,
                     "corr_error": true
                 }

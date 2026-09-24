@@ -7,9 +7,9 @@ This module intentionally does not implement compatibility shims.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, List, Mapping
 
-from .errors import single_issue_error
+from .errors import ConfigIssue, single_issue_error
 from .types import (
     BatchingConfig,
     CanonicalConfig,
@@ -29,6 +29,10 @@ from .types import (
 
 _TOPLEVEL_KEYS = {"io", "model", "inference", "observability", "synth"}
 _SAMPLER_BACKENDS = {"psgld", "sghmc"}
+# Only these solver names enter the correlated (whitened) likelihood path in
+# spider/core/modeling.py compute_likelihood_loss; anything else would silently
+# degrade to the independent Gaussian, so validation rejects other values.
+_SHARED_EVENT_SOLVER_KINDS = ("pcg", "pcg_sparse", "pcg-sparse")
 
 
 def _as_dict(value: Any, path: str) -> Dict[str, Any]:
@@ -280,6 +284,21 @@ def _validate_shared_event_re_shape(likelihoods: Mapping[str, Any]) -> None:
 
     solver = se.get("solver", {})
     if isinstance(solver, dict):
+        if "kind" in solver:
+            kind = solver.get("kind")
+            kind_norm = str(kind).strip().lower() if isinstance(kind, str) else None
+            if kind_norm not in _SHARED_EVENT_SOLVER_KINDS:
+                raise single_issue_error(
+                    path="model.likelihoods.sample.shared_event_re.solver.kind",
+                    code="enum_error",
+                    message=(
+                        f"Unsupported solver kind {kind!r}. Accepted values: "
+                        + ", ".join(_SHARED_EVENT_SOLVER_KINDS)
+                        + ". Any other name would silently disable the correlated likelihood "
+                        "(the runtime falls back to the independent Gaussian without a warning)."
+                    ),
+                    suggestion="Use solver.kind = \"pcg\" (pcg_sparse / pcg-sparse are aliases).",
+                )
         legacy_solver = {"bucket_nodes", "merge_sparse_edge_bins", "min_groups_per_edge_bin", "max_edge_bins_per_node"}
         found_solver = sorted([k for k in legacy_solver if k in solver])
         if found_solver:
@@ -543,11 +562,16 @@ def _parse_runtime(raw: Mapping[str, Any]) -> RuntimeConfig:
         raise single_issue_error(path="inference.runtime.cuda_empty_cache_every", code="value_error", message="Must be >= 0")
     reset_batch_numbers = _require_bool(raw, "reset_batch_numbers", path)
     clear_samples_on_reset = _require_bool(raw, "clear_samples_on_reset", path)
-    min_samples_to_save = int(_require_num(raw, "min_samples_to_save", path))
+    # `min_samples_to_save` and `cluster_events` are accepted for backward compatibility only:
+    # nothing in the runtime consumes them. They are optional and type-checked when present.
+    min_samples_to_save_num = _optional_num(raw, "min_samples_to_save", path)
+    min_samples_to_save = 0 if min_samples_to_save_num is None else int(min_samples_to_save_num)
     if min_samples_to_save < 0:
         raise single_issue_error(path="inference.runtime.min_samples_to_save", code="value_error", message="Must be >= 0")
     verbose = _require_bool(raw, "verbose", path)
-    cluster_events = _require_bool(raw, "cluster_events", path)
+    cluster_events = False
+    if raw.get("cluster_events", None) is not None:
+        cluster_events = _require_bool(raw, "cluster_events", path)
     seed_v = _optional_num(raw, "seed", path)
     seed = None if seed_v is None else int(seed_v)
     gauge_projection = raw.get("gauge_projection", {})
@@ -570,12 +594,37 @@ def _parse_runtime(raw: Mapping[str, Any]) -> RuntimeConfig:
     )
 
 
+def _parse_shift_guard(raw: Any) -> Dict[str, Any]:
+    """
+    `inference.safety.shift_guard`: {enabled: bool (default false), factor: number > 0 (default 5.0)}.
+
+    Materialized by the legacy bridge to `shift_guard_enable` / `shift_guard_factor`, which
+    spider/core/locate.py `_shift_guard_check` reads. The CLI flags `--shift-guard` /
+    `--shift-guard-factor` override these after materialization.
+    """
+    path = "inference.safety.shift_guard"
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise single_issue_error(path=path, code="type_error", message=f"Expected object/dict, got {type(raw).__name__}")
+    _reject_unknown_keys(path, raw, {"enabled", "factor"})
+    enabled = False
+    if raw.get("enabled", None) is not None:
+        enabled = _require_bool(raw, "enabled", path)
+    factor_num = _optional_num(raw, "factor", path)
+    factor = 5.0 if factor_num is None else float(factor_num)
+    if factor <= 0.0:
+        raise single_issue_error(path=f"{path}.factor", code="value_error", message="Must be > 0")
+    return {"enabled": bool(enabled), "factor": float(factor)}
+
+
 def _parse_safety(raw: Mapping[str, Any]) -> SafetyConfig:
     path = "inference.safety"
-    _reject_unknown_keys(path, raw, {"max_abs_dX"})
+    _reject_unknown_keys(path, raw, {"max_abs_dX", "shift_guard"})
+    extras: Dict[str, Any] = {"shift_guard": _parse_shift_guard(raw.get("shift_guard", None))}
     max_abs = raw.get("max_abs_dX", None)
     if max_abs is None:
-        return SafetyConfig(max_abs_dX=None, extras={})
+        return SafetyConfig(max_abs_dX=None, extras=extras)
     if not isinstance(max_abs, list) or len(max_abs) != 4:
         raise single_issue_error(path="inference.safety.max_abs_dX", code="type_error", message="Expected list[4] of numbers or null")
     out: list[float] = []
@@ -583,7 +632,7 @@ def _parse_safety(raw: Mapping[str, Any]) -> SafetyConfig:
         if not isinstance(item, (int, float)):
             raise single_issue_error(path=f"inference.safety.max_abs_dX[{i}]", code="type_error", message="Expected number")
         out.append(float(item))
-    return SafetyConfig(max_abs_dX=out, extras={})
+    return SafetyConfig(max_abs_dX=out, extras=extras)
 
 
 def _parse_inference(raw: Mapping[str, Any]) -> InferenceConfig:
@@ -678,3 +727,165 @@ def validate_config(raw: Mapping[str, Any], mode: str | None = None) -> Canonica
     validate_cross_field_config(cfg, mode=mode)
     return cfg
 
+
+# ---------------------------------------------------------------------------
+# Non-fatal unknown-key warnings for pass-through blocks
+# ---------------------------------------------------------------------------
+#
+# The blocks below are not strictly key-checked (the runtime reads them with
+# defaults), so a misspelled key is silently ignored. The known-key sets are
+# derived from what spider/core/config_v2/legacy_bridge.py and the runtime
+# consumers (eikonet_loader.py, cli.py torch settings, epoch_runner.py,
+# analyze_resid.py, locate.py) actually read. A `None` value means the key is
+# an opaque sub-block whose contents are not inspected here.
+
+def _leaves(*names: str) -> Dict[str, Any]:
+    """Spec helper: plain keys whose values are not inspected further."""
+    return {n: True for n in names}
+
+
+_SHARED_EVENT_RE_SPEC: Dict[str, Any] = {
+    **_leaves("enabled"),
+    "model": {**_leaves("group_by", "tau_s"), "cluster": _leaves("mode", "k")},
+    "limits": _leaves("max_nodes", "max_rows"),
+    "fallback": _leaves("to_diag", "abort_on_pcg_fallback"),
+    "numerics": _leaves("jitter0", "jitter_max"),
+    "station_phase_term": _leaves("enabled", "tau_s"),
+    "solver": {
+        **_leaves(
+            "kind", "max_iters", "min_iters", "tol", "batched", "node_bin_edges", "warm_start",
+            "cache_max_entries", "prefetch_grouping", "profile_micro_steps",
+            "merge_sparse_node_bins", "min_groups_per_node_bin", "max_node_bins_per_node",
+        ),
+        "precompute": _leaves("enabled", "device"),
+    },
+    "edge_weights": _leaves("mode", "ell_km", "eps_km", "power", "scale_km", "global_scale", "normalize"),
+    "autotune": _leaves(
+        "enabled", "observe_epochs", "latest_epoch", "min_groups", "max_node_bins",
+        "min_groups_per_node_bin", "min_node_bin", "min_gain", "raise_nodes_cap", "nodes_cap_max",
+    ),
+    "logging": _leaves("quiet", "stats_log_every_epochs"),
+}
+
+# Spec grammar: {key: True} = known leaf; {key: {...}} = sub-block inspected recursively;
+# {key: None} = known opaque sub-block (contents not inspected).
+_PASSTHROUGH_KNOWN_KEYS: Dict[str, Any] = {
+    "model.eikonet": _leaves(
+        "model_kind", "x_max", "y_max", "n_hidden", "n_blocks", "n_fourier", "use_fourier",
+        "phase_emb_dim", "t2_log_scale", "vp", "vs",
+    ),
+    "model.filters": {
+        "dtimes": _leaves("remove_duplicates", "max_abs_input_dt", "dtime_thin_frac", "flip_dt_sign", "cc_min"),
+        "events": {
+            **_leaves(
+                "min_dtimes", "min_unique_phase_per_event", "min_dtimes_per_pair", "min_event_degree",
+                "min_events_per_cluster", "max_pair_station_ratio", "ratio_filter_phase", "lat_bounds",
+                "lon_bounds",
+            ),
+            "linearization_error": _leaves(
+                "enabled", "phase", "batch_size", "sample_size", "log_every_batches", "max_ratio"
+            ),
+        },
+        "residual": _leaves("enabled", "method", "mad_sigma", "abs_max", "phase"),
+    },
+    "model.likelihoods": {
+        "locate_map": {**_leaves("type", "phase_unc", "huber_delta"), "student_t": _leaves("nu")},
+        "sample": {
+            **_leaves("type", "phase_unc", "huber_delta"),
+            "student_t": _leaves("nu"),
+            "shared_event_re": _SHARED_EVENT_RE_SPEC,
+        },
+    },
+    "inference.batching": {
+        "standard": _leaves("warmup", "sgld", "shuffle"),
+        "event_batches": _leaves(
+            "enabled", "events_per_batch", "max_edges_per_batch", "bucket_reorder_all", "bucket_reuse_epochs"
+        ),
+    },
+    "inference.runtime.gauge_projection": _leaves("enabled", "mode", "dims", "apply_noise", "apply_momentum"),
+    "inference.runtime.torch": _leaves(
+        "allow_tf32", "matmul_precision", "compile_eikonet", "compile_mode", "compile_backend",
+        "compile_dynamic", "compile_fullgraph",
+    ),
+    "inference.sampler.preconditioning.lrd": _leaves(
+        "rank", "mode", "update_every", "buffer_size", "eta", "oja_eta", "diag_floor", "target"
+    ),
+    "inference.sampler.overrides": {
+        "core": _leaves("lr_mult", "temperature_mult", "eps", "freeze_preconditioner_sampling"),
+    },
+    "observability.diagnostics": {
+        **_leaves(
+            "pair_count_stats_enable", "display_precond_every", "profile_shared_event_re",
+            # accepted for backward compatibility, no effect
+            "sgld_log_gnoise", "sgld_log_temperature", "hierarchical_log_every_epochs",
+        ),
+        "wandb": _leaves("enabled", "groups"),
+        "ess_online": _leaves("enabled", "every_n_samples", "n_events", "seed", "window", "max_lag", "dims"),
+        "spatial": _leaves("enabled", "min_obs", "permutations", "seed"),
+        "pathcorr": _leaves(
+            "enabled", "min_obs_per_event", "seed", "max_pairs", "bin_width", "top_k_print", "max_pi", "outfile"
+        ),
+        # analyze-resid sub-diagnostics and removed blocks: opaque, contents not inspected
+        "truth_catalog": None,
+        "truth_locations": None,
+        "shared_event_re_tau": None,
+        "event_pair_station_corr": None,
+        "eikonet_v1d": None,
+        "resid_distribution": None,
+        "resid_scalar_metrics": None,
+        "shared_event_legcorr2d": None,
+    },
+}
+
+
+def _walk_passthrough(path: str, data: Any, spec: Any, out: List[ConfigIssue]) -> None:
+    if not isinstance(spec, dict) or not isinstance(data, Mapping):
+        return
+    unknown = sorted(str(k) for k in data.keys() if k not in spec)
+    if unknown:
+        out.append(
+            ConfigIssue(
+                path=path,
+                code="unknown_key",
+                message=f"Unknown key(s) ignored by the runtime: {', '.join(unknown)}",
+                severity="warning",
+                suggestion=f"Known keys: {', '.join(sorted(spec.keys()))}",
+            )
+        )
+    for name, sub_spec in spec.items():
+        if isinstance(sub_spec, dict) and name in data:
+            _walk_passthrough(f"{path}.{name}", data[name], sub_spec, out)
+
+
+def _get_path(raw: Mapping[str, Any], dotted: str) -> Any:
+    cur: Any = raw
+    for part in dotted.split("."):
+        if not isinstance(cur, Mapping) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def collect_unknown_key_issues(raw: Mapping[str, Any]) -> List[ConfigIssue]:
+    """
+    Return non-fatal `ConfigIssue(severity="warning")` entries for keys inside the
+    pass-through blocks that no code reads. Never raises; safe to call on any dict.
+    """
+    out: List[ConfigIssue] = []
+    if not isinstance(raw, Mapping):
+        return out
+    for block_path, spec in _PASSTHROUGH_KNOWN_KEYS.items():
+        _walk_passthrough(block_path, _get_path(raw, block_path), spec, out)
+    return out
+
+
+def collect_unknown_key_warnings(raw: Mapping[str, Any]) -> List[str]:
+    """
+    Human-readable unknown-key warnings for the pass-through config blocks, one string per
+    block with unknown keys, e.g.
+    ``[warning] model.filters.dtimes (unknown_key): Unknown key(s) ignored by the runtime: cc_mn | suggestion: Known keys: ...``.
+
+    Intended for `spider validate-config` to print after a successful validation. Returns an
+    empty list when every pass-through key is recognized.
+    """
+    return [issue.render() for issue in collect_unknown_key_issues(raw)]

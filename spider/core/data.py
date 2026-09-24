@@ -452,6 +452,14 @@ def prepare_input_dfs(params, *, model=None, device=None):
         dtimes = dtimes.with_columns(pl.col("phase").cast(pl.Int8).alias("phase"))
     dtimes = dtimes.select(["network", "station", "dt", "evid1", "evid2", "phase", "cc"])
 
+    # Optional: flip the sign convention of `dt` (e.g. HypoDD dt.cc carries t1 - t2; SPIDER expects
+    # t2 - t1). This must happen before ANY filter that looks at the sign of `dt` (the residual and
+    # linearization filters with phase="before" compute Observed - Predicted); otherwise those
+    # filters see residuals of the wrong sign and remove the wrong rows.
+    if bool(params.get("flip_dt_sign", False)):
+        info("Flipping sign of dt (flip_dt_sign=true)", section="FILTER")
+        dtimes = dtimes.with_columns(pl.col("dt") * -1)
+
     # Filter to events present in origins
     event_ids = set(origins["evid"].to_numpy())
     dtimes = dtimes.filter(
@@ -680,10 +688,6 @@ def prepare_input_dfs(params, *, model=None, device=None):
     if thin_frac < 1.0:
         info(f"Thinning dtimes fraction={thin_frac}", section="FILTER")
         dtimes = dtimes.sample(fraction=thin_frac, seed=42)
-
-    # Optional: Flip sign
-    if bool(params.get("flip_dt_sign", False)):
-        dtimes = dtimes.with_columns(pl.col("dt") * -1)
 
     # Filter by cross-correlation threshold
     cc_min = float(params.get("cc_min", 0.0))

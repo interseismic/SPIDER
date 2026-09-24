@@ -1,0 +1,926 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\lstdefinelanguage{json}{
+  basicstyle=\ttfamily\small,
+  numbers=left,
+  numberstyle=\tiny,
+  stepnumber=1,
+  numbersep=6pt,
+  showstringspaces=false,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{black!20},
+  stringstyle=\color{green!40!black},
+  commentstyle=\color{gray},
+  morecomment=[l]{//},
+  morestring=[b]",
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{black!20},
+  showstringspaces=false,
+}
+
+\title{SPIDER User Guide\\\large Scalable Probabilistic Inference for Differential Earthquake Relocation}
+\author{SPIDER Project}
+\date{\today}
+
+% Long monospace identifiers (config paths) may break after underscores, braces, slashes and dots.
+\let\origtexttt\texttt
+\renewcommand{\texttt}[1]{\origtexttt{\def\_{\char`\_\allowbreak}\def\{{\char`\{\allowbreak}\def\}{\char`\}\allowbreak}#1}}
+\emergencystretch=3em
+\tolerance=2000
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\Cov}{\mathrm{Cov}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\vspace{1em}
+
+\section{What SPIDER is (and what problem it solves)}
+SPIDER is a Python toolkit for \emph{probabilistic earthquake relocation} from \emph{differential travel-time} observations.
+Given an initial catalog (event locations and origin times) and a set of pairwise differential times (for P and/or S at many stations), SPIDER estimates a posterior distribution over event location adjustments.
+
+\paragraph{Key idea.}
+For an event pair $(e_1,e_2)$ recorded at a station $s$ and phase $\phi\in\{P,S\}$, SPIDER uses a learned travel-time model (EikoNet) to predict travel times and fits the observed differential time
+\[
+\Delta t^{\mathrm{obs}} \approx \Bigl(T_\phi(x_{e_2},u_s) + t_{e_2}\Bigr)-\Bigl(T_\phi(x_{e_1},u_s) + t_{e_1}\Bigr),
+\]
+where $x_e\in\R^3$ is event position, $t_e\in\R$ is origin time, and $u_s\in\R^3$ is station position.
+The unknowns are the per-event increments $\Delta X_e=(\Delta x,\Delta y,\Delta z,\Delta t)$ relative to the input catalog; positions are handled in a local km frame obtained from a Lambert azimuthal equal-area (LAEA) projection anchored at \texttt{model.domain.lon\_min}/\texttt{lat\_min}.
+Inference is done using a 4-phase pipeline: MAP warmup (Phase~1) followed by preconditioned stochastic-gradient MCMC (Phases~2--4).
+
+\paragraph{Sign convention (read this before importing data).}
+The predicted differential time is \emph{always} $T(\texttt{evid2}) - T(\texttt{evid1})$ (see
+\texttt{compute\_travel\_times} in \texttt{spider/core/modeling.py}). The \texttt{dt} column of your
+input must follow the same convention. HypoDD \texttt{dt.cc}/\texttt{dt.ct} files carry
+$t_1 - t_2$, i.e.\ the opposite sign, so when converting from HypoDD set
+\texttt{model.filters.dtimes.flip\_dt\_sign = true}. A wrong sign is easy to spot: the
+``Initial residual stats'' line printed before Phase~1 shows residuals far larger than the pick
+uncertainty, and the MAP moves events in the wrong direction rather than sharpening the catalog.
+
+\paragraph{Recommended workflow at a glance.}
+\begin{enumerate}[leftmargin=*]
+  \item Train (or reuse) an EikoNet travel-time model for your 1-D velocity model (Section~\ref{sec:eikonet}).
+  \item Write a config (Appendix) and check it with \texttt{spider validate-config params.json}.
+  \item Run Phase~1 once: \texttt{spider locate-map params.json --device 0}. Inspect
+        \texttt{<catalog\_outfile>\_MAP.csv} and the filter/prior log lines.
+  \item Run sampling from the resulting bundle: \texttt{spider sample params.json --device 0}
+        (or \texttt{sample-multi} for several chains). Summarize the HDF5 samples with
+        \texttt{spider.analysis.results.EventSamplesSummary}.
+\end{enumerate}
+
+\section{Installation and entry points}
+\subsection{Python environment}
+SPIDER is a Python package intended to be installed editable in a conda/venv environment. The
+travel-time surrogate lives in the separate \texttt{eikonet} package, which is a hard dependency
+(only its \texttt{[train]} extra is needed if you also train models on the same machine).
+From the repo root:
+
+\begin{lstlisting}[language=bash]
+pip install -e /path/to/eikonet          # or '/path/to/eikonet[train]' to train models too
+pip install -e .                         # add '.[wandb]' for Weights & Biases logging
+\end{lstlisting}
+
+\subsection{Command line interface}
+SPIDER installs a \texttt{spider} console script (equivalently \texttt{python -m spider}).
+The recommended workflow is two-stage: run Phase~1 once, then reuse its output for one or many
+sampling runs.
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{spider validate-config <params.json> [--mode M] [--print-resolved]} --- validate
+        against the canonical \texttt{config\_v2} schema, list the defaults that were applied, and
+        print a \texttt{[WARN][CFGV2]} line for every unknown key in a pass-through block (typos that
+        the runtime would silently ignore);
+        \texttt{--print-resolved} additionally dumps the resolved runtime configuration (flat
+        internal keys). \texttt{--mode} is one of \texttt{locate-map}, \texttt{sample},
+        \texttt{sample-multi}, \texttt{analyze-resid}, \texttt{locate-full}, \texttt{synth}.
+  \item \texttt{spider locate-map <params.json> --device <id> [--bundle-out PATH]} --- run Phase~1
+        (MAP) only, write \texttt{<catalog\_outfile>\_MAP.csv} and a Phase-2 bundle (default
+        \texttt{<checkpoint\_dir>/phase2\_bundle.pth}).
+  \item \texttt{spider sample <params.json> --device <id> [--bundle PATH]} --- run Phases 2--4
+        starting from a Phase-2 bundle. \texttt{spider locate} is a deprecated alias (it prints a
+        warning and behaves identically).
+  \item \texttt{spider sample-multi <params.json> --devices 0,1,2 [--chains N] [--seed0 K]
+        [--bundle PATH] [--out-dir DIR] [--dry-run] [--no-merge]} --- launch independent chains
+        from the same bundle, one \texttt{spider sample} subprocess per chain (chains are assigned
+        to devices round-robin; default \texttt{N} = number of devices). Each chain gets its own
+        \texttt{inference.runtime.seed} ($=\texttt{seed0} + 1000003\,i$), samples file
+        (\texttt{<samples\_outfile>\_chain<i>.h5}), checkpoint directory
+        (\texttt{<checkpoint\_dir>/chain<i>}) and W\&B run name (\texttt{<run\_name>\_chain<i>});
+        the per-chain param files are written to \texttt{--out-dir} (default: the directory of
+        \texttt{params.json}). Per-chain stores are merged into \texttt{io.samples\_outfile} unless
+        \texttt{--no-merge}. \texttt{spider locate-multi} is a deprecated alias.
+  \item \texttt{spider summarize <params.json> [--burn-in N] [--thin K] [--out PATH] [--device DEV]}
+        --- read the samples store, print posterior-width and ESS summaries, and write a per-event
+        posterior catalog (default \texttt{<catalog\_outfile>\_posterior.csv}; runs on the CPU by default).
+  \item \texttt{spider analyze-resid <params.json> --device <id>} --- residual and
+        variogram diagnostics evaluated at the MAP state stored in an existing bundle (no MAP
+        rerun). Options: \texttt{--bundle PATH}; \texttt{--use-latest-checkpoint} (evaluate at
+        the most recent checkpoint in \texttt{io.checkpoint\_dir} instead, e.g.\ after sampling);
+        \texttt{--no-plot-variograms}; \texttt{--plot-dir DIR} (default: the bundle directory).
+  \item \texttt{spider locate-full <params.json> --device <id>} --- legacy one-shot
+        Phase~1 + Phases 2--4 in a single process (no bundle is written; the Adam second-moment
+        statistics are handed directly to the sampler).
+  \item \texttt{spider synth <params.json> --device <id>} --- generate a synthetic
+        differential-time dataset matching the config (requires an optional top-level
+        \texttt{synth} block; see \texttt{spider/cli.py}, \texttt{\_cmd\_synth}).
+\end{itemize}
+
+\paragraph{Device selection is CLI-only.} Every run command requires an explicit
+\texttt{--device} (or \texttt{--devices}); \texttt{inference.compute.devices} in the config is
+overridden. The value is a CUDA index, \texttt{cuda:<n>}, or \texttt{cpu} (\texttt{-1} also means
+CPU); a CUDA index on a machine without CUDA falls back to CPU. All commands run as a single process; launching under
+\texttt{torchrun} (\texttt{WORLD\_SIZE > 1}) is rejected with an error.
+
+\paragraph{Shift guard.} \texttt{locate-map}, \texttt{sample} and \texttt{locate-full} accept
+\texttt{--shift-guard} and \texttt{--shift-guard-factor F} (default 5.0), or the equivalent config
+block \texttt{inference.safety.shift\_guard = \{enabled, factor\}} (the flags override it). After every epoch the
+absolute per-event shift $|\Delta X_e|$ is compared, dimension by dimension, against
+$F\times\texttt{model.priors.event.params.std}$; if any event exceeds it, SPIDER prints that
+event's observations (with residuals at the initial locations) and exits with status~2. It is a
+debugging aid for finding mislabelled picks or bad event ids, not a production safety net.
+
+\section{Input data formats}
+SPIDER reads \textbf{three CSV files} specified in the config:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Stations CSV} (\texttt{io.station\_file})
+  \item \textbf{Event catalog CSV} (\texttt{io.catalog\_infile})
+  \item \textbf{Differential times CSV} (\texttt{io.dtime\_file})
+\end{itemize}
+Extra columns are tolerated in all three files (the dtimes table is reduced to the seven columns
+below immediately after loading; catalog columns are carried through to the output catalog).
+
+\subsection{Stations CSV (\texttt{io.station\_file})}
+Required columns:
+\begin{center}
+\begin{tabular}{llp{0.58\textwidth}}
+\toprule
+Column & Type & Notes\\
+\midrule
+\texttt{network} & string & network code\\
+\texttt{station} & string & station code\\
+\texttt{longitude} & float & degrees\\
+\texttt{latitude} & float & degrees\\
+\texttt{depth} & float & km, positive down (elevation above sea level is negative); missing values are filled with 0.0\\
+\bottomrule
+\end{tabular}
+\end{center}
+Duplicate \texttt{(network, station)} rows are dropped (first occurrence kept). Station depths must
+lie inside \texttt{[model.domain.z\_min, z\_max]}, i.e.\ inside the depth range the EikoNet was
+trained on.
+
+\subsection{Event catalog CSV (\texttt{io.catalog\_infile})}
+Required columns:
+\begin{center}
+\begin{tabular}{llp{0.58\textwidth}}
+\toprule
+Column & Type & Notes\\
+\midrule
+\texttt{evid} & string or integer & event id; must match \texttt{evid1}/\texttt{evid2} in the dtimes file (same type)\\
+\texttt{longitude} & float & degrees\\
+\texttt{latitude} & float & degrees\\
+\texttt{depth} & float & km (positive down)\\
+\texttt{time} & string & parsed with polars \texttt{str.strptime(Datetime)}; ISO-like strings recommended\\
+\bottomrule
+\end{tabular}
+\end{center}
+Duplicate \texttt{evid} rows are reduced to the first occurrence. Optional
+\texttt{model.filters.events.lat\_bounds}/\texttt{lon\_bounds} (\texttt{[min, max]} degrees)
+restrict the catalog to a geographic box before anything else is done.
+
+\subsection{Differential times CSV (\texttt{io.dtime\_file})}
+Required columns (SPIDER selects exactly these columns during loading):
+\begin{center}
+\begin{tabular}{llp{0.58\textwidth}}
+\toprule
+Column & Type & Notes\\
+\midrule
+\texttt{network} & string & station network\\
+\texttt{station} & string & station code\\
+\texttt{dt} & float & observed differential time (seconds), $t(\texttt{evid2}) - t(\texttt{evid1})$\\
+\texttt{evid1} & string or integer & first event id\\
+\texttt{evid2} & string or integer & second event id\\
+\texttt{phase} & int or string & \texttt{0}/\texttt{1} or \texttt{P}/\texttt{S}; strings are upper-cased and anything other than \texttt{S} maps to 0 (=P)\\
+\texttt{cc} & float & correlation/quality (used only by the \texttt{cc\_min} filter; may be a constant)\\
+\bottomrule
+\end{tabular}
+\end{center}
+Rows whose \texttt{evid1} or \texttt{evid2} is absent from the catalog, or whose station is
+absent from the station file, are dropped. Both orderings of a pair are accepted; with
+\texttt{remove\_duplicates=true} only one row per unordered pair, station and phase is kept.
+
+\section{Configuration model (canonical \texttt{config\_v2}, strict nested JSON)}
+\subsection{Important: four top-level blocks, nothing else}
+SPIDER uses a \textbf{strict nested JSON schema} with four required top-level keys:
+\texttt{io}, \texttt{model}, \texttt{inference}, \texttt{observability} (plus an optional
+\texttt{synth} block used only by \texttt{spider synth}). Any other top-level key
+(for example a legacy \texttt{wandb}, \texttt{phases} or \texttt{priors} block) is rejected with an
+\texttt{unknown\_key} error.
+
+\paragraph{Where the schema lives.}
+The canonical schema and its validators are in \texttt{spider/core/config\_v2/validate.py};
+runtime materialization into internal flat keys is in
+\texttt{spider/core/config\_v2/legacy\_bridge.py}; the priors schema is in
+\texttt{spider/core/priors\_config.py}. Only the blocks that \texttt{validate.py} key-checks are
+strict (\texttt{io}, \texttt{model}, \texttt{model.domain}, \texttt{inference},
+\texttt{inference.sampler} and its sub-blocks, \texttt{inference.runtime},
+\texttt{inference.safety}, \texttt{observability}, \texttt{observability.wandb}, and the top level
+of \texttt{shared\_event\_re}); \texttt{model.priors}, \texttt{model.likelihoods},
+\texttt{model.filters}, \texttt{model.eikonet}, \texttt{inference.batching} and
+\texttt{observability.diagnostics} accept unknown keys silently (priors are re-validated strictly
+at run time, so a typo in \texttt{model.priors} is still caught; a typo in \texttt{model.filters}
+is \emph{not}). Use \texttt{spider validate-config params.json --print-resolved} and check the
+resolved value of anything you are unsure about.
+
+\subsection{Block \texttt{io}}
+\begin{itemize}[leftmargin=*]
+  \item \texttt{io.dtime\_file}, \texttt{io.station\_file}, \texttt{io.catalog\_infile} (all required)
+  \item \texttt{io.catalog\_outfile}: output catalog \emph{prefix}; Phase~1 writes
+        \texttt{<catalog\_outfile>\_MAP.csv} (and \texttt{\_MAP\_pass1.csv} with two-pass MAP)
+  \item \texttt{io.samples\_outfile} (HDF5 samples store)
+  \item \texttt{io.checkpoint\_dir}, \texttt{io.checkpoint\_interval} (\(\ge 1\); epochs between
+        checkpoints in every phase)
+  \item \texttt{io.save\_every\_n} (\(\ge 1\); in Phase~4 one sample is buffered every
+        \texttt{save\_every\_n} optimizer steps), \texttt{io.write\_samples} (bool)
+  \item \texttt{io.sample\_write\_interval} (optional; epochs between flushes of the sample buffer
+        to HDF5; \texttt{null} \(\to\) \texttt{io.checkpoint\_interval})
+\end{itemize}
+
+\subsection{Block \texttt{model}}
+\paragraph{model.} Keys: \texttt{model\_file}, \texttt{domain}, \texttt{priors},
+\texttt{likelihoods}, \texttt{filters}, \texttt{eikonet}.
+
+\paragraph{model.domain.} \texttt{lon\_min}, \texttt{lat\_min} (LAEA projection origin; use
+roughly the south-west corner or the centre of your network --- it must be the same origin the
+EikoNet training frame assumed), \texttt{z\_min}, \texttt{z\_max} (\texttt{z\_max > z\_min}; must
+equal the training \texttt{z\_min}/\texttt{z\_max}), \texttt{scale} (\(>0\); km, only used as a
+fallback for \texttt{model.eikonet.x\_max}/\texttt{y\_max}).
+
+\paragraph{model.eikonet.} Controls how the EikoNet state-dict is rebuilt when loaded and must
+match the values used at training time: \texttt{x\_max}, \texttt{y\_max} (km extents;
+fall back to \texttt{model.domain.scale}), \texttt{model\_kind} (\texttt{"1d"} default, or
+\texttt{"3d"}), \texttt{n\_hidden} (128), \texttt{n\_blocks} (5), \texttt{n\_fourier} (4),
+\texttt{use\_fourier} (true), \texttt{phase\_emb\_dim} (8), \texttt{t2\_log\_scale} (0.1),
+\texttt{vp} (6.0), \texttt{vs} (3.2). The defaults in parentheses are what SPIDER assumes when a
+key is omitted; they match the \texttt{eikonet} trainer defaults, so a model trained with a
+different width (for example the recommended \texttt{n\_hidden=64, n\_blocks=4,
+phase\_emb\_dim=6}) \emph{must} have those values spelled out here. A mismatch is not silent:
+\texttt{eikonet.io.load\_model} raises \texttt{ValueError: Checkpoint ... does not match the
+requested architecture} listing the unexpected/missing tensor names. The distance terms inside
+the network include a \(10^{-6}\,\mathrm{km}^2\) floor under the square root (a 1~m distance
+floor) so gradients stay finite when a source coincides with a receiver. See
+Section~\ref{sec:eikonet} for what makes a travel-time model good enough for relocation.
+
+\paragraph{Alternative travel-time operator.} \texttt{model\_kind = "gridtt"} loads a GridTT
+operator (precomputed per-station eikonal tables with tricubic interpolation) from the separate
+\texttt{gridtt} package instead of EikoNet; \texttt{model\_file} is then the table directory
+written by \texttt{gridtt build-spider}. The rest of this guide assumes EikoNet.
+
+\subsection{Priors (\texttt{model.priors})}
+\label{sec:priors}
+Strictly validated at run time; a top-level \texttt{priors} block is a hard error. Every prior
+hyperparameter must be spelled out (there are no implicit defaults except
+\texttt{hyper.update.start\_epoch} and \texttt{hyper.update.min\_cluster\_events}, both 0).
+All priors, when enabled, act in \emph{all} phases (MAP and sampling).
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Event prior} \texttt{model.priors.event} (required): \texttt{enabled},
+        \texttt{type} (must be \texttt{"gaussian"}), \texttt{params.std} (list of 4:
+        \(\Delta x,\Delta y,\Delta z,\Delta t\) in km, km, km, s) --- an independent zero-mean
+        Gaussian on each event's shift from its initial catalog location. Use it together with
+        the hierarchical hyperprior below; a fixed \texttt{params.std} alone is not recommended.
+        With the hyperprior enabled this Gaussian only acts until the first Wishart update, so
+        keep it loose (e.g.\ \texttt{[5, 5, 5, 2]}): a tight fixed prior fights the differential
+        data and blurs fine structure in the MAP.
+  \item \textbf{Centroid prior} \texttt{model.priors.centroid} (optional): same shape
+        (\texttt{enabled}, \texttt{type="gaussian"}, \texttt{params.std}). It acts on the
+        \emph{mean shift of each connected component} of the event graph, weighted by the
+        component's event count \(n_k\): the log-prior term is
+        \(\sum_k n_k \log\mathcal N(\bar{\Delta X}_k; 0, \mathrm{diag}(\sigma_c^2))\), so a
+        component mean is effectively constrained with width \(\sigma_c/\sqrt{n_k}\). Differential
+        data cannot fix the absolute position/time of a component; this prior fixes that
+        translation gauge relative to the input catalog, so keep it tight (e.g.\ 0.01 in every
+        dimension). There is \emph{no} global (single-mean) form and no \texttt{scope} key
+        (a leftover \texttt{scope} key is a hard error). Components that share no data are never
+        coupled. Console/W\&B diagnostics appear under \texttt{centroid/*} (see
+        Section~\ref{sec:wandb}).
+  \item \textbf{Hierarchical hyperprior} \texttt{model.priors.event.hyper} (\textbf{recommended}):
+        \texttt{enabled}, \texttt{type} (\texttt{"wishart\_precision"}), \texttt{params.df}
+        (\textbf{must be \(>3\)}), \texttt{params.scale\_std} (list of 4),
+        \texttt{update.every\_epochs} (\(\ge 1\)), \texttt{update.start\_epoch} (int \(\ge 0\)),
+        \texttt{update.min\_cluster\_events} (int \(\ge 0\)). Recommended:
+        \texttt{df=10}, \texttt{scale\_std=[0.5,0.5,0.5,0.2]}, \texttt{every\_epochs=10},
+        \texttt{start\_epoch=200}, \texttt{min\_cluster\_events=100}, together with a loose base
+        \texttt{params.std} such as \texttt{[5,5,5,2]}.
+\end{itemize}
+
+\paragraph{How the hierarchical prior works.} The event prior becomes
+\(\Delta X_e \sim \mathcal N(0, P_k^{-1})\) with a full \(4\times4\) precision \(P_k\) per
+connected component \(k\), and \(P_k \sim \mathrm{Wishart}(\nu, V)\) with \(\nu=\texttt{df}\) and
+\(V^{-1} = \nu\,\mathrm{diag}(\texttt{scale\_std}^2)\), i.e.\ \texttt{scale\_std} is the prior
+guess of the event-shift scale. At initialization \(P_k = \mathrm{diag}(1/\texttt{params.std}^2)\)
+for every component. Then, at the end of every epoch whose index (counted from 0 within each MAP
+pass and within each sampling phase) satisfies \(\text{epoch} \ge \texttt{start\_epoch}\) and
+\(\text{epoch} \bmod \texttt{every\_epochs} = 0\), each \(P_k\) is replaced by a Gibbs draw from
+its conjugate posterior \(\mathrm{Wishart}\bigl(\nu + n_k, (V^{-1} + S_k)^{-1}\bigr)\), where
+\(S_k=\sum_{e\in k}\Delta X_e \Delta X_e^{\top}\) is the scatter of the current shifts. Components
+with fewer than \texttt{min\_cluster\_events} events do not get their own draw (a handful of
+shifts cannot pin a \(4\times4\) precision, and a small drifting component would loosen its own
+prior and run away); they share one pooled draw computed from \emph{all} events.
+\texttt{start\_epoch} keeps the fixed Gaussian for the first epochs so that the very first draw is
+not computed from \(\Delta X \approx 0\), which would collapse the prior. Every
+\texttt{display\_precond\_every} epochs SPIDER logs the implied standard deviations of the largest
+component (\texttt{Hierarchical event prior updated: std$\approx$[...]}); typical converged values
+are a few hundred metres and a few hundredths of a second. The learned precision is stored in
+Phase-1 checkpoints and in the Phase-2 bundle (\texttt{event\_precision\_matrix}), so sampling
+starts from the MAP-learned scale rather than from the loose base Gaussian; a bundle written
+without it produces the warning \texttt{Bundle carries no hierarchical precision} at
+\texttt{spider sample} start (regenerate the bundle with \texttt{locate-map}).
+
+\paragraph{Why not a fixed prior?} The MAP wants a loose prior while the sampling phases need a
+realistic one, and no single fixed \texttt{params.std} can be both: too tight and the MAP is
+blurred toward the input catalog; too loose and poorly constrained events random-walk during
+sampling. The hyperprior learns the scale from the data, per component, and carries it into
+sampling.
+
+\paragraph{Removed prior features (hard errors).} \texttt{priors.laplacian};
+\texttt{priors.noise} (noise-scale learning removed; \(\sigma_P,\sigma_S\) are fixed by
+\texttt{phase\_unc}); \texttt{priors.event.schedule} and
+\texttt{priors.event.hyper.update.active\_phases} (priors and hyper-updates are active in
+\emph{all} phases when enabled); \texttt{priors.centroid.scope}; and all legacy flat keys
+(\texttt{prior\_event\_std}, \texttt{hierarchical\_event\_prior}, \ldots).
+
+\subsection{Likelihoods (\texttt{model.likelihoods})}
+SPIDER configures \textbf{two separate likelihoods}, each with its own fixed noise scales:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{model.likelihoods.locate\_map} --- used by Phase~1 (MAP). \texttt{type} may be
+        \texttt{huber} (default; \texttt{huber\_delta}, default 1.0, in units of
+        \(r/\sigma\)), \texttt{laplace}/\texttt{l1}/\texttt{mae}, \texttt{gaussian}/\texttt{l2}/\texttt{mse}, or
+        \texttt{student\_t} (\texttt{student\_t.nu}, default 4.0). Requires \texttt{phase\_unc}:
+        \([\sigma_P,\sigma_S]\) in seconds. The per-batch loss is the mean of
+        \(\rho(r/\sigma_\phi)+\log\sigma_\phi\) over rows plus the priors scaled by \(1/N\).
+        A robust family (\texttt{laplace} or \texttt{huber}) is recommended because the input
+        dtimes still contain cycle skips at this stage.
+  \item \texttt{model.likelihoods.sample} --- used by Phases 2--4. \texttt{type} \textbf{must} be
+        \texttt{correlated\_gaussian} (or \texttt{correlated}); any other value is a configuration
+        error. Requires \texttt{phase\_unc}. The correlation structure is configured under
+        \texttt{shared\_event\_re}; setting \texttt{shared\_event\_re.enabled=false} reduces it to
+        the independent Gaussian form (do not change \texttt{type} to get an iid Gaussian).
+\end{itemize}
+
+\paragraph{Noise scales are fixed.} \(\sigma_P,\sigma_S\) come from \texttt{phase\_unc} and are
+never learned. There is no \texttt{learn\_noise\_scale} key. The optimizer parameter list contains
+only the event increments \(\Delta X\). The two \texttt{phase\_unc} lists may differ (e.g.\ a
+larger value for the robust MAP loss), but the sampling value directly sets the posterior width,
+so estimate it from your data (for example the scatter of dtimes of very close event pairs).
+
+\subsubsection{Collapsed shared-event random effects (\texttt{shared\_event\_re})}
+\label{sec:sere}
+Residuals of dtimes that share an event at the same station and phase are strongly correlated
+(they share that event's path anomaly and pick error). SPIDER models this with a per-event random
+effect \(b_i \sim \mathcal N(0,\tau_\phi^2)\) inside each station--phase group, analytically
+integrated out, so that the residual vector of a group has covariance
+\(\Sigma = \sigma_\phi^2 I + \tau_\phi^2 A A^{\top}\) with \(A\) the signed incidence matrix of the
+group's event graph. The quadratic form \(r^{\top}\Sigma^{-1}r\) is evaluated with a
+preconditioned conjugate-gradient (PCG) solve; no latent variables are added to the sampler.
+Under \texttt{model.likelihoods.sample.shared\_event\_re}, only these sub-blocks are allowed:
+\texttt{enabled}, \texttt{model}, \texttt{limits}, \texttt{fallback}, \texttt{numerics},
+\texttt{station\_phase\_term}, \texttt{solver}, \texttt{edge\_weights}, \texttt{autotune},
+\texttt{logging}. Flat legacy keys (\texttt{grouping}, \texttt{tau\_s},
+\texttt{max\_nodes\_per\_group}, \texttt{max\_rows\_per\_group}, \texttt{jitter0}, \ldots at the
+top level) are explicitly rejected.
+\begin{itemize}[leftmargin=*]
+  \item \texttt{model.group\_by}: must be \texttt{station\_phase} (\texttt{phase} grouping was
+        removed and raises at run time). \texttt{model.tau\_s}: \([\tau_P,\tau_S]\) in seconds (a
+        scalar is broadcast; 0 disables the correlation for that phase). Typical values are of the
+        order of \texttt{phase\_unc} or somewhat larger. \texttt{model.cluster.\{mode, k\}}:
+        \texttt{none} (default), \texttt{component} (one random-effect graph per connected
+        component) or \texttt{dd\_khop} (greedy \(k\)-hop balls on the event graph).
+  \item \texttt{limits.max\_nodes} (default 512), \texttt{limits.max\_rows} (200000): groups
+        larger than this fall back to the diagonal likelihood. The defaults are far too small for
+        dense catalogs; the shipped example uses 25000 / 1500000.
+  \item \texttt{solver.\{kind (pcg; pcg\_sparse is an accepted alias; any other value is rejected), max\_iters (50), min\_iters (2),
+        tol (1e-3), batched (true), node\_bin\_edges ([512,1024,\ldots,32768]), warm\_start (false),
+        cache\_max\_entries (8), prefetch\_grouping (false), profile\_micro\_steps (false),
+        merge\_sparse\_node\_bins (true), min\_groups\_per\_node\_bin (32),
+        max\_node\_bins\_per\_node (4), precompute.\{enabled (false), device ("gpu")\}\}}.
+  \item \texttt{numerics.\{jitter0 (1e-8), jitter\_max (1e-3)\}} (diagonal jitter for the solves).
+  \item \texttt{fallback.\{to\_diag (true), abort\_on\_pcg\_fallback (false)\}}: with
+        \texttt{abort\_on\_pcg\_fallback=true} any group that fell back to the diagonal likelihood
+        (row/node cap, \(\tau=0\), or PCG failure) aborts the run with a diagnostic message.
+  \item \texttt{edge\_weights.\{mode, ell\_km, eps\_km, power, scale\_km, global\_scale,
+        normalize\}}: \texttt{mode} is \texttt{uniform} (default) or one of the distance-based
+        forms \texttt{distance\_rbf}, \texttt{distance\_linear}, \texttt{distance\_power}, which
+        scale each pair's edge weight by the inter-event distance.
+  \item \texttt{autotune.\{enabled (true), observe\_epochs (1), latest\_epoch (2), min\_groups
+        (128), max\_node\_bins (8), min\_groups\_per\_node\_bin (24), min\_node\_bin (512),
+        min\_gain (0.08), raise\_nodes\_cap (true), nodes\_cap\_max (65536)\}}: re-plans the PCG
+        node bins from the observed group-size histogram during the first sampling epochs.
+  \item \texttt{station\_phase\_term.\{enabled (false), tau\_s\}}: an optional additional
+        station--phase-level random effect layered on the per-event one.
+  \item \texttt{logging.\{quiet (true), stats\_log\_every\_epochs (0)\}}.
+\end{itemize}
+See \texttt{docs/pcg-whitening-convergence.md} for solver tuning and
+\texttt{docs/COLLAPSED\_GAUSSIAN\_SHARED\_EVENT\_RE.md} for the derivation and implementation
+notes.
+
+\subsection{Filters (\texttt{model.filters})}
+Required sub-blocks: \texttt{dtimes}, \texttt{events}, \texttt{residual} (each may be empty, in
+which case the defaults in parentheses apply). Unknown keys inside them are ignored silently.
+\begin{itemize}[leftmargin=*]
+  \item \texttt{dtimes}: \texttt{remove\_duplicates} (false; keep one row per unordered pair,
+        station, phase), \texttt{max\_abs\_input\_dt} (99999 s; keep \(|dt| <\) value),
+        \texttt{dtime\_thin\_frac} (1.0; random subsample with fixed seed), \texttt{flip\_dt\_sign}
+        (false; multiply \texttt{dt} by \(-1\), needed for HypoDD-convention input),
+        \texttt{cc\_min} (0.0; keep \texttt{cc} \(\ge\) value)
+  \item \texttt{events}: \texttt{min\_dtimes} (1) and \texttt{min\_dtimes\_per\_pair} (1) both
+        require at least that many rows per unordered event pair (they are the same filter applied
+        at two points of the pipeline), \texttt{min\_unique\_phase\_per\_event} (1; minimum number
+        of distinct station--phase combinations per event), \texttt{min\_event\_degree} (0;
+        minimum number of distinct partner events, applied iteratively), \texttt{min\_events\_per\_cluster}
+        (0; minimum connected-component size), \texttt{max\_pair\_station\_ratio} (1.0; drop rows
+        whose inter-event distance divided by the distance from the pair centroid to the station
+        exceeds the ratio; \(\le 0\) disables), \texttt{ratio\_filter\_phase}
+        (\texttt{before}\,|\,\texttt{after\_phase1}, default \texttt{before}), optional
+        \texttt{lat\_bounds}/\texttt{lon\_bounds} (\texttt{[min, max]} degrees, catalog subset),
+        \texttt{linearization\_error} (below)
+  \item \texttt{residual}: \texttt{enabled} (false), \texttt{method} (\texttt{mad}\,|\,\texttt{abs},
+        default \texttt{mad}), \texttt{mad\_sigma} (6.0), \texttt{abs\_max} (99999 s),
+        \texttt{phase} (\texttt{before}\,|\,\texttt{after\_phase1}, default \texttt{after\_phase1})
+\end{itemize}
+
+\paragraph{Residual filter timing (\texttt{model.filters.residual.phase}).}
+\texttt{"before"} evaluates residuals at the \emph{initial} catalog locations during data
+preparation; \texttt{"after\_phase1"} (the \textbf{default}) evaluates them at the \emph{MAP}
+locations at the end of Phase~1, so that \texttt{locate-map} output, the Phase-2 bundle, and the
+optional second MAP pass all see the filtered dtimes. With \texttt{method="mad"} the threshold is
+\(\min(\texttt{abs\_max},\ \texttt{mad\_sigma}\times\mathrm{MAD})\) about the residual median;
+with \texttt{method="abs"} it is \texttt{abs\_max} about zero (recommended for two-pass MAP, since
+a MAD threshold re-derives itself from already-cleaned residuals on each application). The bundle
+records that the filter was applied, so \texttt{spider sample} does not trim the dtimes a second
+time.
+
+\paragraph{Linearization error filter (ratio-only).}
+Under \texttt{model.filters.events.linearization\_error}: \texttt{enabled} (false),
+\texttt{max\_ratio} (dimensionless; required when enabled), \texttt{phase}
+(\texttt{before}\,|\,\texttt{after\_phase1}, default \texttt{after\_phase1}), \texttt{batch\_size}
+(50000), \texttt{sample\_size} (200000; reservoir sample used for the printed percentiles),
+\texttt{log\_every\_batches} (25). For every row the filter compares the exact travel-time
+difference of the pair with its first-order (gradient) approximation about one event and drops
+rows whose relative error exceeds \texttt{max\_ratio}; these are pairs too far apart for the
+double-difference assumption. Values around 0.05 are typical.
+
+\paragraph{Filter order.} During data preparation (\texttt{prepare\_input\_dfs}):
+\texttt{flip\_dt\_sign} (first, so every later filter sees the corrected sign);
+\texttt{lat\_bounds}/\texttt{lon\_bounds} catalog subset; restriction of dtimes to catalog events;
+station coordinates attached; linearization filter if \texttt{phase="before"};
+residual filter if \texttt{phase="before"}; \texttt{remove\_duplicates};
+\texttt{max\_abs\_input\_dt}; \texttt{dtime\_thin\_frac}; \texttt{cc\_min};
+\texttt{min\_unique\_phase\_per\_event}; \texttt{min\_dtimes\_per\_pair}; pair/station ratio if
+\texttt{ratio\_filter\_phase="before"}; drop of non-finite rows; \texttt{min\_dtimes};
+\texttt{min\_event\_degree}; \texttt{min\_events\_per\_cluster}; deduplication of catalog rows by
+\texttt{evid}; removal of events with no remaining dtimes. Each step logs the surviving row count
+under the \texttt{[FILTER]} tag. Filters configured with \texttt{phase="after\_phase1"} run at the
+end of Phase~1 in the order ratio, residual, linearization, followed by the post-Phase-1 event
+drop described in Section~\ref{sec:phase1}.
+
+\subsection{Block \texttt{inference}}
+\paragraph{inference.sampler.} Required keys:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{backend} in \{\texttt{psgld}, \texttt{sghmc}\}
+  \item \texttt{epochs\_per\_phase}: list of 4 integers \(\ge 0\), for Phases 1--4 (0 skips a phase)
+  \item \texttt{lr}: list of 4 positive floats, for Phases 1--4. \texttt{lr[0]} is the Adam step
+        size of the MAP. For Phases 2--4 the configured value is divided by the number of dtimes
+        \(N\) before being handed to the sampler (per-observation scaling), so the same number
+        works across dataset sizes.
+  \item \texttt{temperature} (\(\ge 0\); 1.0 is the true posterior), \texttt{beta} (\(0 \le \beta < 1\);
+        RMSprop decay of the preconditioner), \texttt{eps} (\(>0\); preconditioner floor)
+  \item \texttt{freeze\_preconditioner\_sampling} (bool; if true the preconditioner stops adapting
+        once noise is on, in Phases 3--4)
+  \item \texttt{sghmc\_alpha}: must be present; a positive number for \texttt{sghmc}, may be
+        \texttt{null} for \texttt{psgld}
+\end{itemize}
+Optional keys: \texttt{noise\_scale\_mult} (\(>0\), default 1; multiplies the injected noise),
+\texttt{grad\_clip\_norm} (\(\ge 0\); when omitted, Phase~1 clips gradients at norm 100 and
+Phases 2--4 do not clip; when set, the value applies to all phases and 0 disables clipping
+everywhere), \texttt{preconditioning}, \texttt{reparameterization}, \texttt{overrides},
+\texttt{lr\_schedule}, \texttt{phase1\_two\_pass}.
+
+\paragraph{Preconditioning.}
+\texttt{inference.sampler.preconditioning.\{enabled, type, include\_gamma (default false), lrd\}} with
+\texttt{type} one of \texttt{rmsprop}, \texttt{lrd}, \texttt{component\_lrd} (aliases
+\texttt{cc\_lrd}, \texttt{block\_lrd}, \texttt{component-lrd}). The \texttt{lrd} sub-block accepts
+\texttt{rank} (16), \texttt{mode} (\texttt{svd}\,|\,\texttt{oja}), \texttt{update\_every} (20),
+\texttt{buffer\_size} (64), \texttt{eta} (0.02), \texttt{diag\_floor} (defaults to \texttt{eps}),
+\texttt{target}. \texttt{rmsprop} (diagonal) is the well-tested choice.
+
+\paragraph{Blocked reparameterization.}
+\texttt{inference.sampler.reparameterization.\{enabled, spatial\_scale, dt\_scale\}}: static
+coordinate scales (\(>0\)) for \(x/y/z\) and \(t\) in the blocked sampler, so that a 1-unit move
+in the sampler corresponds to \texttt{spatial\_scale} km or \texttt{dt\_scale} s (replaces the
+old \texttt{dt\_lr\_mult}). The example uses \texttt{dt\_scale=0.3}.
+
+\paragraph{Phase-1 learning-rate schedule.}
+\texttt{inference.sampler.lr\_schedule.phase1.\{type, eta\_min, T\_max\}} with \texttt{type} in
+\{\texttt{none}, \texttt{cosine}\} (default \texttt{none}). \texttt{T\_max} may be \texttt{null}, in
+which case it resolves at run time to the epoch count of the current MAP pass (so a second pass
+gets its own horizon). On resume the schedule is advanced to the resume epoch. Annealing the MAP
+step size matters: with a constant \texttt{lr[0]} the MAP keeps jittering at the step-size scale
+and never fully sharpens.
+
+\paragraph{Two-pass MAP.}
+\texttt{inference.sampler.phase1\_two\_pass.\{enabled, epochs, warm\_start\}}. When
+\texttt{enabled=true}, Phase~1 runs MAP, applies the post-MAP filters at the relocated positions,
+rebuilds the Adam optimizer (and any learning-rate schedule), and re-runs MAP on the filtered
+data. \texttt{epochs=null} reuses \texttt{epochs\_per\_phase[0]}; \texttt{warm\_start} (default
+\texttt{true}) keeps the pass-1 \(\Delta X\) as the starting point, otherwise \(\Delta X\) is reset
+to zero. The pass-1 catalog is preserved as \texttt{<catalog\_outfile>\_MAP\_pass1.csv}. Intended
+for fresh runs (\texttt{inference.runtime.reset\_batch\_numbers=true}); resuming into the second
+pass is not supported.
+
+\paragraph{inference.batching.} \texttt{batching.standard.\{warmup (10000), sgld (10000),
+shuffle (true)\}}: rows per mini-batch in Phase~1 and in Phases 2--4, and whether rows are
+permuted each epoch. Large batches (\(10^6\) rows) are normal on a modern GPU; each epoch is one
+pass over all \(N\) dtimes, so the number of optimizer steps per epoch is \(N/\texttt{batch}\).
+\texttt{batching.event\_batches.\{enabled (false), events\_per\_batch, max\_edges\_per\_batch,
+bucket\_reorder\_all, bucket\_reuse\_epochs\}} groups rows by event instead (mainly useful for
+the shared-event likelihood on very large graphs).
+
+\paragraph{inference.runtime.} Required: \texttt{cuda\_empty\_cache\_every} (\(\ge 0\); 0 never),
+\texttt{reset\_batch\_numbers} (true deletes existing checkpoints and starts fresh; false resumes
+from the latest checkpoint in \texttt{io.checkpoint\_dir}), \texttt{clear\_samples\_on\_reset}
+(delete the HDF5 store when resetting), \texttt{min\_samples\_to\_save}, \texttt{verbose},
+\texttt{cluster\_events}. Optional: \texttt{seed} (0; batching/sampler RNG),
+\texttt{gauge\_projection.\{enabled (false), mode (global\,|\,cluster), dims ([0,1,2]),
+apply\_noise (true), apply\_momentum (true)\}} (project the gauge (mean-shift) direction out of
+the sampler update; the centroid prior is the recommended way to fix the gauge, so this is
+normally left disabled), \texttt{torch.\{allow\_tf32, matmul\_precision, compile\_eikonet,
+compile\_mode, compile\_backend, compile\_dynamic, compile\_fullgraph\}}.
+
+\paragraph{inference.safety.} \texttt{max\_abs\_dX}: \texttt{null} or a list of 4 numbers
+clamping per-event shifts in \((x,y,z,t)\) (km, km, km, s) after every optimizer/sampler step.
+Events pinned at the clamp appear in the Phase-1 log as \texttt{dr\_max} equal to the clamp norm;
+widen the clamp rather than leave them pinned (the example uses \texttt{[10, 10, 10, 3]}).
+\texttt{shift\_guard = \{enabled (false), factor (5.0)\}}: the config form of the shift guard described
+under the CLI section.
+
+\paragraph{inference.compute.} \texttt{devices}: list of \texttt{int}, \texttt{"cpu"}/\texttt{-1},
+or \texttt{"cuda:<n>"}. Informational only: the CLI \texttt{--device}/\texttt{--devices} flag
+overrides it at run time.
+
+\subsection{Block \texttt{observability}}
+\texttt{observability.wandb.\{enabled, project\_name, run\_name\}} (all three keys required;
+\texttt{project\_name} must be non-null when \texttt{enabled=true}) and
+\texttt{observability.diagnostics} with optional keys \texttt{pair\_count\_stats\_enable} (false;
+prints the pair-count histogram of the event graph at start-up), \texttt{sgld\_log\_gnoise},
+\texttt{sgld\_log\_temperature}, \texttt{display\_precond\_every} (50; console cadence of the
+preconditioner, hierarchical-prior and centroid summaries), \texttt{profile\_shared\_event\_re},
+\texttt{wandb.\{enabled, groups\}} (\texttt{groups} is a dict of metric families to log:
+\texttt{core}, \texttt{noise}, \texttt{priors}, \texttt{sampler}, \texttt{ess\_online}, \ldots;
+omitted means all), \texttt{ess\_online.\{enabled, every\_n\_samples, n\_events, seed, window,
+max\_lag, dims\}}, and \texttt{truth\_catalog.\{path, time\_source, time\_ref, require\_all\}}
+(a known-truth catalog for synthetic tests, used by the residual diagnostics).
+
+\section{The 4-phase workflow (what SPIDER actually does)}
+\subsection{Phase 1: MAP warmup (\texttt{locate-map})}
+\label{sec:phase1}
+Before optimizing, SPIDER prints residual statistics at the initial catalog locations
+(\texttt{Initial residual stats}); the P and S medians should be comparable to your
+\texttt{phase\_unc}. Phase~1 then runs Adam on the event increments \(\Delta X\) (noise scales
+fixed) to reach a MAP solution. This is deterministic --- no Langevin noise. It uses the
+\texttt{model.likelihoods.locate\_map} block, typically a robust family (Laplace / Huber /
+Student-\(t\)) to damp outliers, optionally with a cosine learning-rate schedule. The hierarchical
+prior updates (Section~\ref{sec:priors}) run during Phase~1 as well. Each epoch logs
+\texttt{loss}, the median absolute shifts \texttt{dx/dy/dz/dt\_med\_abs}, \texttt{dr\_90},
+\texttt{dr\_max} and the fixed \texttt{sigma\_p/sigma\_s}; \texttt{<catalog\_outfile>\_MAP.csv}
+is refreshed every 100 epochs.
+
+\paragraph{End of Phase 1 (post-MAP finalization).} After the MAP loop, SPIDER writes
+\texttt{<catalog\_outfile>\_MAP.csv} and the MAP locations into the HDF5 store, then applies, in
+this order: the pair/station ratio filter (if \texttt{ratio\_filter\_phase="after\_phase1"}), the
+residual outlier filter at MAP locations (if \texttt{model.filters.residual.phase="after\_phase1"},
+the default), and the linearization-error filter (if its \texttt{phase="after\_phase1"}). Events
+that these row filters leave with no dtimes, or in components smaller than
+\texttt{min\_events\_per\_cluster}, are then removed from the event set (they would otherwise
+random-walk to the \texttt{max\_abs\_dX} clamp in the sampling phases and drag their component's
+centroid); their MAP locations stay in \texttt{\_MAP.csv} with \texttt{dropped\_after\_phase1=1},
+and the connected components and per-component prior precisions are rebuilt. The log line
+\texttt{Post-Phase-1 event filter: dropping n/N events ...} reports how many. SPIDER then runs the
+one-shot spatial and path-correlation diagnostics and saves a Phase-1 checkpoint.
+
+\paragraph{Optional second MAP pass.} With
+\texttt{inference.sampler.phase1\_two\_pass.enabled=true}, the pass-1 catalog is copied to
+\texttt{<catalog\_outfile>\_MAP\_pass1.csv}, the Adam optimizer is rebuilt, and MAP is re-run on
+the post-filter dtimes (log lines are tagged \texttt{phase1-pass2}). Post-MAP finalization runs
+again at the end of the second pass. In practice most of the sharpening comes from freeing the
+inversion (loose event prior with the hierarchical hyperprior, wide clamp, annealed learning
+rate); the second pass removes the remaining cycle-skipped observations that only become
+identifiable once the events have moved.
+
+\paragraph{Phase-2 bundle.} \texttt{spider locate-map} writes
+\texttt{<checkpoint\_dir>/phase2\_bundle.pth} (plus \texttt{.origins0.parquet} and
+\texttt{.dtimes.parquet} sidecars) containing the post-Phase-1 filtered dtimes/origins, the
+MAP \(\Delta X\), a flag recording that the residual filter was applied, and (with the
+hierarchical prior) the learned per-component precision matrices. Sampling runs consume this
+bundle. The bundle carries \emph{data and MAP state only}: no optimizer state and no config;
+Phases 2--4 always re-read the current JSON config, so you can change sampler settings between
+\texttt{sample} runs without redoing the MAP.
+
+\subsection{Phase 2: drift-only preconditioning}
+Phase~2 uses the sampler backend with the Langevin noise disabled, letting the RMSprop-style
+preconditioner adapt to the local curvature at the MAP. With \texttt{locate-full}, Adam's
+second-moment statistics are transplanted into the sampler as a starting point; when starting
+from a bundle the preconditioner starts fresh, so give Phase~2 a few hundred to a thousand epochs
+(the example uses 1000) rather than 0. Phases 2--4 use the \texttt{model.likelihoods.sample}
+block and its \texttt{phase\_unc}.
+
+\subsection{Phase 3: noise ramp}
+Phase~3 turns the noise on gradually: at epoch \(t\) of \texttt{epochs\_per\_phase[2]} the
+injected noise is multiplied by \((t+1)/\texttt{epochs\_per\_phase[2]}\) (logged as
+\texttt{ramp\_progress}), avoiding a sudden transition from the MAP. No samples are written.
+
+\subsection{Phase 4: sampling}
+Phase~4 runs stochastic-gradient MCMC at the configured \texttt{temperature}. Every
+\texttt{io.save\_every\_n} optimizer steps the current \(\Delta X\) is appended to an in-memory
+buffer, which is flushed to the HDF5 store as a new \texttt{batch\_<k>} group every
+\texttt{io.sample\_write\_interval} epochs (and once more at the end). Checkpoints
+(\texttt{checkpoint\_phase4\_epoch\_<n>.pth}) are written every \texttt{io.checkpoint\_interval}
+epochs; a run with \texttt{reset\_batch\_numbers=false} resumes from the latest one and continues
+the batch numbering of an existing store.
+
+\section{Outputs}
+\subsection{Catalog output}
+\texttt{<catalog\_outfile>\_MAP.csv} is written periodically during Phase~1 (every 100 epochs)
+and again at the end of Phase~1. It contains all columns of the input catalog, with
+\texttt{longitude}, \texttt{latitude} and \texttt{depth} replaced by the MAP values, plus:
+\texttt{T\_src} (origin-time shift in seconds relative to the input \texttt{time}, which is left
+unchanged), \texttt{X}, \texttt{Y} (MAP position in the local LAEA km frame), \texttt{unc\_x},
+\texttt{unc\_y}, \texttt{unc\_z} (placeholders filled with NaN; uncertainties come from the samples),
+and \texttt{dropped\_after\_phase1} (0/1; present whenever the post-Phase-1 event filter removed
+at least one event; rows with 1 hold the event's last MAP location but the event is absent from
+the bundle and from all sampling output). With two-pass MAP enabled, the first pass's result is
+preserved as \texttt{<catalog\_outfile>\_MAP\_pass1.csv}.
+
+\subsection{Samples output (HDF5)}
+\texttt{io.samples\_outfile} stores per-sample event locations (projected and lon/lat) in
+\texttt{batch\_<k>} groups (each with provenance attributes: epoch, global step, wall time), plus
+root-level \texttt{map\_longitude}, \texttt{map\_latitude} and \texttt{map\_depth} datasets (which
+exist even for a Phase-1-only \texttt{locate-map} run). The event order matches the bundle's
+\texttt{origins0} table, i.e.\ the events of \texttt{\_MAP.csv} with
+\texttt{dropped\_after\_phase1=0}. \texttt{spider sample-multi} merges the per-chain stores into
+one file whose batches carry \texttt{chain\_idx}/\texttt{source\_batch} attributes. Read with
+\texttt{spider summarize <params.json>} (one command: posterior means, widths, ESS and a CSV catalog), or
+in Python with \texttt{spider.io.samples.read\_all\_samples} and
+\texttt{spider.analysis.results.EventSamplesSummary} (see \texttt{docs/EXAMPLES.md}).
+
+\subsection{Checkpoints and bundles}
+Checkpoints are written to \texttt{io.checkpoint\_dir} as
+\texttt{checkpoint\_<phase>\_epoch\_<n>.pth} and contain the current event increments, the
+optimizer/sampler state, and the event precision matrix when the hierarchical prior is enabled.
+Noise parameters are \emph{not} stored (they are fixed). \texttt{locate-map} can only resume from
+a Phase-1 checkpoint (it aborts if the latest checkpoint belongs to Phases 2--4);
+\texttt{sample} never resumes from a checkpoint --- it always starts Phase~2 at epoch 0 from the
+bundle. \texttt{spider locate-map} additionally writes the Phase-2 bundle described above.
+
+\section{W\&B logging and diagnostics}
+\label{sec:wandb}
+When \texttt{observability.wandb.enabled=true}, SPIDER logs per-phase metrics using a monotonic
+\texttt{global\_step}. Common metric families:
+\begin{itemize}[leftmargin=*]
+  \item \texttt{loss}, \texttt{dx\_med\_abs}, \texttt{dy\_med\_abs}, \texttt{dz\_med\_abs},
+        \texttt{dt\_med\_abs}, \texttt{dr\_90}, \texttt{dr\_max}, \texttt{learning\_rate} ---
+        objective and shift statistics (all phases; \texttt{learning\_rate} follows the cosine
+        schedule in Phase~1)
+  \item \texttt{skipped\_batches} --- batches dropped by the finiteness guards (should be 0)
+  \item \texttt{noise/sigma\_p}, \texttt{noise/sigma\_s} (and log-scales) --- the \emph{fixed}
+        phase scales of the active likelihood block
+  \item \texttt{centroid/*} --- \texttt{n\_components}, the largest component's mean shift
+        (\texttt{main\_dx/dy/dz/dt}), \texttt{max\_dr}, \texttt{max\_abs\_dt},
+        \texttt{rms\_dr\_weighted}, and the z-scores of the component means against the centroid
+        prior (\texttt{z\_max}, \texttt{frac\_components\_z\_gt3}, \texttt{neg\_logp}); the same
+        summary is printed to the console every \texttt{display\_precond\_every} epochs
+  \item \texttt{ramp\_progress} --- Phase-3 noise fraction
+  \item \texttt{shared\_event\_re/*} --- whitening health (\texttt{groups\_mean},
+        \texttt{groups\_pcg\_mean}, \texttt{groups\_fallback\_diag\_mean}, \texttt{max\_rows\_max},
+        \texttt{max\_nodes\_max}, cache hits/misses, PCG timings)
+  \item \texttt{ess\_online/*} --- online ESS/IACT during Phase~4 (if enabled)
+\end{itemize}
+
+\section{EikoNet travel-time model: what matters for relocation}
+\label{sec:eikonet}
+SPIDER's accuracy is bounded by the travel-time model. Two properties of the EikoNet matter, and
+they are not the same:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Travel-time accuracy} sets how well absolute differential times are predicted. A
+        compact 16-wide network (\texttt{n\_hidden=16, n\_blocks=4}) already reproduces 1-D travel
+        times to roughly 10--20~ms.
+  \item \textbf{Source-derivative accuracy} sets how the inversion moves events. Relative depths in
+        particular are driven by \(\partial T/\partial z_{\mathrm{src}}\), and a network whose
+        travel times are good can still have a poor depth derivative: for the 16-wide network the
+        depth-derivative error is 15--40\,\% of the derivative itself. A 64-wide network
+        (\texttt{n\_hidden=64, n\_blocks=4}) brings this to about 2--18\,\% depending on domain
+        size. Recommend \texttt{n\_hidden=64}.
+\end{itemize}
+Train with hybrid physics + supervised labels. For a 1-D velocity model the eikonal problem is
+exactly axisymmetric, so labels from a 2-D \((\rho,z)\) fast-marching solve at 0.1~km spacing
+(\texttt{supervised\_fmm\_mode="axisymmetric"}, the default for 1-D models) are essentially exact
+and cheap; coarse 3-D label grids (4--8~km) are \emph{not} accurate enough and bias the network.
+Before using a model in SPIDER, validate its depth derivative against exact FMM with
+\texttt{maunaloa/experiments/check\_gradients.py <eikonet.json>}, which prints the travel-time
+rms error and the \(\partial T/\partial z_{\mathrm{src}}\) error as a percentage of the median
+derivative, binned by horizontal distance. Full training recipes and the parameter reference are
+in \texttt{docs/EIKONET\_TRAINING.md}; the settings that must be mirrored into
+\texttt{model.eikonet} are \texttt{x\_max}, \texttt{y\_max}, \texttt{n\_hidden}, \texttt{n\_blocks},
+\texttt{n\_fourier}, \texttt{use\_fourier}, \texttt{phase\_emb\_dim}, \texttt{t2\_log\_scale},
+\texttt{vp}, \texttt{vs} (and \texttt{z\_min}/\texttt{z\_max} into \texttt{model.domain}).
+
+\section{Troubleshooting}
+\subsection{Config validation errors}
+Most user-facing errors come from legacy key locations (top-level \texttt{wandb},
+\texttt{phases}, \texttt{priors}; flat \texttt{shared\_event\_re} keys; scalar \texttt{lr};
+\texttt{dt\_lr\_mult}; \texttt{priors.centroid.scope}; \texttt{priors.noise}). Run
+\texttt{spider validate-config} and follow the path in the error message; the four-block layout
+in this guide is the current schema.
+
+\subsection{``Checkpoint does not match the requested architecture''}
+Raised by \texttt{eikonet.io.load\_model} when \texttt{model.eikonet} does not describe the
+trained network (most often a 64-wide model loaded with the default \texttt{n\_hidden=128},
+\texttt{n\_blocks=5}, \texttt{phase\_emb\_dim=8}). Copy the architecture keys from the training
+\texttt{eikonet.json}. Checkpoints written by the pre-package EikoNet code (layers named
+\texttt{input\_layer}/\texttt{blocks}) cannot be loaded at all and must be retrained.
+
+\subsection{Initial residuals are huge / MAP moves events the wrong way}
+Check the sign convention: SPIDER predicts \(T(\texttt{evid2})-T(\texttt{evid1})\). HypoDD-style
+input needs \texttt{model.filters.dtimes.flip\_dt\_sign=true}. Also confirm that
+\texttt{model.domain.lon\_min}/\texttt{lat\_min} are the projection origin the EikoNet frame
+assumes and that station depths use the same sign convention as the catalog (positive down).
+
+\subsection{``Skipped N/M batches'' warnings / loss reported as \texttt{nan}}
+Batches whose loss or gradient is non-finite are skipped, leaving parameters unchanged. SPIDER
+warns once per epoch with the counts, and escalates when \emph{every} batch is skipped
+(``optimization is frozen''); in that state the epoch loss is reported as \texttt{nan}. The usual
+cause is a source that has converged onto a receiver (zero horizontal offset makes the gradient
+of the distance term undefined). Current EikoNet builds include a 1~m distance floor that keeps
+these gradients finite; if you see the warning with an older model, check for events located
+exactly on stations.
+
+\subsection{Events pinned at the clamp}
+If the Phase-1 log shows \texttt{dr\_max} equal to the norm of \texttt{inference.safety.max\_abs\_dX}
+epoch after epoch, some events are being held at the clamp rather than at their data-preferred
+positions. Widen the clamp (e.g.\ \texttt{[10, 10, 10, 3]}); it is a safety net, not a prior.
+If a few events genuinely want to travel that far they are usually mis-associated; the
+post-Phase-1 residual filter and the event drop take care of them, or use \texttt{--shift-guard}
+to print their observations.
+
+\subsection{``Bundle carries no hierarchical precision''}
+The bundle was written before the hierarchical prior was enabled (or by an older version), so
+sampling would start from the loose base \texttt{params.std} until the first Wishart update.
+Re-run \texttt{spider locate-map} to regenerate it.
+
+\subsection{W\&B import shadowing}
+If you have a repo-local \texttt{wandb/} directory (run logs), it can shadow the pip package. SPIDER
+includes a robust import helper, but if W\&B still fails: install wandb (\texttt{pip install
+wandb}), run outside the repo root or rename the local \texttt{wandb/} folder, or disable W\&B in
+the config.
+
+\subsection{Posterior looks ``too cold'' / uncertainties too small}
+Practical checks:
+\begin{itemize}[leftmargin=*]
+  \item verify the correlation model: \texttt{shared\_event\_re.model.tau\_s} must be strictly
+        positive, and \texttt{shared\_event\_re/groups\_fallback\_diag\_mean} should be near zero
+        (raise \texttt{limits.max\_nodes}/\texttt{max\_rows} if not)
+  \item verify \texttt{phase\_unc} of the \texttt{sample} block is realistic for your picks (it is
+        fixed, not learned)
+  \item verify the hierarchical prior scale reported in the log is plausible (hundreds of metres,
+        not centimetres); a tiny learned scale means the prior, not the data, is setting the width
+  \item reduce \texttt{inference.sampler.lr[3]} and check \texttt{temperature=1.0}
+\end{itemize}
+
+\appendix
+\section{Minimal config skeleton}
+The canonical, schema-valid template ships with the package at
+\texttt{spider/examples/params\_template.json}, and the runnable examples are
+\texttt{example/SPIDER\_example.json} (pSGLD) and \texttt{example/SPIDER\_example\_sghmc.json}.
+Validate any edit with \texttt{spider validate-config <params.json>}. Structure (abbreviated;
+the \texttt{model.eikonet} values must match your trained model):
+
+\begin{lstlisting}[language=json]
+{
+  "io": {
+    "dtime_file": "PATH/TO/dtimes.csv",
+    "station_file": "PATH/TO/stations.csv",
+    "catalog_infile": "PATH/TO/events.csv",
+    "catalog_outfile": "PATH/TO/output_catalog",
+    "samples_outfile": "PATH/TO/output_samples.h5",
+    "checkpoint_dir": "PATH/TO/checkpoints/",
+    "checkpoint_interval": 1000,
+    "save_every_n": 10,
+    "write_samples": true
+  },
+  "model": {
+    "model_file": "PATH/TO/eikonet_model_state_dict.pt",
+    "eikonet": { "model_kind": "1d", "x_max": 500.0, "y_max": 500.0,
+                 "n_hidden": 64, "n_blocks": 4, "n_fourier": 4, "use_fourier": true,
+                 "phase_emb_dim": 6, "t2_log_scale": 0.1, "vp": 6.0, "vs": 3.2 },
+    "domain": { "lon_min": -119.6, "lat_min": 33.9,
+                "z_min": -5.0, "z_max": 80.0, "scale": 500.0 },
+    "priors": {
+      "event": {
+        "enabled": true, "type": "gaussian", "params": { "std": [5.0, 5.0, 5.0, 2.0] },
+        "hyper": { "enabled": true, "type": "wishart_precision",
+                   "params": { "df": 10.0, "scale_std": [0.5, 0.5, 0.5, 0.2] },
+                   "update": { "every_epochs": 10, "start_epoch": 200, "min_cluster_events": 100 } }
+      },
+      "centroid": { "enabled": true, "type": "gaussian", "params": { "std": [0.01, 0.01, 0.01, 0.01] } }
+    },
+    "likelihoods": {
+      "locate_map": { "type": "laplace", "phase_unc": [0.02, 0.03] },
+      "sample": {
+        "type": "correlated_gaussian",
+        "phase_unc": [0.02, 0.03],
+        "shared_event_re": {
+          "enabled": true,
+          "model":    { "group_by": "station_phase", "tau_s": [0.033, 0.06],
+                        "cluster": { "mode": "none", "k": 1 } },
+          "limits":   { "max_nodes": 25000, "max_rows": 1500000 },
+          "fallback": { "to_diag": true, "abort_on_pcg_fallback": false },
+          "numerics": { "jitter0": 1e-8, "jitter_max": 1e-3 },
+          "solver":   { "kind": "pcg", "max_iters": 100, "min_iters": 2, "tol": 3e-4, "batched": true },
+          "edge_weights": { "mode": "uniform" },
+          "autotune": { "enabled": true },
+          "logging":  { "quiet": true, "stats_log_every_epochs": 0 }
+        }
+      }
+    },
+    "filters": {
+      "dtimes": { "remove_duplicates": true, "max_abs_input_dt": 99999,
+                  "dtime_thin_frac": 1.0, "flip_dt_sign": false, "cc_min": 0.0 },
+      "events": { "min_dtimes": 1, "min_unique_phase_per_event": 8, "min_dtimes_per_pair": 1,
+                  "min_event_degree": 3, "min_events_per_cluster": 0,
+                  "max_pair_station_ratio": 1.0, "ratio_filter_phase": "before",
+                  "linearization_error": { "enabled": true, "phase": "after_phase1",
+                                           "max_ratio": 0.05, "batch_size": 50000,
+                                           "sample_size": 200000, "log_every_batches": 25 } },
+      "residual": { "enabled": true, "method": "abs", "abs_max": 0.15, "phase": "after_phase1" }
+    }
+  },
+  "inference": {
+    "sampler": {
+      "backend": "psgld",
+      "epochs_per_phase": [10000, 1000, 1000, 100000],
+      "lr": [0.001, 0.01, 0.01, 0.01],
+      "temperature": 1.0, "beta": 0.99, "eps": 1e-5, "sghmc_alpha": null,
+      "freeze_preconditioner_sampling": false,
+      "preconditioning": { "enabled": true, "type": "rmsprop", "include_gamma": false },
+      "reparameterization": { "enabled": true, "spatial_scale": 1.0, "dt_scale": 0.3 },
+      "lr_schedule": { "phase1": { "type": "cosine", "eta_min": 1e-5 } },
+      "phase1_two_pass": { "enabled": true, "epochs": null, "warm_start": true }
+    },
+    "batching": {
+      "standard": { "warmup": 1000000, "sgld": 1000000, "shuffle": false },
+      "event_batches": { "enabled": false, "events_per_batch": 50, "max_edges_per_batch": 200000,
+                         "bucket_reorder_all": false, "bucket_reuse_epochs": 1 }
+    },
+    "safety": { "max_abs_dX": [10.0, 10.0, 10.0, 3.0] },
+    "runtime": { "cuda_empty_cache_every": 0, "reset_batch_numbers": true,
+                 "clear_samples_on_reset": true, "min_samples_to_save": 10,
+                 "verbose": true, "cluster_events": false }
+  },
+  "observability": {
+    "wandb": { "enabled": false, "project_name": null, "run_name": null },
+    "diagnostics": { "pair_count_stats_enable": true, "display_precond_every": 50 }
+  }
+}
+\end{lstlisting}
+
+\end{document}

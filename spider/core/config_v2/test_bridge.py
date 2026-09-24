@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import unittest
 
-from spider.core.config_v2 import load_config, to_legacy_runtime_params
+from spider.core.config_v2 import ConfigError, load_config, to_legacy_runtime_params
+from spider.core.config_v2.validate import collect_unknown_key_issues, collect_unknown_key_warnings, validate_config
+from spider.utils.wandb_gates import want_wandb_group
 
 
 def _base_config() -> dict:
@@ -425,7 +427,197 @@ class ConfigBridgeTests(unittest.TestCase):
         self.assertIn("batch_size_warmup", legacy)
         self.assertIn("devices", legacy)
 
+    def test_centroid_prior_scope_key_rejected(self) -> None:
+        cfg = _base_config()
+        cfg["model"]["priors"] = {
+            "event": {"enabled": True, "type": "gaussian", "params": {"std": [5.0, 5.0, 5.0, 2.0]}},
+            "centroid": {"enabled": True, "type": "gaussian", "params": {"std": [0.01, 0.01, 0.01, 0.01]}},
+        }
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="locate-map"), profile="all", require_priors=True)
+        self.assertTrue(legacy["prior_centroid_enable"])
+        self.assertNotIn("prior_centroid_scope", legacy)
+        cfg["model"]["priors"]["centroid"]["scope"] = "global"
+        with self.assertRaises(Exception):
+            to_legacy_runtime_params(load_config(cfg, mode="locate-map"), profile="all", require_priors=True)
+
+    # --- config-schema fixes -------------------------------------------------
+
+    def test_runtime_noop_keys_are_optional(self) -> None:
+        # `cluster_events` / `min_samples_to_save` have no consumer: accepted when present, not required.
+        cfg = _base_config()
+        cfg["inference"]["runtime"].pop("cluster_events")
+        cfg["inference"]["runtime"].pop("min_samples_to_save")
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertFalse(legacy["cluster_events"])
+        self.assertEqual(legacy["min_samples_to_save"], 0)
+        # Still type-checked when present.
+        cfg["inference"]["runtime"]["cluster_events"] = "no"
+        with self.assertRaises(ConfigError):
+            load_config(cfg, mode="sample")
+        cfg["inference"]["runtime"]["cluster_events"] = True
+        cfg["inference"]["runtime"]["min_samples_to_save"] = -1
+        with self.assertRaises(ConfigError):
+            load_config(cfg, mode="sample")
+
+    def test_sgld_log_keys_accepted_but_not_materialized(self) -> None:
+        cfg = _base_config()
+        cfg["observability"]["diagnostics"]["sgld_log_gnoise"] = True
+        cfg["observability"]["diagnostics"]["sgld_log_temperature"] = True
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertNotIn("sgld_log_gnoise", legacy)
+        self.assertNotIn("sgld_log_temperature", legacy)
+        self.assertEqual(collect_unknown_key_warnings(cfg), [])
+
+    def test_shared_event_solver_kind_enum(self) -> None:
+        cfg = _base_config()
+        solver = cfg["model"]["likelihoods"]["sample"]["shared_event_re"]["solver"]
+        for ok in ("pcg", "pcg_sparse", "pcg-sparse", " PCG_SPARSE "):
+            solver["kind"] = ok
+            legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+            self.assertEqual(legacy["_shared_event_re_solver_kind"], ok.strip().lower())
+        for bad in ("chol", "cholesky", "dense", "", 3):
+            solver["kind"] = bad
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(cfg, mode="sample")
+            msg = str(ctx.exception)
+            self.assertIn("model.likelihoods.sample.shared_event_re.solver.kind", msg)
+            self.assertIn("pcg, pcg_sparse, pcg-sparse", msg)
+        # Omitting `kind` keeps the pcg default.
+        solver.pop("kind")
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertEqual(legacy["_shared_event_re_solver_kind"], "pcg")
+
+    def test_shift_guard_materialization(self) -> None:
+        cfg = _base_config()
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertFalse(legacy["shift_guard_enable"])
+        self.assertAlmostEqual(legacy["shift_guard_factor"], 5.0)
+        cfg["inference"]["safety"]["shift_guard"] = {"enabled": True, "factor": 3.5}
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertTrue(legacy["shift_guard_enable"])
+        self.assertAlmostEqual(legacy["shift_guard_factor"], 3.5)
+        # Partial block: defaults fill in.
+        cfg["inference"]["safety"]["shift_guard"] = {"enabled": True}
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertTrue(legacy["shift_guard_enable"])
+        self.assertAlmostEqual(legacy["shift_guard_factor"], 5.0)
+        # Invalid values are rejected by validate-config.
+        for bad in ({"enabled": True, "factor": 0.0}, {"enabled": True, "factor": -1}, {"enabled": "yes"}, {"factr": 2.0}, [1, 2]):
+            cfg["inference"]["safety"]["shift_guard"] = bad
+            with self.assertRaises(ConfigError):
+                load_config(cfg, mode="sample")
+        # The runtime clamps the enabled flag into the same key the CLI overrides; a later CLI
+        # assignment must win (mirrors spider/cli.py, which sets these after materialization).
+        cfg["inference"]["safety"]["shift_guard"] = {"enabled": False, "factor": 5.0}
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        legacy["shift_guard_enable"] = True
+        legacy["shift_guard_factor"] = 2.0
+        self.assertTrue(legacy["shift_guard_enable"])
+        self.assertAlmostEqual(legacy["shift_guard_factor"], 2.0)
+
+    def test_include_gamma_default_false(self) -> None:
+        cfg = _base_config()
+        cfg["inference"]["sampler"]["preconditioning"].pop("include_gamma")
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertFalse(legacy["sampler_preconditioning_include_gamma"])
+        cfg["inference"]["sampler"]["preconditioning"]["include_gamma"] = True
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertTrue(legacy["sampler_preconditioning_include_gamma"])
+
+    def test_unknown_key_warnings_for_passthrough_blocks(self) -> None:
+        cfg = _base_config()
+        self.assertEqual(collect_unknown_key_warnings(cfg), [])
+        cfg["model"]["filters"]["dtimes"]["cc_mn"] = 0.5
+        cfg["model"]["filters"]["events"]["linearization_error"] = {"enabled": False, "max_ratoi": 0.05}
+        cfg["model"]["eikonet"] = {"n_hidden": 128, "n_hiden": 64}
+        cfg["model"]["likelihoods"]["locate_map"]["huber_delt"] = 1.0
+        cfg["model"]["likelihoods"]["sample"]["shared_event_re"]["solver"]["max_iter"] = 10
+        cfg["inference"]["batching"]["standard"]["shufle"] = True
+        cfg["inference"]["batching"]["event_batches"]["events_per_batc"] = 10
+        cfg["inference"]["runtime"]["torch"]["allow_tf_32"] = True
+        cfg["observability"]["diagnostics"]["pair_count_stats_enabled"] = True
+        cfg["observability"]["diagnostics"]["spatial"] = {"enabled": True, "permutation": 99}
+        # Opaque sub-blocks are accepted without inspecting their contents.
+        cfg["observability"]["diagnostics"]["truth_catalog"] = {"path": "x.csv", "anything": 1}
+        # Still validates: warnings are non-fatal.
+        validate_config(cfg, mode="sample")
+        issues = collect_unknown_key_issues(cfg)
+        self.assertTrue(all(i.severity == "warning" and i.code == "unknown_key" for i in issues))
+        paths = {i.path for i in issues}
+        self.assertEqual(
+            paths,
+            {
+                "model.filters.dtimes",
+                "model.filters.events.linearization_error",
+                "model.eikonet",
+                "model.likelihoods.locate_map",
+                "model.likelihoods.sample.shared_event_re.solver",
+                "inference.batching.standard",
+                "inference.batching.event_batches",
+                "inference.runtime.torch",
+                "observability.diagnostics",
+                "observability.diagnostics.spatial",
+            },
+        )
+        warnings = collect_unknown_key_warnings(cfg)
+        self.assertEqual(len(warnings), len(issues))
+        joined = "\n".join(warnings)
+        self.assertIn("cc_mn", joined)
+        self.assertIn("max_ratoi", joined)
+        self.assertIn("permutation", joined)
+        self.assertIn("[warning]", joined)
+        self.assertNotIn("anything", joined)
+        # Robust to garbage input.
+        self.assertEqual(collect_unknown_key_warnings({"model": {"filters": "nope"}}), [])
+        self.assertEqual(collect_unknown_key_warnings("not-a-dict"), [])  # type: ignore[arg-type]
+
+    def test_spatial_and_pathcorr_diagnostics_materialization(self) -> None:
+        cfg = _base_config()
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertFalse(legacy["spatial_diag_enable"])
+        self.assertEqual(legacy["spatial_diag_min_obs"], 5)
+        self.assertEqual(legacy["spatial_diag_permutations"], 199)
+        self.assertEqual(legacy["spatial_diag_seed"], 0)
+        self.assertFalse(legacy["pathcorr_enable"])
+        self.assertEqual(legacy["pathcorr_min_obs_per_event"], 3)
+        self.assertEqual(legacy["pathcorr_seed"], 0)
+        self.assertEqual(legacy["pathcorr_max_pairs"], 50000)
+        self.assertAlmostEqual(legacy["pathcorr_bin_width"], 0.5)
+        self.assertEqual(legacy["pathcorr_top_k_print"], 8)
+        self.assertNotIn("pathcorr_max_pi", legacy)  # data-driven default in pathcorr.py
+        self.assertIsNone(legacy["pathcorr_outfile"])
+        cfg["observability"]["diagnostics"]["spatial"] = {"enabled": True, "min_obs": 7, "permutations": 999, "seed": 3}
+        cfg["observability"]["diagnostics"]["pathcorr"] = {
+            "enabled": True, "min_obs_per_event": 4, "seed": 11, "max_pairs": 1000, "bin_width": 0.25,
+            "top_k_print": 3, "max_pi": 2.5, "outfile": "pc.csv",
+        }
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        self.assertTrue(legacy["spatial_diag_enable"])
+        self.assertEqual(legacy["spatial_diag_min_obs"], 7)
+        self.assertEqual(legacy["spatial_diag_permutations"], 999)
+        self.assertEqual(legacy["spatial_diag_seed"], 3)
+        self.assertTrue(legacy["pathcorr_enable"])
+        self.assertEqual(legacy["pathcorr_min_obs_per_event"], 4)
+        self.assertEqual(legacy["pathcorr_seed"], 11)
+        self.assertEqual(legacy["pathcorr_max_pairs"], 1000)
+        self.assertAlmostEqual(legacy["pathcorr_bin_width"], 0.25)
+        self.assertEqual(legacy["pathcorr_top_k_print"], 3)
+        self.assertAlmostEqual(legacy["pathcorr_max_pi"], 2.5)
+        self.assertEqual(legacy["pathcorr_outfile"], "pc.csv")
+        self.assertEqual(collect_unknown_key_warnings(cfg), [])
+
+    def test_wandb_group_gating_from_observability_diagnostics(self) -> None:
+        cfg = _base_config()
+        cfg["observability"]["diagnostics"]["wandb"] = {"enabled": True, "groups": {"core": True, "sampler": False}}
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        legacy["_wandb_runtime_enabled"] = True
+        self.assertTrue(want_wandb_group(legacy, "core"))
+        self.assertFalse(want_wandb_group(legacy, "sampler"))
+        cfg["observability"]["diagnostics"]["wandb"] = {"enabled": False}
+        legacy = to_legacy_runtime_params(load_config(cfg, mode="sample"), profile="all", require_priors=False)
+        legacy["_wandb_runtime_enabled"] = True
+        self.assertFalse(want_wandb_group(legacy, "core"))
+
 
 if __name__ == "__main__":
     unittest.main()
-

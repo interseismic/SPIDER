@@ -241,59 +241,48 @@ def _pcg_solve_sum_weighted(
     return x
 
 
-def _station_phase_re_quad(
+def _station_phase_re_correction(
     *,
     resid: torch.Tensor,
-    sigma: torch.Tensor,
+    u1: torch.Tensor,
+    keys: torch.Tensor,
     ph_id: torch.Tensor,
-    sta_idx: Optional[torch.Tensor],
     tau_ps: list,
-) -> Tuple[torch.Tensor, int, str]:
+) -> Tuple[torch.Tensor, int]:
     """
-    Collapsed station-phase random effects (additive) quadratic term.
-    Returns (quad_sum, n_groups, grouping_used).
+    Rank-one (Sherman-Morrison) correction that adds a station x phase random effect (one shared
+    offset per group, scale tau_sp) ON TOP of the shared-event covariance Sigma_0:
+
+        Sigma = Sigma_0 + tau_sp^2 1 1^T
+        1/2 r^T Sigma^-1 r = 1/2 r^T Sigma_0^-1 r - 1/2 tau_sp^2 (1^T Sigma_0^-1 r)^2 / (1 + tau_sp^2 1^T Sigma_0^-1 1)
+
+    Only the second (correction) term is returned; the first is the shared-event quadratic already
+    computed by the whitening solve. `u1 = Sigma_0^-1 1` (per row, detached) must be supplied by the
+    caller; with s_g = u1^T r the exact gradient d/dr of the correction is
+    -tau_sp^2 s_g / (1 + tau_sp^2 1^T u1) * u1, which autograd reproduces from this expression.
+
+    Returns (correction_sum, n_groups). Groups whose tau_sp is zero contribute 0.
     """
     if resid.numel() == 0:
-        return torch.tensor(0.0, device=resid.device, dtype=resid.dtype), 0, "station_phase"
+        return torch.tensor(0.0, device=resid.device, dtype=resid.dtype), 0
     tau_p = float(tau_ps[0]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
     tau_s = float(tau_ps[1]) if isinstance(tau_ps, (list, tuple)) and len(tau_ps) >= 2 else float(tau_ps)
-
-    if not isinstance(sta_idx, torch.Tensor) or int(sta_idx.numel()) != int(resid.numel()):
-        raise ValueError(
-            "shared_event_re.station_phase_re requires per-row station indices; phase grouping support was removed."
-        )
-    grouping = "station_phase"
-    keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id
-
-    keys_sorted, perm = torch.sort(keys)
-    resid_s = resid.index_select(0, perm)
-    sigma_s = sigma.index_select(0, perm)
-    ph_s = ph_id.index_select(0, perm)
-
-    quad = torch.tensor(0.0, device=resid.device, dtype=resid.dtype)
-    n_groups = 0
-    if keys_sorted.numel() > 0:
-        is_new = torch.ones_like(keys_sorted, dtype=torch.bool)
-        is_new[1:] = keys_sorted[1:] != keys_sorted[:-1]
-        starts = torch.nonzero(is_new, as_tuple=False).flatten()
-        ends = torch.cat([starts[1:], torch.tensor([keys_sorted.numel()], device=keys_sorted.device)])
-        for s0, e0 in zip(starts.tolist(), ends.tolist()):
-            r_g = resid_s[s0:e0]
-            s_g = sigma_s[s0:e0].clamp_min(1e-12)
-            ph_g = ph_s[s0:e0]
-            if r_g.numel() == 0:
-                continue
-            n_groups += 1
-            tau = float(tau_p if int(ph_g[0].item()) == 0 else tau_s)
-            if not (tau > 0.0):
-                continue
-            d_inv = 1.0 / s_g.square().clamp_min(1e-24)
-            sum_w = d_inv.sum()
-            sum_wr = (d_inv * r_g).sum()
-            coef = (tau * tau) / (1.0 + (tau * tau) * float(sum_w))
-            u = d_inv * r_g - d_inv * (coef * sum_wr)
-            quad = quad + 0.5 * (r_g * u).sum()
-    return quad, n_groups, grouping
+    if not isinstance(u1, torch.Tensor) or int(u1.numel()) != int(resid.numel()):
+        raise ValueError("station_phase_term: u1 must be aligned with resid")
+    u1 = u1.detach().to(dtype=resid.dtype)
+    uniq, inv = torch.unique(keys.to(torch.int64), return_inverse=True)
+    n_groups = int(uniq.numel())
+    tau_row = torch.where(
+        ph_id.to(torch.int64) == 0,
+        resid.new_tensor(float(tau_p)),
+        resid.new_tensor(float(tau_s)),
+    )
+    tau2_g = torch.zeros((n_groups,), device=resid.device, dtype=resid.dtype)
+    tau2_g.scatter_(0, inv, tau_row.square())  # same value for every row of a group
+    s_g = torch.zeros((n_groups,), device=resid.device, dtype=resid.dtype).index_add(0, inv, u1 * resid)
+    c_g = torch.zeros((n_groups,), device=resid.device, dtype=resid.dtype).index_add(0, inv, u1)
+    corr = -0.5 * (tau2_g * s_g.square() / (1.0 + tau2_g * c_g)).sum()
+    return corr, n_groups
 
 
 def _shared_event_re_u_pcg(
@@ -619,11 +608,11 @@ def compute_likelihood_loss(
             f"reasons: rows_cap={g_rows or w_rows} nodes_cap={g_nodes or w_nodes} tau_zero={g_tau0 or w_tau0}\n"
             f"max_seen: rows={max_rows} nodes={max_nodes}\n"
             "Suggested fixes:\n"
-            "- Increase model.likelihood.shared_event_re.max_rows_per_group / max_nodes_per_group\n"
+            "- Increase model.likelihoods.sample.shared_event_re.limits.max_rows / limits.max_nodes\n"
             "- Reduce inference.batching.standard.warmup/sgld batch sizes\n"
             "- Enable inference.batching.event_batches to limit group sizes\n"
             "- Ensure shared_event_re.tau_s > 0 (tau_zero indicates zero tau)\n"
-            "- If whitening is enabled, increase shared_event_re.whitening.pcg_bucket_nodes or max_nodes\n"
+            "- Check shared_event_re.solver.node_bin_edges covers the largest groups (see max_seen above)\n"
         )
         raise RuntimeError(msg)
     # Tempering removed; keep core residual distributions only.
@@ -722,31 +711,19 @@ def compute_likelihood_loss(
             ph_id = torch.where(is_p, torch.zeros_like(resid, dtype=torch.int64), torch.ones_like(resid, dtype=torch.int64))
             keys = (sta_idx.to(dtype=torch.int64) * 2) + ph_id
 
-            # Optional: collapsed station-phase random effects (additive).
-            quad_sp = torch.tensor(0.0, device=resid.device, dtype=resid.dtype)
+            # Optional: station x phase random effect (one shared offset per group). It is folded into the
+            # SAME covariance as the shared-event effect after the whitening solve below (Sherman-Morrison),
+            # so remember the full row set here: rows dropped from the correlated solve by the cluster
+            # filter still belong to their station x phase group.
             try:
                 se_sp_enable = bool(params.get("_shared_event_re_station_phase_enabled", False))
             except Exception:
                 se_sp_enable = False
-            if se_sp_enable:
-                sp_tau_ps = params.get("_shared_event_re_station_phase_tau_s", [0.0, 0.0])
-                quad_sp, n_sp_groups, sp_grouping = _station_phase_re_quad(
-                    resid=resid,
-                    sigma=sigma,
-                    ph_id=ph_id,
-                    sta_idx=sta_idx,
-                    tau_ps=sp_tau_ps,
-                )
-                params["_shared_event_re_station_phase_last_groups"] = int(n_sp_groups)
-                params["_shared_event_re_station_phase_last_grouping"] = str(sp_grouping)
-                params["_shared_event_re_station_phase_last_quad"] = float(quad_sp.detach().item())
-                if not bool(params.get("_shared_event_re_station_phase_logged", False)):
-                    params["_shared_event_re_station_phase_logged"] = True
-                    _log(
-                        f"[shared_event_re] station_phase_re enabled=True grouping={sp_grouping} "
-                        f"tau_p={float(sp_tau_ps[0]):.4g} tau_s={float(sp_tau_ps[1]):.4g} groups={int(n_sp_groups)}",
-                        flush=True,
-                    )
+            resid_full = resid
+            sigma_full = sigma
+            keys_full = keys
+            ph_id_full = ph_id
+            same_mask = None
 
             # Optional: DD graph k-hop clustering (non-overlapping balls).
             try:
@@ -781,6 +758,7 @@ def compute_likelihood_loss(
                             is_p = is_p[same]
                             ph_id = ph_id[same]
                             keys = keys[same]
+                            same_mask = same
                 except Exception:
                     pass
             log_sigma_mean = torch.log(sigma).mean()
@@ -1036,6 +1014,80 @@ def compute_likelihood_loss(
                         raise ValueError("shared_event_re whitening produced non-finite quad")
                 except Exception:
                     raise
+                quad_sp = torch.tensor(0.0, device=resid.device, dtype=resid.dtype)
+                if se_sp_enable:
+                    # Sigma = Sigma_0 + tau_sp^2 1 1^T per group. The rank-one update needs u1 = Sigma_0^-1 1,
+                    # obtained from a second whitening solve with a ones right-hand side (same grouping plan,
+                    # cache hit; warm start disabled so the r-solve's cached x0 is left alone). The custom
+                    # autograd of the whitening quadratic returns exactly the solution vector as the gradient.
+                    sp_tau_ps = params.get("_shared_event_re_station_phase_tau_s", [0.0, 0.0])
+                    with torch.enable_grad():
+                        ones_rhs = torch.ones_like(resid).requires_grad_(True)
+                        quad_ones, _metrics_ones, cache = compute_quad_whitening(
+                            idx=idx,
+                            resid=ones_rhs,
+                            keys=keys,
+                            ph_id=ph_id,
+                            sigma_p=σ_p,
+                            sigma_s=σ_s,
+                            tau_p=float(tau_p),
+                            tau_s=float(tau_s),
+                            jitter0=float(jitter0),
+                            max_rows_per_group=int(max_rows_per_group),
+                            max_nodes_per_group=int(max_nodes_per_group),
+                            solver=str(whiten_solver),
+                            pcg_max_iters=int(whiten_pcg_max_iters),
+                            pcg_tol=float(whiten_pcg_tol),
+                            pcg_min_iters=int(whiten_pcg_min_iters),
+                            pcg_batched=bool(whiten_pcg_batched),
+                            pcg_bucket_nodes=whiten_pcg_bucket_nodes if isinstance(whiten_pcg_bucket_nodes, list) else None,
+                            edge_weighting=edge_weighting,
+                            edge_weight_ell_km=float(edge_weight_ell_km),
+                            edge_weight_eps_km=float(edge_weight_eps_km),
+                            edge_weight_power=float(edge_weight_power),
+                            edge_weight_scale_km=float(edge_weight_scale_km),
+                            edge_weight_global_scale=float(edge_weight_global_scale),
+                            edge_weight_normalize=bool(edge_weight_normalize),
+                            X_event=X_event,
+                            cache=cache,
+                            batch_context=batch_context,
+                            cache_max_entries=int(cache_max),
+                            pcg_warm_start=False,
+                            grouping_cache=grouping_cache,
+                            cache_key_extra=cache_key_extra,
+                            pcg_merge_sparse_edge_bins=bool(whiten_pcg_merge_sparse_edge_bins),
+                            pcg_min_groups_per_edge_bin=int(whiten_pcg_min_groups_per_edge_bin),
+                            pcg_max_edge_bins_per_node=int(whiten_pcg_max_edge_bins_per_node),
+                            pcg_profile_micro_steps=False,
+                        )
+                        (u1,) = torch.autograd.grad(quad_ones, ones_rhs)
+                    params["_shared_event_re_solver_cache"] = cache
+                    u1 = u1.detach()
+                    if isinstance(same_mask, torch.Tensor) and int(same_mask.numel()) == int(resid_full.numel()):
+                        # Cross-cluster rows were evaluated with the diagonal form: Sigma_0 = sigma^2 I there.
+                        u1_full = 1.0 / sigma_full.square().clamp_min(1e-24)
+                        u1_full = u1_full.masked_scatter(same_mask, u1)
+                    else:
+                        u1_full = u1
+                    quad_sp, n_sp_groups = _station_phase_re_correction(
+                        resid=resid_full,
+                        u1=u1_full,
+                        keys=keys_full,
+                        ph_id=ph_id_full,
+                        tau_ps=sp_tau_ps,
+                    )
+                    params["_shared_event_re_station_phase_last_groups"] = int(n_sp_groups)
+                    params["_shared_event_re_station_phase_last_grouping"] = "station_phase"
+                    params["_shared_event_re_station_phase_last_quad"] = float(quad_sp.detach().item())
+                    params["_shared_event_re_whitening_solve_ms_sum"] = float(params.get("_shared_event_re_whitening_solve_ms_sum", 0.0) or 0.0) + float(_metrics_ones.solve_ms)
+                    if not bool(params.get("_shared_event_re_station_phase_logged", False)):
+                        params["_shared_event_re_station_phase_logged"] = True
+                        _log(
+                            f"[shared_event_re] station_phase_term enabled=True grouping=station_phase "
+                            f"tau_p={float(sp_tau_ps[0]):.4g} tau_s={float(sp_tau_ps[1]):.4g} groups={int(n_sp_groups)} "
+                            f"(rank-one update of the shared-event covariance; second PCG solve per batch)",
+                            flush=True,
+                        )
                 quad = quad_w + quad_diag_extra + quad_sp
                 loss_like = (quad / m_tot_full) + log_sigma_mean
                 _abort_on_pcg_fallback(params, context="whitening")
@@ -1163,19 +1215,30 @@ def compute_prior_loss(
         # We treat prior_event as a batch distribution or independent
         log_prob_events = prior_event.log_prob(ΔX_src).sum()
     
-    # 2. Centroid prior (scaled by number of events for comparable strength)
+    # 2. Centroid (gauge) prior on each connected component's mean shift (weighted by event count)
     if (not centroid_prior_enable) or (not centroid_runtime_enable):
         log_prob_centroid = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
     else:
         if ΔX_src.numel() == 0:
             log_prob_centroid = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)
         else:
-            centroid = ΔX_src.mean(dim=0)
-            log_prob_centroid = prior_centroid.log_prob(centroid)
-            if isinstance(log_prob_centroid, torch.Tensor) and log_prob_centroid.ndim > 0:
-                log_prob_centroid = log_prob_centroid.sum()
-            n_events = int(ΔX_src.shape[0])
-            log_prob_centroid = log_prob_centroid * float(n_events)
+            if cluster_ids is not None:
+                # Centroid prior per connected component: each component's mean shift gets its own
+                # Gaussian, weighted by its event count. Components that share no data are not coupled.
+                cid = cluster_ids.to(torch.int64)
+                K = int(cluster_counts.numel()) if cluster_counts is not None else int(cid.max().item()) + 1
+                sums = torch.zeros(K, ΔX_src.shape[1], device=ΔX_src.device, dtype=ΔX_src.dtype)
+                sums.index_add_(0, cid, ΔX_src)
+                n_k = torch.bincount(cid, minlength=K).to(ΔX_src.dtype)
+                means = sums / n_k.clamp_min(1.0).unsqueeze(1)
+                log_prob_centroid = (prior_centroid.log_prob(means) * n_k).sum()
+            else:
+                # No component labels available: treat all events as one component.
+                centroid = ΔX_src.mean(dim=0)
+                log_prob_centroid = prior_centroid.log_prob(centroid)
+                if isinstance(log_prob_centroid, torch.Tensor) and log_prob_centroid.ndim > 0:
+                    log_prob_centroid = log_prob_centroid.sum()
+                log_prob_centroid = log_prob_centroid * float(ΔX_src.shape[0])
 
     # 3. Noise prior removed: SPIDER uses fixed `phase_unc` only (no σ learning).
     log_prob_noise = torch.tensor(0.0, device=ΔX_src.device, dtype=ΔX_src.dtype)

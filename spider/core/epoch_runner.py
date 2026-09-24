@@ -14,7 +14,6 @@ from spider.core.modeling import (
     compute_likelihood_loss,
     compute_prior_loss,
     compute_residuals,
-    write_output,
 )
 from spider.utils.wandb_gates import want_wandb_group as _want_wandb_group
 from spider.optim.gauge import project_event_mean_inplace
@@ -353,14 +352,10 @@ def _maybe_write_map_csv(state: LocateState, epoch: int) -> None:
     if epoch % 100 != 0:
         return
     try:
-        X_src1 = (state.X_src + state.dX_src).detach().cpu().numpy()
-        origins = write_output(
-            state.origins0,
-            X_src1,
-            state.X_src.detach().cpu().numpy(),
-            state.projector,
-        )
-        origins.write_csv(f"{state.params['catalog_outfile']}_MAP.csv")
+        # Same writer as the final file, so the snapshot carries the `dropped_after_phase1` rows/column
+        # during the second MAP pass (lazy import: locate.py imports this module).
+        from spider.core.locate import _write_map_catalog
+        _write_map_catalog(state)
     except Exception:
         # Best-effort only; never fail training for CSV output.
         return
@@ -369,8 +364,9 @@ def _maybe_write_map_csv(state: LocateState, epoch: int) -> None:
 def _get_diagnostics_cfg(params: dict) -> dict:
     """Return the diagnostics config dict (new schema only).
 
-    Diagnostics are configured under `inference.diagnostics`.
-    Legacy top-level `diagnostics` is no longer supported.
+    Users configure diagnostics under `observability.diagnostics`; the config bridge copies that
+    block to `params["inference"]["diagnostics"]`, which is what this reads. A legacy top-level
+    `diagnostics` block is no longer supported.
     """
     inf = params.get("inference", None)
     if not isinstance(inf, dict):
@@ -972,7 +968,8 @@ def _run_epoch(
                     if g > 0 and g_pcg == 0 and g_fb >= g:
                         info(
                             "shared_event_re warning: all groups fell back to diagonal; "
-                            "increase shared_event_re.max_nodes_per_group or max_rows_per_group",
+                            "increase model.likelihoods.sample.shared_event_re.limits.max_nodes "
+                            "or limits.max_rows",
                             section="LIKELIHOOD",
                         )
                 if (
@@ -1224,7 +1221,8 @@ def _run_epoch(
                     if g > 0 and g_pcg == 0 and g_fb >= g:
                         info(
                             "shared_event_re warning: all groups fell back to diagonal; "
-                            "increase shared_event_re.max_nodes_per_group or max_rows_per_group",
+                            "increase model.likelihoods.sample.shared_event_re.limits.max_nodes "
+                            "or limits.max_rows",
                             section="LIKELIHOOD",
                         )
                 if (
@@ -1762,6 +1760,7 @@ def _run_epoch(
         metrics = {
             "loss": total_loss_mean,
             "skipped_batches": float(n_skipped_loss + n_skipped_grad),
+            "n_batches": float(n_batches_seen),
             "epoch_time": epoch_time,
             "permute_time": float(permute_time_s),
             "dx_mean": stats_cpu[0],
@@ -1781,6 +1780,62 @@ def _run_epoch(
             "dt_centered_med_abs": dt_centered_med_abs,
             "dt_centered_p90_abs": dt_centered_p90_abs,
         }
+        # Centroid (gauge) prior diagnostics, per connected component. `dx_mean`/`dy_mean`/`dz_mean`/
+        # `dt_mean` above are means over ALL events; with several components they say little, since the
+        # centroid prior acts on each component's own mean shift (weighted by its event count, so the
+        # prior width of a component mean is std/sqrt(n_k)).
+        try:
+            cid = getattr(state, "cluster_ids", None)
+            want_wb = _want_wandb_group(state.params, "priors")
+            log_every = max(1, int(state.params.get("display_precond_every", 50)))
+            want_console = (epoch_index % log_every) == 0 and ((not ddp_enabled) or ddp_is_main)
+            if (
+                cid is not None
+                and bool(state.params.get("prior_centroid_enable", False))
+                and (want_wb or want_console)
+            ):
+                cid64 = cid.to(torch.int64)
+                K = int(cid64.max().item()) + 1
+                dXd = state.dX_src.detach()
+                n_k = torch.bincount(cid64, minlength=K).to(dXd.dtype)
+                sums = torch.zeros(K, 4, device=dXd.device, dtype=dXd.dtype)
+                sums.index_add_(0, cid64, dXd)
+                means = sums / n_k.clamp_min(1.0).unsqueeze(1)                       # (K, 4) component mean shifts
+                dr_k = torch.sqrt((means[:, :3] ** 2).sum(dim=1))                     # (K,) 3-D norm, km
+                k_main = int(torch.argmax(n_k).item())
+                n_tot = float(n_k.sum().item())
+                std_c = state.params.get("prior_centroid_std", None)
+                cm = {
+                    "centroid/n_components": float(K),
+                    "centroid/main_dx": float(means[k_main, 0].item()),
+                    "centroid/main_dy": float(means[k_main, 1].item()),
+                    "centroid/main_dz": float(means[k_main, 2].item()),
+                    "centroid/main_dt": float(means[k_main, 3].item()),
+                    "centroid/max_dr": float(dr_k.max().item()),
+                    "centroid/max_abs_dt": float(means[:, 3].abs().max().item()),
+                    "centroid/rms_dr_weighted": float(torch.sqrt((n_k * dr_k ** 2).sum() / max(n_tot, 1.0)).item()),
+                }
+                if isinstance(std_c, (list, tuple)) and len(std_c) == 4:
+                    sc = torch.tensor([float(v) for v in std_c], device=dXd.device, dtype=dXd.dtype).clamp_min(1e-12)
+                    # z-score of each component mean against its prior width std/sqrt(n_k)
+                    z = means.abs() * torch.sqrt(n_k).unsqueeze(1) / sc.unsqueeze(0)  # (K, 4)
+                    z_max_k = z.max(dim=1).values
+                    cm["centroid/z_max"] = float(z_max_k.max().item())
+                    cm["centroid/frac_components_z_gt3"] = float((z_max_k > 3.0).float().mean().item())
+                    cm["centroid/neg_logp"] = float(0.5 * (n_k.unsqueeze(1) * (means / sc.unsqueeze(0)) ** 2).sum().item())
+                    if want_console:
+                        k_worst = int(torch.argmax(z_max_k).item())
+                        info(
+                            f"Component centroids: K={K} | main (n={int(n_k[k_main].item())}) shift "
+                            f"[{means[k_main,0]:+.4f},{means[k_main,1]:+.4f},{means[k_main,2]:+.4f}] km {means[k_main,3]:+.4f} s "
+                            f"| max |shift| {dr_k.max():.4f} km | worst z={z_max_k.max():.1f} (comp n={int(n_k[k_worst].item())}), "
+                            f"{int((z_max_k > 3.0).sum().item())}/{K} components beyond 3 sigma",
+                            section="PRIORS",
+                        )
+                if want_wb:
+                    metrics.update(cm)
+        except Exception as exc:
+            warn(f"Component centroid diagnostics failed: {exc}", section="PRIORS")
         # Optional: timing + workload summary for collapsed shared_event_re likelihood (per epoch).
         try:
             diag = _get_diagnostics_cfg(state.params)

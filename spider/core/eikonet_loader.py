@@ -20,7 +20,17 @@ def load_eikonet_model(params: dict[str, Any], device: str | int | torch.device)
     Load an EikoNet model strictly through the external `eikonet` package.
 
     SPIDER no longer supports the legacy in-repo EikoNet implementation.
+
+    If model.eikonet.model_kind == "gridtt", load a GridTT operator instead: precomputed
+    per-station eikonal tables (factored 2nd-order fast marching) read back with Catmull-Rom
+    tricubic interpolation. Same call signature (forward(x[N,7]) -> T[N,1]); model.model_file
+    is the table directory written by `gridtt build-spider`.
     """
+    if str(_model_cfg(params).get("model_kind", "")).strip().lower() == "gridtt":
+        from gridtt import load_gridtt
+
+        return load_gridtt(str(params["model_file"]), device=device)
+
     try:
         from eikonet.io import load_model
     except Exception as e:
