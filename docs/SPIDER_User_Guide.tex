@@ -582,9 +582,12 @@ from the latest checkpoint in \texttt{io.checkpoint\_dir}), \texttt{clear\_sampl
 (delete the HDF5 store when resetting), \texttt{min\_samples\_to\_save}, \texttt{verbose},
 \texttt{cluster\_events}. Optional: \texttt{seed} (0; batching/sampler RNG),
 \texttt{gauge\_projection.\{enabled (false), mode (global\,|\,cluster), dims ([0,1,2]),
-apply\_noise (true), apply\_momentum (true)\}} (project the gauge (mean-shift) direction out of
-the sampler update; the centroid prior is the recommended way to fix the gauge, so this is
-normally left disabled), \texttt{torch.\{allow\_tf32, matmul\_precision, compile\_eikonet,
+apply\_noise (true), apply\_momentum (true)\}} (hard gauge fix: the mean shift of each connected
+component (\texttt{cluster}) or of all events (\texttt{global}) over the selected dims is removed
+from the gradient, momentum and noise, and the parameters are re-centered exactly after every step
+in all phases; with \texttt{mode=cluster}, \texttt{dims=[0,1,2,3]} every component keeps its
+input-catalog frame regardless of its size, which the soft centroid prior does not guarantee on large
+datasets), \texttt{torch.\{allow\_tf32, matmul\_precision, compile\_eikonet,
 compile\_mode, compile\_backend, compile\_dynamic, compile\_fullgraph\}}.
 
 \paragraph{inference.safety.} \texttt{max\_abs\_dX}: \texttt{null} or a list of 4 numbers

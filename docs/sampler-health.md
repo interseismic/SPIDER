@@ -126,8 +126,12 @@ What you can do with the current code:
 - Report the uncertainties of low-ESS events with caution, or filter them by
   `ess_per_event_xyzt_min` when publishing a catalog.
 
-There is no built-in per-event step adaptation beyond the RMSprop rule above; anything that
-requires one has to be done outside SPIDER.
+The structural fix is `inference.sampler.preconditioning.type: "block_gn"`: a per-event 4x4
+Gauss-Newton metric (data Fisher block plus prior precision, inverted) that gives every event
+and coordinate the same dimensionless step, so mixing no longer depends on degree. See the
+"Block Gauss-Newton preconditioner" section of {doc}`sampler-options`. It does not accelerate
+collective modes of weakly anchored *groups*; for those see the next section and multi-chain
+runs.
 
 ## Frame-mode drift (coherent slow trends)
 

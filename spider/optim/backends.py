@@ -5,6 +5,7 @@ from typing import Tuple, List
 
 from .sgld import pSGLD  # default backend
 from .sghmc import SGHMC
+from .block_gn import BLOCK_GN_NAME, attach_block_gn_provider
 
 
 def _normalize_preconditioner_name(name: str) -> str:
@@ -101,9 +102,9 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         if precond_enabled:
             if precond in {"none", "false", ""}:
                 precond = "rmsprop"
-            if precond not in {"rmsprop", "lrd", "component_lrd"}:
+            if precond not in {"rmsprop", "lrd", "component_lrd", BLOCK_GN_NAME}:
                 raise ValueError(
-                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd, component_lrd."
+                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd, component_lrd, block_gn."
                 )
         else:
             precond = "none"
@@ -126,6 +127,7 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
                         g["lrd_component_counts"] = cc
 
         _maybe_attach_gauge_projection(opt, params=params, state=state)
+        attach_block_gn_provider(opt, params=params, state=state)
         return "psgld", opt
 
     if backend == "sghmc":
@@ -151,9 +153,9 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         if precond_enabled:
             if precond in {"none", "false", ""}:
                 precond = "rmsprop"
-            if precond not in {"rmsprop", "lrd", "component_lrd"}:
+            if precond not in {"rmsprop", "lrd", "component_lrd", BLOCK_GN_NAME}:
                 raise ValueError(
-                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd, component_lrd."
+                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd, component_lrd, block_gn."
                 )
         else:
             precond = "none"
@@ -180,6 +182,7 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
             g.setdefault("alpha", float(params.get("sghmc_alpha", 0.01)))
         # Attach optional gauge-projection config (hard constraint on translation mode) to optimizer instance.
         _maybe_attach_gauge_projection(opt, params=params, state=state)
+        attach_block_gn_provider(opt, params=params, state=state)
         return "sghmc", opt
 
     raise ValueError(

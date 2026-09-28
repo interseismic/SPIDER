@@ -285,6 +285,36 @@ def _clamp_dX_inplace(state: LocateState) -> None:
     state.dX_src.clamp_(min=-eff, max=eff)
 
 
+@torch.no_grad()
+def _project_gauge_inplace(state: LocateState) -> None:
+    """Hard gauge fix: remove the mean shift of ΔX_src (per connected component, or globally) over
+    the configured dims, after every optimizer/sampler step.
+
+    Projecting the gradient, momentum and noise (also done) is not sufficient on its own: Adam and the
+    RMSprop-preconditioned samplers rescale each element by its own running statistics, so a zero-mean
+    gradient does not produce a zero-mean update and the component frames drift anyway. Re-centering the
+    parameters after each step enforces the constraint exactly, for any optimizer, at the cost of one
+    index_add over events. Runs only when `inference.runtime.gauge_projection.enabled` is true.
+    """
+    try:
+        if not bool(state.params.get("gauge_project_enable", False)):
+            return
+        dims_v = state.params.get("gauge_project_dims", [0, 1, 2])
+        if not isinstance(dims_v, (list, tuple)) or len(dims_v) == 0:
+            dims_v = [0, 1, 2]
+        dims = tuple(int(d) for d in dims_v)
+        mode = str(state.params.get("gauge_project_mode", "global")).strip().lower()
+        if mode not in {"global", "cluster"}:
+            mode = "global"
+        cid = state.cluster_ids if mode == "cluster" else None
+        cc = state.cluster_counts if mode == "cluster" else None
+        from spider.optim.gauge import project_event_mean_inplace
+        project_event_mean_inplace(state.dX_src.data, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+    except Exception:
+        # Never fail a step for the gauge fix; the gradient/noise projection still applies.
+        pass
+
+
 def _current_noise_scales(state: LocateState) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (σ_p, σ_s) as tensors on the correct device."""
     assert state.scale_theta is not None, "Noise scales not initialized"

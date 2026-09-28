@@ -36,6 +36,7 @@ from spider.io.samples import save_samples_periodic, get_next_sample_count, clea
 from spider.io.samples import save_map_locations
 from spider.core.data import filter_by_pair_station_ratio
 from spider.optim.backends import create_sampler_backend
+from spider.optim.block_gn import block_gn_epoch_hook
 from spider.diagnostics.spatial import run_spatial_diag_end_phase1
 from spider.diagnostics.pathcorr import run_pathcorr_diag_end_phase1
 from spider.utils.console import info, warn
@@ -47,6 +48,7 @@ from spider.core.shared_event_re_whitening import build_whitening_cache_entry, _
 from spider.core.state import (
     LocateState,
     _clamp_dX_inplace,
+    _project_gauge_inplace,
     _current_noise_scales,
 )
 
@@ -1435,6 +1437,7 @@ def _resume_or_initialize(state: LocateState):
     # Clamp any resumed parameters to respect current config bounds
     try:
         _clamp_dX_inplace(state)
+        _project_gauge_inplace(state)  # hard per-component (or global) gauge fix, exact for any optimizer
     except Exception as e:
         _log(f"Warning: could not clamp resumed parameters: {e}")
 
@@ -1732,7 +1735,7 @@ def _phase2_preconditioner(
             g['noise_scale'] = 0.0
 
         # Only keep preconditioners currently supported in runtime.
-        if user_preconditioning and user_precond_type in {"rmsprop", "lrd", "component_lrd"}:
+        if user_preconditioning and user_precond_type in {"rmsprop", "lrd", "component_lrd", "block_gn"}:
             g['preconditioner'] = user_precond_type
             g['preconditioning'] = True
             g['freeze_preconditioner'] = False
@@ -1745,6 +1748,7 @@ def _phase2_preconditioner(
     if ddp_main:
         _log(f"Phase 2: drift-only (noise=off) | {_format_sampler_status(state.sampler)}")
     for epoch in range(start_epoch, state.params["phase2_epochs"]):
+        block_gn_epoch_hook(state, sampler, epoch=epoch, phase_start=(epoch == start_epoch), log=ddp_main)
         grad_clip_norm = float(state.params.get("sampler_grad_clip_norm", 0.0))
         metrics = _run_epoch(state, epoch, sampler, noise_scale_factor=0.0, grad_clip_norm=grad_clip_norm)
         if ddp_main:
@@ -1880,6 +1884,7 @@ def _phase3_noise_ramp(
         _log(f"Phase 3: noise ramp | {_format_sampler_status(sampler)}")
 
     for t in range(start_epoch, ramp_len):
+        block_gn_epoch_hook(state, sampler, epoch=t, phase_start=(t == start_epoch), log=ddp_main)
         progress = float(min(1.0, (t + 1) / float(ramp_len)))
 
         # Optional extra noise multiplier (applied in both Phase 3 and Phase 4).
@@ -2139,6 +2144,21 @@ def _phase4_sampling(
             return None
 
     for epoch in range(int(start_epoch), int(n_epochs)):
+        block_gn_epoch_hook(state, sampler, epoch=epoch, phase_start=(epoch == int(start_epoch)), log=ddp_main)
+        # Optional: freeze ONLY the LRD subspace (U, lambda) after this many sampling epochs.
+        # The RMSProp diagonal stays adaptive (stability governor); a static subspace makes
+        # the low-rank part of the kernel time-homogeneous. See docs/sampler-options.md.
+        fs_after = state.params.get("_lrd_freeze_subspace_after", None)
+        if fs_after is not None:
+            fs_on = epoch >= int(fs_after)
+            for g in sampler.param_groups:
+                if bool(g.get("lrd_subspace_frozen", False)) != fs_on:
+                    g["lrd_subspace_frozen"] = fs_on
+                    if fs_on and ddp_main:
+                        _log(
+                            f"Phase 4: LRD subspace frozen at epoch {epoch} "
+                            f"(lrd.freeze_subspace_after={int(fs_after)}); diagonal remains adaptive"
+                        )
         # Drift tracker: capture state at epoch start (for delta over this epoch)
         try:
             tr = getattr(state, "_runtime_drift_tracker", None)

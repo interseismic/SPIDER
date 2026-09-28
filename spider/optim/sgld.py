@@ -3,6 +3,14 @@ import torch
 import math
 
 from .gauge import project_event_mean_inplace
+from .block_gn import (
+    BLOCK_GN_NAME,
+    block_gn_diag_metric,
+    block_gn_drift_and_noise,
+    block_gn_gauge_spec,
+    block_gn_natural_step,
+    ensure_block_gn_metric,
+)
 from spider.utils.console import info, warn
 
 _COMPONENT_LRD_ALIASES = {"component_lrd", "cc_lrd", "block_lrd", "component-lrd"}
@@ -119,7 +127,10 @@ def _build_lrd_metric(
     if (not isinstance(lam, torch.Tensor)) or lam.shape != (rank,) or lam.device != g.device or lam.dtype != g.dtype:
         lam = torch.zeros((rank,), device=g.device, dtype=g.dtype)
 
-    if not freeze_preconditioner:
+    # The SUBSPACE refresh can be frozen independently of the diagonal (which must stay
+    # adaptive for stability): a rotating U/lambda makes the phase-4 kernel time-inhomogeneous
+    # and shows up as slow per-event drift. Set via lrd.freeze_subspace_after (sampling epochs).
+    if not (freeze_preconditioner or bool(group.get("lrd_subspace_frozen", False))):
         if mode == "oja":
             # A one-time Python flag avoids two full-tensor reductions plus two
             # host syncs per step just to re-detect the initialized state.
@@ -389,7 +400,7 @@ def _build_component_lrd_metric(
         if (not isinstance(lam, torch.Tensor)) or lam.shape != (rank,) or lam.device != g.device or lam.dtype != g.dtype:
             lam = torch.zeros((rank,), device=g.device, dtype=g.dtype)
 
-        if not freeze_preconditioner:
+        if not (freeze_preconditioner or bool(group.get("lrd_subspace_frozen", False))):
             if mode == "oja":
                 u_ready = bool(sub.get("U_ready", False))
                 if not u_ready:
@@ -632,9 +643,9 @@ class pSGLD(torch.optim.Optimizer):
                 raise ValueError("preconditioner cannot be 'none' when preconditioning=True")
             # Keep a valid label even when preconditioning is disabled.
             preconditioner = "rmsprop"
-        if preconditioner not in {"rmsprop", "lrd", "component_lrd"}:
+        if preconditioner not in {"rmsprop", "lrd", "component_lrd", BLOCK_GN_NAME}:
             raise ValueError(
-                f"preconditioner must be 'rmsprop', 'lrd', or 'component_lrd'; got '{preconditioner}'"
+                f"preconditioner must be 'rmsprop', 'lrd', 'component_lrd', or 'block_gn'; got '{preconditioner}'"
             )
 
         defaults = dict(lr=lr, beta=beta, eps=eps, n_obs=n_obs,
@@ -727,6 +738,37 @@ class pSGLD(torch.optim.Optimizer):
                 if 'step' not in state:
                     state['step'] = 0
                 state['step'] += 1
+
+                if preconditioning and preconditioner == BLOCK_GN_NAME:
+                    # Block Gauss-Newton metric: M_i = (F_i + P_k)^-1 per event, held fixed between
+                    # refreshes (see spider/optim/block_gn.py). Natural step s = lr * N is dimensionless.
+                    M_blk, L_blk = ensure_block_gn_metric(self, group, state, p)
+                    if reparam_scale is not None and not bool(getattr(self, "_block_gn_reparam_warned", False)):
+                        warn("block_gn preconditioner ignores sampler.reparameterization (the metric already "
+                             "carries the coordinate units).", section="PRECOND")
+                        setattr(self, "_block_gn_reparam_warned", True)
+                    g_drift = raw_grad.mul(n_obs)  # sum-loglik convention, unscaled coordinates
+                    s_nat = block_gn_natural_step(group)
+                    ema_g = state['ema_g']
+                    ema_g2 = state['ema_g2']
+                    ema_g.mul_(grad_ema_beta).add_(g_drift, alpha=(1.0 - grad_ema_beta))
+                    ema_g2.mul_(grad_ema_beta).addcmul_(g_drift, g_drift, value=(1.0 - grad_ema_beta))
+                    std = math.sqrt(2.0 * s_nat * max(0.0, temperature)) * noise_scale if add_noise else 0.0
+                    drift_blk, noise_blk = block_gn_drift_and_noise(M=M_blk, L=L_blk, g=g_drift, noise_std=std, gauge=block_gn_gauge_spec(self, p))
+                    update = s_nat * drift_blk
+                    if noise_blk is not None:
+                        update = update + noise_blk
+                    try:
+                        if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                            dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                            mode = str(getattr(self, "_gauge_project_mode", "global"))
+                            cid = getattr(self, "_gauge_cluster_ids", None)
+                            cc = getattr(self, "_gauge_cluster_counts", None)
+                            project_event_mean_inplace(update, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                    except Exception:
+                        pass
+                    p.sub_(update)
+                    continue
 
                 if preconditioning and preconditioner in {"lrd", "component_lrd"}:
                     # Non-diagonal preconditioner (LRD)
@@ -969,9 +1011,13 @@ class pSGLD(torch.optim.Optimizer):
                 # var of drift-scaled grad (non-negative clamp)
                 var_g = (ema_g2 - ema_g * ema_g).clamp_min(0.0)
                 # Preconditioner metric (diagonal proxy in update space)
+                lr_use = lr
                 if preconditioning:
                     precond = _canonical_preconditioner_name(preconditioner)
-                    if precond in {"lrd", "component_lrd"}:
+                    if precond == BLOCK_GN_NAME:
+                        G = block_gn_diag_metric(state, ema_g)
+                        lr_use = block_gn_natural_step(group)
+                    elif precond in {"lrd", "component_lrd"}:
                         G = state.get("precond_diag", None)
                         if G is None or not isinstance(G, torch.Tensor):
                             G = torch.ones_like(ema_g)
@@ -989,10 +1035,10 @@ class pSGLD(torch.optim.Optimizer):
                 else:
                     G = torch.ones_like(ema_g)
                 # Langevin noise variance per parameter in update space
-                var_noise = (2.0 * lr * max(temperature, 0.0)) * (noise_scale * noise_scale) * G
+                var_noise = (2.0 * lr_use * max(temperature, 0.0)) * (noise_scale * noise_scale) * G
                 denom = torch.where(var_noise > 0.0, var_noise, var_noise.new_full(var_noise.shape, eps))
                 # Gradient noise-induced update variance
-                num = (lr * lr) * (G * G) * var_g
+                num = (lr_use * lr_use) * (G * G) * var_g
                 ratio = (num / denom).clamp_min(1e-30)
                 # Track dt column (index 3) for hypocenter-like tensors (N,4).
                 if ratio.ndim == 2 and int(ratio.shape[1]) == 4:

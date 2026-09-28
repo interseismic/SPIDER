@@ -288,13 +288,16 @@ then `min_unique_phase_per_event` and `min_event_degree` to trim poorly connecte
 - `backend`: `sghmc` or `psgld` (the example uses `psgld`; see {doc}`sampler-options`).
 - `epochs_per_phase`: `[Phase 1 MAP, Phase 2 preconditioner warm-up, Phase 3 noise ramp, Phase 4
   sampling]`. Phase 1 must comfortably exceed `priors.event.hyper.update.start_epoch`.
-- `lr`: `lr[0]` is the Phase-1 Adam rate; `lr[1..3]` are per-observation sampler step sizes.
+- `lr`: `lr[0]` is the Phase-1 Adam rate; `lr[1..3]` are per-observation sampler step sizes
+  (with `preconditioning.type: block_gn` they are dimensionless natural steps, typically 0.05-0.5).
 - `temperature`: injected-noise temperature (`1.0` = the posterior; `0` = noise off).
 - `noise_scale_mult`: extra multiplier on the injected noise in Phases 3 and 4.
 - `sghmc_alpha`: SGHMC friction; required key (a number for `sghmc`, `null` allowed for `psgld`).
 - `eps`, `beta`: RMSprop damping and second-moment decay of the preconditioner.
 - `preconditioning.enabled`, `.type`, `.include_gamma`: `rmsprop` diagonal preconditioner
-  (`lrd`/`component_lrd` with a `preconditioning.lrd` sub-block are the alternatives).
+  (`lrd`/`component_lrd` with a `preconditioning.lrd` sub-block, and `block_gn`, the per-event
+  Gauss-Newton metric that equalizes mixing across well- and poorly-observed events and requires
+  `runtime.gauge_projection.enabled: true`, are the alternatives; see {doc}`sampler-options`).
 - `freeze_preconditioner_sampling`: freeze preconditioner statistics in Phases 3 and 4.
 - `lr_schedule.phase1.type`, `.eta_min` (and optional `.T_max`): cosine decay of the Phase-1
   learning rate from `lr[0]` to `eta_min` over the pass. Recommended on.
@@ -366,8 +369,10 @@ check the sign convention before widening it.
 - `min_samples_to_save`, `cluster_events`: accepted, currently no runtime effect.
 - `verbose`: per-epoch console lines.
 - `seed` (not in the template): base seed, default `0`; `sample-multi` sets it per chain.
-- `gauge_projection.enabled`, `.mode`, `.dims`, `.apply_noise`, `.apply_momentum`: project out
-  the per-component translation during sampling. Off; the centroid prior handles the gauge.
+- `gauge_projection.enabled`, `.mode`, `.dims`, `.apply_noise`, `.apply_momentum`: hard gauge fix,
+  re-centering each connected component's mean shift to zero after every step in all phases. Set
+  `enabled: true, mode: "cluster", dims: [0, 1, 2, 3]` to keep every component's frame at the input
+  catalog (the soft centroid prior does not hold the frame on large datasets).
 - `torch` (not in the template): `allow_tf32`, `matmul_precision`, `compile_eikonet` and friends.
 
 Change first: nothing. Set `reset_batch_numbers: false` only when you intend to resume.

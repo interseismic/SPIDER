@@ -3,6 +3,15 @@ from typing import Optional
 import torch
 
 from .gauge import project_event_mean_inplace
+from .block_gn import (
+    BLOCK_GN_NAME,
+    block_gn_diag_metric,
+    block_gn_drift_and_noise,
+    block_gn_gauge_spec,
+    block_gn_natural_step,
+    ensure_block_gn_metric,
+)
+from spider.utils.console import warn as _warn
 
 _COMPONENT_LRD_ALIASES = {"component_lrd", "cc_lrd", "block_lrd", "component-lrd"}
 
@@ -103,7 +112,10 @@ def _build_lrd_metric(
     if (not isinstance(lam, torch.Tensor)) or lam.shape != (rank,) or lam.device != g.device or lam.dtype != g.dtype:
         lam = torch.zeros((rank,), device=g.device, dtype=g.dtype)
 
-    if not freeze_preconditioner:
+    # The SUBSPACE refresh can be frozen independently of the diagonal (which must stay
+    # adaptive for stability): a rotating U/lambda makes the phase-4 kernel time-inhomogeneous
+    # and shows up as slow per-event drift. Set via lrd.freeze_subspace_after (sampling epochs).
+    if not (freeze_preconditioner or bool(group.get("lrd_subspace_frozen", False))):
         if mode == "oja":
             # A one-time Python flag avoids two full-tensor reductions plus two
             # host syncs per step just to re-detect the initialized state.
@@ -371,7 +383,7 @@ def _build_component_lrd_metric(
         if (not isinstance(lam, torch.Tensor)) or lam.shape != (rank,) or lam.device != g.device or lam.dtype != g.dtype:
             lam = torch.zeros((rank,), device=g.device, dtype=g.dtype)
 
-        if not freeze_preconditioner:
+        if not (freeze_preconditioner or bool(group.get("lrd_subspace_frozen", False))):
             if mode == "oja":
                 u_ready = bool(sub.get("U_ready", False))
                 if not u_ready:
@@ -693,6 +705,48 @@ class SGHMC(torch.optim.Optimizer):
                     state["ema_g2"] = ema_g2
                 state["step"] = int(state.get("step", 0)) + 1
 
+                if preconditioning and preconditioner_type == BLOCK_GN_NAME:
+                    # Block Gauss-Newton metric (see spider/optim/block_gn.py): fixed per-event 4x4 M_i,
+                    # natural step s = lr * N (dimensionless), momentum in metric-scaled units.
+                    M_blk, L_blk = ensure_block_gn_metric(self, group, state, p)
+                    if reparam_scale is not None and not bool(getattr(self, "_block_gn_reparam_warned", False)):
+                        _warn("block_gn preconditioner ignores sampler.reparameterization (the metric already "
+                              "carries the coordinate units).", section="PRECOND")
+                        setattr(self, "_block_gn_reparam_warned", True)
+                    g_drift = grad.mul(n_obs)
+                    s_nat = block_gn_natural_step(group)
+                    ema_g.mul_(grad_ema_beta).add_(g_drift, alpha=(1.0 - grad_ema_beta))
+                    ema_g2.mul_(grad_ema_beta).addcmul_(g_drift, g_drift, value=(1.0 - grad_ema_beta))
+                    std = (math.sqrt(2.0 * alpha * s_nat) * math.sqrt(max(temperature, 0.0)) * noise_scale
+                           if (add_noise and temperature > 0.0 and noise_scale > 0.0) else 0.0)
+                    drift_blk, noise = block_gn_drift_and_noise(M=M_blk, L=L_blk, g=g_drift, noise_std=std, gauge=block_gn_gauge_spec(self, p))
+                    m.mul_(1.0 - alpha)
+                    m.add_(drift_blk, alpha=-s_nat)
+                    if noise is not None:
+                        try:
+                            if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                                if bool(getattr(self, "_gauge_project_apply_noise", True)):
+                                    dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                                    mode = str(getattr(self, "_gauge_project_mode", "global"))
+                                    cid = getattr(self, "_gauge_cluster_ids", None)
+                                    cc = getattr(self, "_gauge_cluster_counts", None)
+                                    project_event_mean_inplace(noise, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                        except Exception:
+                            pass
+                        m.add_(noise)
+                    try:
+                        if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
+                            if bool(getattr(self, "_gauge_project_apply_momentum", True)):
+                                dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
+                                mode = str(getattr(self, "_gauge_project_mode", "global"))
+                                cid = getattr(self, "_gauge_cluster_ids", None)
+                                cc = getattr(self, "_gauge_cluster_counts", None)
+                                project_event_mean_inplace(m, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
+                    except Exception:
+                        pass
+                    p.add_(m)
+                    continue
+
                 if preconditioning and preconditioner_type in {"lrd", "component_lrd"}:
                     if preconditioner_type == "component_lrd":
                         d_flat, comp_factors = _build_component_lrd_metric(
@@ -923,6 +977,8 @@ class SGHMC(torch.optim.Optimizer):
             
             state = self.state.get(p, {})
             
+            if preconditioner_type == BLOCK_GN_NAME:
+                return _five_num(block_gn_diag_metric(state, p))
             if preconditioner_type in {"lrd", "component_lrd"}:
                 G_diag = state.get("precond_diag", None)
                 if isinstance(G_diag, torch.Tensor):
@@ -1012,8 +1068,12 @@ class SGHMC(torch.optim.Optimizer):
                 
                 var_g = (ema_g2 - ema_g * ema_g).clamp_min(0.0)
                 
+                lr_use = lr
                 if preconditioning:
-                    if preconditioner_type in {"lrd", "component_lrd"}:
+                    if preconditioner_type == BLOCK_GN_NAME:
+                        G = block_gn_diag_metric(state, p)
+                        lr_use = block_gn_natural_step(group)
+                    elif preconditioner_type in {"lrd", "component_lrd"}:
                         G = state.get("precond_diag", None)
                         if (not isinstance(G, torch.Tensor)) or G.shape != p.shape:
                             G = torch.ones_like(p)
@@ -1027,11 +1087,11 @@ class SGHMC(torch.optim.Optimizer):
                     G = torch.ones_like(p)
                 
                 # SGHMC noise variance per parameter in momentum/update space
-                var_noise = (2.0 * alpha * lr) * (noise_scale * noise_scale) * max(temperature, 0.0) * G
+                var_noise = (2.0 * alpha * lr_use) * (noise_scale * noise_scale) * max(temperature, 0.0) * G
                 denom = torch.where(var_noise > 0.0, var_noise, var_noise.new_full(var_noise.shape, eps))
                 
                 # Gradient noise-induced update variance via EMA stats
-                num = (lr * lr) * (G * G) * var_g
+                num = (lr_use * lr_use) * (G * G) * var_g
                 
                 ratio = (num / denom).clamp_min(1e-30)
                 finite_mask = torch.isfinite(ratio)
@@ -1119,7 +1179,11 @@ class SGHMC(torch.optim.Optimizer):
                     continue
 
                 # Compute effective G used for noise injection
-                if preconditioning and preconditioner_type in {"lrd", "component_lrd"}:
+                lr_eff_t = lr
+                if preconditioning and preconditioner_type == BLOCK_GN_NAME:
+                    G_eff = block_gn_diag_metric(state, m)
+                    lr_eff_t = block_gn_natural_step(group)
+                elif preconditioning and preconditioner_type in {"lrd", "component_lrd"}:
                     G_eff = state.get("precond_diag", None)
                     if (not isinstance(G_eff, torch.Tensor)) or G_eff.shape != m.shape:
                         G_eff = torch.ones_like(m)
@@ -1135,7 +1199,7 @@ class SGHMC(torch.optim.Optimizer):
                     else:
                         G_eff = torch.ones_like(m)
 
-                denom = (lr * (noise_scale * noise_scale)) * G_eff
+                denom = (lr_eff_t * (noise_scale * noise_scale)) * G_eff
                 denom = torch.where(denom > 0.0, denom, denom.new_full(denom.shape, eps))
                 # m^2-based (may include drift mean)
                 teff_msq = (scale * (m * m)) / denom

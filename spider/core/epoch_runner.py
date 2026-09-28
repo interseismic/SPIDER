@@ -7,7 +7,7 @@ import torch.distributed as dist
 from spider.core.hierarchy import update_precision_hyperparameter
 from spider.utils.console import info, warn
 
-from spider.core.state import LocateState, _current_noise_scales, _clamp_dX_inplace
+from spider.core.state import LocateState, _current_noise_scales, _clamp_dX_inplace, _project_gauge_inplace
 from spider.core.batching import _ensure_owner_buckets, _iter_event_batches
 from spider.core.modeling import (
     posterior_loss,
@@ -17,6 +17,7 @@ from spider.core.modeling import (
 )
 from spider.utils.wandb_gates import want_wandb_group as _want_wandb_group
 from spider.optim.gauge import project_event_mean_inplace
+from spider.optim.block_gn import block_gn_prior_updated_hook
 
 
 # Standardized stdout helper
@@ -1442,6 +1443,7 @@ def _run_epoch(
             torch.nan_to_num_(state.dX_src.data, nan=0.0, posinf=0.0, neginf=0.0)
         
         _clamp_dX_inplace(state)
+        _project_gauge_inplace(state)  # hard per-component (or global) gauge fix, exact for any optimizer
         
         # Sampling (Phase 4)
         if is_sampling:
@@ -1634,6 +1636,12 @@ def _run_epoch(
                     else:
                         new_P0 = update_precision_hyperparameter(state.dX_src.detach(), nu, V_inv_common, mode="sample")
                         state.event_precision_matrix = new_P0
+                    # The block Gauss-Newton metric includes the prior precision; schedule a rebuild
+                    # (no-op for other preconditioners or when the preconditioner is frozen).
+                    try:
+                        block_gn_prior_updated_hook(state, getattr(state, "sampler", None))
+                    except Exception:
+                        pass
                     # Lightweight visibility: report implied stds periodically (or every update if update_every is large).
                     try:
                         # Prefer the existing diagnostics cadence knob if present.
@@ -1668,6 +1676,60 @@ def _run_epoch(
                 except Exception:
                     # Avoid silent failures; warn once per epoch.
                     warn("Hierarchical event prior update failed; leaving P0 unchanged for this epoch.", section="PRIORS")
+
+        # Optional: independence-Metropolis resampling of weakly-observed events (sampling only).
+        # Draws fresh positions from the hierarchical event prior with an MH correction over
+        # each weak event's own rows, so prior-dominated events contribute properly smeared
+        # marginals instead of slow lumpy random walks. See docs/weak-event-mh.md.
+        if (
+            bool(state.params.get("_weak_mh_enable", False))
+            and phase_id == 4
+            and getattr(state, "event_precision_matrix", None) is not None
+        ):
+            wm_every = max(1, int(state.params.get("_weak_mh_every_epochs", 10)))
+            wm_start = int(state.params.get("_weak_mh_start_epoch", 0) or 0)
+            if epoch_index >= wm_start and (epoch_index % wm_every) == 0 and ((not ddp_enabled) or ddp_is_main):
+                try:
+                    from spider.optim.weak_event_mh import build_weak_event_cache, weak_event_mh_sweep
+
+                    wm_cache = getattr(state, "_weak_mh_cache", None)
+                    wm_max = int(state.params.get("_weak_mh_max_dtimes", 100))
+                    if wm_cache is None or wm_cache.get("max_dtimes") != wm_max:
+                        wm_cache = build_weak_event_cache(state.II, int(state.dX_src.shape[0]), wm_max)
+                        state._weak_mh_cache = wm_cache
+                        info(
+                            f"Weak-event MH: {wm_cache.get('n_weak', 0)} events with <= {wm_max} dtimes "
+                            f"in {wm_cache.get('n_colors', 0)} conflict-free groups",
+                            section="SAMPLER",
+                        )
+                    cen_std = None
+                    if bool(state.params.get("prior_centroid_enable", False)):
+                        cen_std = state.params.get("prior_centroid_std", None)
+                    wm_stats = weak_event_mh_sweep(
+                        dX=state.dX_src.data,
+                        X_src=state.X_src,
+                        II=state.II,
+                        YY=state.YY,
+                        model=state.model,
+                        precision=state.event_precision_matrix,
+                        cluster_ids=state.cluster_ids,
+                        sigma_ps=tuple(state.params.get("phase_unc", (0.02, 0.02))),
+                        cache=wm_cache,
+                        centroid_std=cen_std,
+                        batch_size=int(state.params.get("batch_size_warmup", 500_000)),
+                        params=state.params,
+                    )
+                    if wm_stats["n_proposed"] > 0:
+                        by = wm_stats.get("accept_by_degree", {})
+                        by_s = " | ".join(f"{k} dtimes: {a}/{n}" for k, (a, n) in by.items()) if by else ""
+                        info(
+                            f"Weak-event MH sweep: accepted {wm_stats['n_accepted']}/{wm_stats['n_proposed']} "
+                            f"(median jump {wm_stats['median_jump_m']:.0f} m)"
+                            + (f" [{by_s}]" if by_s else ""),
+                            section="SAMPLER",
+                        )
+                except Exception as exc:
+                    warn(f"Weak-event MH sweep failed; positions unchanged this epoch: {exc}", section="SAMPLER")
 
         # Prefer weighted mean over edges; fallback to unweighted mean if something went wrong.
         if total_loss_weighted_denom > 0:

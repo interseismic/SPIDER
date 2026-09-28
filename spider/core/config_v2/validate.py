@@ -349,8 +349,19 @@ def _parse_sampler(raw: Mapping[str, Any]) -> SamplerConfig:
             "overrides",
             "lr_schedule",
             "phase1_two_pass",
+            "weak_event_mh",
         },
     )
+    wm = raw.get("weak_event_mh", {})
+    if not isinstance(wm, Mapping):
+        raise single_issue_error(path=f"{path}.weak_event_mh", code="type_error", message="Expected object/dict")
+    _reject_unknown_keys(
+        f"{path}.weak_event_mh", wm,
+        {"enabled", "every_epochs", "start_epoch", "max_dtimes"},
+    )
+    if int(wm.get("max_dtimes", 100)) < 1:
+        raise single_issue_error(path=f"{path}.weak_event_mh.max_dtimes", code="value_error",
+                                 message="Must be >= 1")
     backend = _require_str(raw, "backend", path).lower()
     if backend not in _SAMPLER_BACKENDS:
         raise single_issue_error(
@@ -406,18 +417,71 @@ def _parse_sampler(raw: Mapping[str, Any]) -> SamplerConfig:
     _reject_unknown_keys(
         "inference.sampler.preconditioning",
         preconditioning,
-        {"enabled", "type", "include_gamma", "lrd"},
+        {"enabled", "type", "include_gamma", "lrd", "block_gn"},
     )
     precond_enabled = bool(preconditioning.get("enabled", False))
     precond_type = str(preconditioning.get("type", "none")).strip().lower()
     if precond_type in {"cc_lrd", "block_lrd", "component-lrd"}:
         precond_type = "component_lrd"
-    if precond_enabled and precond_type not in {"rmsprop", "lrd", "component_lrd"}:
+    if precond_enabled and precond_type not in {"rmsprop", "lrd", "component_lrd", "block_gn"}:
         raise single_issue_error(
             path="inference.sampler.preconditioning.type",
             code="enum_error",
-            message="Supported values are: rmsprop, lrd, component_lrd (or disable preconditioning).",
+            message="Supported values are: rmsprop, lrd, component_lrd, block_gn (or disable preconditioning).",
         )
+    bgn_cfg = preconditioning.get("block_gn", {})
+    if bgn_cfg is None:
+        bgn_cfg = {}
+    if not isinstance(bgn_cfg, dict):
+        raise single_issue_error(
+            path="inference.sampler.preconditioning.block_gn", code="type_error", message="Expected object/dict"
+        )
+    _reject_unknown_keys(
+        "inference.sampler.preconditioning.block_gn",
+        bgn_cfg,
+        {"fallback_std", "min_std", "refresh_every_epochs", "refresh_on_prior_update", "batch_size", "jitter"},
+    )
+    for _k, _positive in (("fallback_std", True), ("min_std", False)):
+        _v = bgn_cfg.get(_k, None)
+        if _v is None:
+            continue
+        _bad = (not isinstance(_v, (list, tuple))) or len(_v) != 4 or any(
+            (not isinstance(x, (int, float))) or isinstance(x, bool) or (x <= 0 if _positive else x < 0) for x in _v
+        )
+        if _bad:
+            raise single_issue_error(
+                path=f"inference.sampler.preconditioning.block_gn.{_k}",
+                code="value_error",
+                message="Expected 4 " + ("positive" if _positive else "non-negative") + " numbers [km, km, km, s]",
+            )
+    _bre = bgn_cfg.get("refresh_every_epochs", None)
+    if _bre is not None and ((not isinstance(_bre, int)) or isinstance(_bre, bool) or _bre < 1):
+        raise single_issue_error(
+            path="inference.sampler.preconditioning.block_gn.refresh_every_epochs",
+            code="value_error", message="Must be an integer >= 1 or null",
+        )
+    _bbs = bgn_cfg.get("batch_size", None)
+    if _bbs is not None and ((not isinstance(_bbs, int)) or isinstance(_bbs, bool) or _bbs < 1):
+        raise single_issue_error(
+            path="inference.sampler.preconditioning.block_gn.batch_size",
+            code="value_error", message="Must be an integer >= 1",
+        )
+    _bj = bgn_cfg.get("jitter", None)
+    if _bj is not None and ((not isinstance(_bj, (int, float))) or isinstance(_bj, bool) or _bj < 0.0):
+        raise single_issue_error(
+            path="inference.sampler.preconditioning.block_gn.jitter",
+            code="value_error", message="Must be a number >= 0",
+        )
+    if precond_enabled and precond_type == "block_gn":
+        # Under block_gn, lr[1..3] are dimensionless natural steps; s >= 2 diverges on a quadratic.
+        for _i in (1, 2, 3):
+            if float(lr[_i]) >= 2.0:
+                raise single_issue_error(
+                    path=f"inference.sampler.lr[{_i}]",
+                    code="value_error",
+                    message=("With preconditioning.type='block_gn' the sampler learning rates are dimensionless "
+                             "natural steps (typical 0.05-0.5); values >= 2 are unstable."),
+                )
     lrd_cfg = preconditioning.get("lrd", {})
     if lrd_cfg is not None and not isinstance(lrd_cfg, dict):
         raise single_issue_error(
@@ -524,6 +588,7 @@ def _parse_sampler(raw: Mapping[str, Any]) -> SamplerConfig:
             "reparameterization_enabled": bool(reparam_enabled),
             "lr_schedule": {"phase1": dict(p1_sched)},
             "phase1_two_pass": dict(two_pass),
+            "weak_event_mh": dict(wm),
         },
     )
 
@@ -720,6 +785,34 @@ def validate_cross_field_config(cfg: CanonicalConfig, mode: str | None = None) -
         )
     if mode is not None and not isinstance(mode, str):
         raise single_issue_error(path="<mode>", code="type_error", message="Mode must be string or null")
+    # block_gn preconditioner: the component-mean mode must be projected out (see spider/optim/block_gn.py).
+    try:
+        pc = cfg.inference.sampler.preconditioning or {}
+        pc_type = str(pc.get("type", "none")).strip().lower()
+        pc_on = bool(pc.get("enabled", False)) and pc_type == "block_gn"
+        gp_on = bool((cfg.inference.runtime.gauge_projection or {}).get("enabled", False))
+    except Exception:
+        pc_on, gp_on = False, True
+    if pc_on and not gp_on:
+        raise single_issue_error(
+            path="inference.runtime.gauge_projection.enabled",
+            code="required_when_enabled",
+            message=("Must be true when inference.sampler.preconditioning.type='block_gn': the block metric is "
+                     "unstable along the component-mean (translation) mode unless it is constrained."),
+        )
+    if pc_on:
+        try:
+            centroid_on = bool((cfg.model.priors.get("centroid", {}) or {}).get("enabled", False))
+            gp_dims = list((cfg.inference.runtime.gauge_projection or {}).get("dims", [0, 1, 2]))
+        except Exception:
+            centroid_on, gp_dims = False, [0, 1, 2, 3]
+        if centroid_on and sorted(int(d) for d in gp_dims) != [0, 1, 2, 3]:
+            raise single_issue_error(
+                path="inference.runtime.gauge_projection.dims",
+                code="value_error",
+                message=("Must be [0, 1, 2, 3] when preconditioning.type='block_gn' and the centroid prior is "
+                         "enabled: the centroid prior acts on every coordinate of the component mean."),
+            )
 
 
 def validate_config(raw: Mapping[str, Any], mode: str | None = None) -> CanonicalConfig:
@@ -809,6 +902,9 @@ _PASSTHROUGH_KNOWN_KEYS: Dict[str, Any] = {
     ),
     "inference.sampler.preconditioning.lrd": _leaves(
         "rank", "mode", "update_every", "buffer_size", "eta", "oja_eta", "diag_floor", "target"
+    ),
+    "inference.sampler.preconditioning.block_gn": _leaves(
+        "fallback_std", "min_std", "refresh_every_epochs", "refresh_on_prior_update", "batch_size", "jitter"
     ),
     "inference.sampler.overrides": {
         "core": _leaves("lr_mult", "temperature_mult", "eps", "freeze_preconditioner_sampling"),

@@ -36,6 +36,7 @@ postprocessing-and-analysis-tools
 outputs-and-formats
 pcg-whitening-convergence
 sampler-health
+weak-event-mh
 diagnostics-catalog
 troubleshooting
 ```
