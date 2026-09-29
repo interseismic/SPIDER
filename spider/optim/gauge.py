@@ -7,8 +7,12 @@ Context:
 - We "gauge fix" by projecting out the translation mode in sampler updates (hard constraint on the mean update).
 
 This module provides a lightweight projection used by samplers (pSGLD/SGHMC/AdaptiveSGHMC) to:
-- project the mean gradient out before preconditioner statistics update, and
-- optionally project the injected noise / momentum to avoid mean translation drift.
+- project the mean out of the preconditioned update (pSGLD) / momentum (SGHMC), and
+- optionally project the injected noise to avoid mean translation drift.
+The parameters are additionally re-centered after every step (state._project_gauge_inplace).
+The RAW GRADIENT is deliberately not projected: with a per-element preconditioner that forces every
+event to carry the same gradient at the fixed point, which prior-dominated events can only satisfy
+by moving kilometres (Kumamoto v1: 1-2-dtime events driven to the depth clamp).
 """
 
 from __future__ import annotations

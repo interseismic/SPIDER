@@ -93,8 +93,8 @@ keys such as `tau_s` or `cluster_mode` at that level).
 Pass-through (unknown keys are accepted and ignored at runtime): the contents of
 `model.likelihoods.*` (other than the checks above and `shared_event_re.solver.kind`, which must be
 `pcg` / `pcg_sparse`), `model.filters.*`, `model.eikonet`, `inference.batching.standard` /
-`event_batches`, `inference.runtime.gauge_projection` / `torch`, `inference.sampler.overrides` /
-`preconditioning.lrd`, and `observability.diagnostics`. A misspelled key in these blocks has no
+`event_batches`, `inference.runtime.gauge_projection` / `torch`, `inference.sampler.overrides`,
+and `observability.diagnostics`. A misspelled key in these blocks has no
 effect rather than raising an error, but `spider validate-config` reports every key that no code
 reads as a non-fatal `[warning] <block> (unknown_key): Unknown key(s) ignored by the runtime: ...`
 line, so run it after editing a config. Use `--print-resolved` and the defaults listed in

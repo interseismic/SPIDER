@@ -537,12 +537,9 @@ everywhere), \texttt{preconditioning}, \texttt{reparameterization}, \texttt{over
 \texttt{lr\_schedule}, \texttt{phase1\_two\_pass}.
 
 \paragraph{Preconditioning.}
-\texttt{inference.sampler.preconditioning.\{enabled, type, include\_gamma (default false), lrd\}} with
-\texttt{type} one of \texttt{rmsprop}, \texttt{lrd}, \texttt{component\_lrd} (aliases
-\texttt{cc\_lrd}, \texttt{block\_lrd}, \texttt{component-lrd}). The \texttt{lrd} sub-block accepts
-\texttt{rank} (16), \texttt{mode} (\texttt{svd}\,|\,\texttt{oja}), \texttt{update\_every} (20),
-\texttt{buffer\_size} (64), \texttt{eta} (0.02), \texttt{diag\_floor} (defaults to \texttt{eps}),
-\texttt{target}. \texttt{rmsprop} (diagonal) is the well-tested choice.
+\texttt{inference.sampler.preconditioning.\{enabled, type, include\_gamma (default false)\}} with
+\texttt{type} = \texttt{rmsprop} (diagonal RMSprop metric); \texttt{enabled: false} uses the
+identity metric.
 
 \paragraph{Blocked reparameterization.}
 \texttt{inference.sampler.reparameterization.\{enabled, spatial\_scale, dt\_scale\}}: static
@@ -584,7 +581,7 @@ from the latest checkpoint in \texttt{io.checkpoint\_dir}), \texttt{clear\_sampl
 \texttt{gauge\_projection.\{enabled (false), mode (global\,|\,cluster), dims ([0,1,2]),
 apply\_noise (true), apply\_momentum (true)\}} (hard gauge fix: the mean shift of each connected
 component (\texttt{cluster}) or of all events (\texttt{global}) over the selected dims is removed
-from the gradient, momentum and noise, and the parameters are re-centered exactly after every step
+from the preconditioned update, momentum and noise (not from the raw gradient), and the parameters are re-centered exactly after every step
 in all phases; with \texttt{mode=cluster}, \texttt{dims=[0,1,2,3]} every component keeps its
 input-catalog frame regardless of its size, which the soft centroid prior does not guarantee on large
 datasets), \texttt{torch.\{allow\_tf32, matmul\_precision, compile\_eikonet,

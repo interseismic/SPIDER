@@ -288,16 +288,13 @@ then `min_unique_phase_per_event` and `min_event_degree` to trim poorly connecte
 - `backend`: `sghmc` or `psgld` (the example uses `psgld`; see {doc}`sampler-options`).
 - `epochs_per_phase`: `[Phase 1 MAP, Phase 2 preconditioner warm-up, Phase 3 noise ramp, Phase 4
   sampling]`. Phase 1 must comfortably exceed `priors.event.hyper.update.start_epoch`.
-- `lr`: `lr[0]` is the Phase-1 Adam rate; `lr[1..3]` are per-observation sampler step sizes
-  (with `preconditioning.type: block_gn` they are dimensionless natural steps, typically 0.05-0.5).
+- `lr`: `lr[0]` is the Phase-1 Adam rate; `lr[1..3]` are per-observation sampler step sizes.
 - `temperature`: injected-noise temperature (`1.0` = the posterior; `0` = noise off).
 - `noise_scale_mult`: extra multiplier on the injected noise in Phases 3 and 4.
 - `sghmc_alpha`: SGHMC friction; required key (a number for `sghmc`, `null` allowed for `psgld`).
 - `eps`, `beta`: RMSprop damping and second-moment decay of the preconditioner.
-- `preconditioning.enabled`, `.type`, `.include_gamma`: `rmsprop` diagonal preconditioner
-  (`lrd`/`component_lrd` with a `preconditioning.lrd` sub-block, and `block_gn`, the per-event
-  Gauss-Newton metric that equalizes mixing across well- and poorly-observed events and requires
-  `runtime.gauge_projection.enabled: true`, are the alternatives; see {doc}`sampler-options`).
+- `preconditioning.enabled`, `.type`, `.include_gamma`: `rmsprop` diagonal preconditioner (the
+  only supported type; see {doc}`sampler-options`).
 - `freeze_preconditioner_sampling`: freeze preconditioner statistics in Phases 3 and 4.
 - `lr_schedule.phase1.type`, `.eta_min` (and optional `.T_max`): cosine decay of the Phase-1
   learning rate from `lr[0]` to `eta_min` over the pass. Recommended on.

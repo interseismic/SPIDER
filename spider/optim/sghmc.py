@@ -3,24 +3,10 @@ from typing import Optional
 import torch
 
 from .gauge import project_event_mean_inplace
-from .block_gn import (
-    BLOCK_GN_NAME,
-    block_gn_diag_metric,
-    block_gn_drift_and_noise,
-    block_gn_gauge_spec,
-    block_gn_natural_step,
-    ensure_block_gn_metric,
-)
-from spider.utils.console import warn as _warn
-
-_COMPONENT_LRD_ALIASES = {"component_lrd", "cc_lrd", "block_lrd", "component-lrd"}
 
 
 def _canonical_preconditioner_name(preconditioner: str) -> str:
-    p = str(preconditioner).strip().lower()
-    if p in _COMPONENT_LRD_ALIASES:
-        return "component_lrd"
-    return p
+    return str(preconditioner).strip().lower()
 
 
 _REPARAM_SCALE_CACHE: dict = {}
@@ -50,518 +36,6 @@ def _blocked_reparam_scale(group: dict, p: torch.Tensor) -> torch.Tensor | None:
         scale[:, 3] = float(s_dt)
         _REPARAM_SCALE_CACHE[key] = scale
     return scale
-
-
-def _build_lrd_metric(
-    *,
-    group: dict,
-    state: dict,
-    grad_for_precond: torch.Tensor,
-    beta: float,
-    eps: float,
-    freeze_preconditioner: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Build/update a low-rank-plus-diagonal preconditioner for a parameter tensor.
-    """
-    g = grad_for_precond
-    D = int(g.numel())
-    g_flat = g.reshape(-1)
-
-    rank_cfg = int(group.get("lrd_rank", 16))
-    rank = max(0, min(int(rank_cfg), D))
-    mode = str(group.get("lrd_mode", "svd")).strip().lower()
-    if mode in {"randomized_svd", "stochastic_svd"}:
-        mode = "svd"
-    if mode not in {"svd", "oja"}:
-        mode = "svd"
-    update_every = max(1, int(group.get("lrd_update_every", 20)))
-    buffer_size = max(max(2, rank + 1), int(group.get("lrd_buffer_size", 64)))
-    oja_eta = float(group.get("lrd_oja_eta", 0.02))
-    if (not math.isfinite(oja_eta)) or (oja_eta <= 0.0):
-        oja_eta = 0.02
-    diag_floor = float(group.get("lrd_diag_floor", eps))
-    if (not math.isfinite(diag_floor)) or (diag_floor <= 0.0):
-        diag_floor = max(float(eps), 1e-12)
-
-    v = state.get("exp_avg_sq", None)
-    if (not isinstance(v, torch.Tensor)) or v.shape != g.shape or v.device != g.device or v.dtype != g.dtype:
-        v = torch.zeros_like(g)
-        state["exp_avg_sq"] = v
-    if not freeze_preconditioner:
-        v.mul_(beta).addcmul_(g, g, value=(1.0 - beta))
-    step_i = int(state.get("step", 1))
-    if 0.0 <= float(beta) < 1.0:
-        v_hat = v / (1.0 - (float(beta) ** max(step_i, 1)))
-    else:
-        v_hat = v
-    d_flat = (1.0 / (float(eps) + v_hat.clamp_min(0.0).sqrt())).reshape(-1).clamp_min(diag_floor)
-
-    if rank <= 0:
-        U = torch.zeros((D, 0), device=g.device, dtype=g.dtype)
-        lam = torch.zeros((0,), device=g.device, dtype=g.dtype)
-        state["lrd_U"] = U
-        state["lrd_lambda"] = lam
-        state["precond_diag"] = d_flat.reshape_as(g).detach()
-        return d_flat, U, lam
-
-    U = state.get("lrd_U", None)
-    lam = state.get("lrd_lambda", None)
-    if (not isinstance(U, torch.Tensor)) or U.shape != (D, rank) or U.device != g.device or U.dtype != g.dtype:
-        U = torch.zeros((D, rank), device=g.device, dtype=g.dtype)
-    if (not isinstance(lam, torch.Tensor)) or lam.shape != (rank,) or lam.device != g.device or lam.dtype != g.dtype:
-        lam = torch.zeros((rank,), device=g.device, dtype=g.dtype)
-
-    # The SUBSPACE refresh can be frozen independently of the diagonal (which must stay
-    # adaptive for stability): a rotating U/lambda makes the phase-4 kernel time-inhomogeneous
-    # and shows up as slow per-event drift. Set via lrd.freeze_subspace_after (sampling epochs).
-    if not (freeze_preconditioner or bool(group.get("lrd_subspace_frozen", False))):
-        if mode == "oja":
-            # A one-time Python flag avoids two full-tensor reductions plus two
-            # host syncs per step just to re-detect the initialized state.
-            u_ready = bool(state.get("lrd_U_ready", False))
-            if not u_ready:
-                u_ready = bool(torch.any(torch.isfinite(U))) and float(U.abs().sum().item()) != 0.0
-            if not u_ready:
-                gn = float(g_flat.norm().item())
-                if gn > 0.0:
-                    U[:, 0] = g_flat / max(gn, 1e-12)
-                if rank > 1:
-                    U[:, 1:] = torch.randn((D, rank - 1), device=g.device, dtype=g.dtype)
-                try:
-                    U, _ = torch.linalg.qr(U, mode="reduced")
-                except Exception:
-                    pass
-                u_ready = (gn > 0.0) or (rank > 1)
-            state["lrd_U_ready"] = bool(u_ready)
-            q = U.mT @ g_flat
-            U = U + (oja_eta * torch.outer(g_flat, q))
-            try:
-                U, _ = torch.linalg.qr(U, mode="reduced")
-            except Exception:
-                pass
-            if U.shape[1] > rank:
-                U = U[:, :rank].contiguous()
-            if U.shape[1] < rank:
-                U_pad = torch.zeros((D, rank), device=g.device, dtype=g.dtype)
-                if U.shape[1] > 0:
-                    U_pad[:, : U.shape[1]] = U
-                U = U_pad
-            q = U.mT @ g_flat
-            lam.mul_(beta).addcmul_(q, q, value=(1.0 - beta))
-        else:
-            # Preallocated ring buffer: one row copy per step instead of
-            # re-concatenating the whole (buffer_size, D) history each step.
-            ring = state.get("lrd_grad_ring", None)
-            pos = int(state.get("lrd_grad_ring_pos", 0))
-            fill = int(state.get("lrd_grad_ring_fill", 0))
-            if (
-                (not isinstance(ring, torch.Tensor))
-                or ring.shape != (int(buffer_size), int(D))
-                or ring.device != g.device
-                or ring.dtype != g.dtype
-            ):
-                ring = torch.zeros((int(buffer_size), int(D)), device=g.device, dtype=g.dtype)
-                pos = 0
-                fill = 0
-                # Migrate a legacy chronological buffer (older checkpoints).
-                old = state.pop("lrd_grad_buffer", None)
-                if isinstance(old, torch.Tensor) and old.ndim == 2 and int(old.shape[1]) == int(D):
-                    rows = old[-int(buffer_size):].to(device=g.device, dtype=g.dtype)
-                    n0 = int(rows.shape[0])
-                    if n0 > 0:
-                        ring[:n0].copy_(rows)
-                        fill = n0
-                        pos = n0 % int(buffer_size)
-                state["lrd_grad_ring"] = ring
-            ring[pos].copy_(g_flat.detach())
-            pos = (pos + 1) % int(buffer_size)
-            fill = min(fill + 1, int(buffer_size))
-            state["lrd_grad_ring_pos"] = pos
-            state["lrd_grad_ring_fill"] = fill
-            if (int(state.get("step", 1)) % int(update_every) == 0) and fill >= max(2, rank):
-                # Materialize rows in chronological order only on SVD steps.
-                if fill < int(buffer_size):
-                    buf = ring[:fill]
-                elif pos == 0:
-                    buf = ring
-                else:
-                    buf = torch.cat([ring[pos:], ring[:pos]], dim=0)
-                X = buf - buf.mean(dim=0, keepdim=True)
-                try:
-                    _, S, Vh = torch.linalg.svd(X, full_matrices=False)
-                    r_eff = min(rank, int(Vh.shape[0]), int(S.shape[0]))
-                    if r_eff > 0:
-                        U_new = Vh[:r_eff, :].mT.contiguous()
-                        lam_new = (S[:r_eff] * S[:r_eff]) / float(max(1, int(X.shape[0]) - 1))
-                        U.zero_()
-                        U[:, :r_eff] = U_new
-                        lam.mul_(beta)
-                        lam[:r_eff].add_(lam_new.to(dtype=lam.dtype, device=lam.device), alpha=(1.0 - beta))
-                except Exception:
-                    pass
-
-    lam = lam.clamp_min(0.0)
-    if int(U.numel()) > 0 and int(lam.numel()) > 0:
-        try:
-            diag_low = (U * U).matmul(lam)
-        except Exception:
-            diag_low = torch.zeros((D,), device=g.device, dtype=g.dtype)
-    else:
-        diag_low = torch.zeros((D,), device=g.device, dtype=g.dtype)
-    diag_proxy = (d_flat + diag_low).clamp_min(diag_floor).reshape_as(g)
-    state["lrd_U"] = U.detach()
-    state["lrd_lambda"] = lam.detach()
-    state["precond_diag"] = diag_proxy.detach()
-    return d_flat, U, lam
-
-
-def _build_component_event_groups(
-    *,
-    state: dict,
-    component_ids: torch.Tensor,
-    n_events: int,
-) -> tuple[list[torch.Tensor], list[int]]:
-    """Returns (groups, keys): per-component event index tensors and the
-    matching integer component ids. Keys are computed once at cache build so
-    the per-step loop never has to sync component ids off the device."""
-    cache = state.get("lrd_component_groups_cache", None)
-    if isinstance(cache, dict):
-        cid_cached = cache.get("component_ids", None)
-        groups_cached = cache.get("groups", None)
-        keys_cached = cache.get("keys", None)
-        if (
-            isinstance(cid_cached, torch.Tensor)
-            and isinstance(groups_cached, list)
-            and isinstance(keys_cached, list)
-            and len(keys_cached) == len(groups_cached)
-            and cid_cached.device == component_ids.device
-            and int(cid_cached.numel()) == int(component_ids.numel())
-            and int(n_events) == int(cache.get("n_events", -1))
-        ):
-            try:
-                if int(cid_cached.data_ptr()) == int(component_ids.data_ptr()):
-                    return groups_cached, keys_cached
-            except Exception:
-                pass
-    keys: list[int] = []
-    if n_events <= 0:
-        groups: list[torch.Tensor] = []
-    else:
-        cid = component_ids.to(dtype=torch.int64)
-        order = torch.argsort(cid)
-        if int(order.numel()) <= 0:
-            groups = []
-        else:
-            cid_sorted = cid.index_select(0, order)
-            if int(cid_sorted.numel()) <= 1:
-                groups = [order]
-                keys = [int(cid_sorted[0].item())]
-            else:
-                split = torch.nonzero(cid_sorted[1:] != cid_sorted[:-1], as_tuple=False).flatten() + 1
-                starts = torch.cat([split.new_tensor([0]), split], dim=0)
-                ends = torch.cat([split, split.new_tensor([int(order.numel())])], dim=0)
-                key_vals = cid_sorted.index_select(0, starts).tolist()
-                groups = []
-                for s, e, kv in zip(starts.tolist(), ends.tolist(), key_vals):
-                    if int(e) > int(s):
-                        groups.append(order[int(s):int(e)])
-                        keys.append(int(kv))
-    state["lrd_component_groups_cache"] = {
-        "component_ids": component_ids,
-        "groups": groups,
-        "keys": keys,
-        "n_events": int(n_events),
-    }
-    return groups, keys
-
-
-def _build_component_lrd_metric(
-    *,
-    group: dict,
-    state: dict,
-    grad_for_precond: torch.Tensor,
-    beta: float,
-    eps: float,
-    freeze_preconditioner: bool,
-) -> tuple[torch.Tensor, list[dict]]:
-    """
-    Component-wise low-rank+diagonal preconditioner.
-
-    This keeps low-rank couplings strictly within DD connected components.
-    Returns:
-      d_flat: full diagonal term over all entries
-      factors: list of per-component factors {event_idx, U, lam}
-    """
-    g = grad_for_precond
-    if g.ndim != 2:
-        d_flat, U, lam = _build_lrd_metric(
-            group=group,
-            state=state,
-            grad_for_precond=grad_for_precond,
-            beta=beta,
-            eps=eps,
-            freeze_preconditioner=freeze_preconditioner,
-        )
-        factors: list[dict] = []
-        if int(U.numel()) > 0 and int(lam.numel()) > 0:
-            factors.append({"event_idx": None, "U": U, "lam": lam})
-        return d_flat, factors
-
-    component_ids = group.get("lrd_component_ids", None)
-    if not isinstance(component_ids, torch.Tensor) or component_ids.ndim != 1 or int(component_ids.numel()) != int(g.shape[0]):
-        d_flat, U, lam = _build_lrd_metric(
-            group=group,
-            state=state,
-            grad_for_precond=grad_for_precond,
-            beta=beta,
-            eps=eps,
-            freeze_preconditioner=freeze_preconditioner,
-        )
-        factors = []
-        if int(U.numel()) > 0 and int(lam.numel()) > 0:
-            factors.append({"event_idx": None, "U": U, "lam": lam})
-        return d_flat, factors
-
-    if component_ids.device != g.device:
-        component_ids = component_ids.to(device=g.device)
-
-    rank_cfg = int(group.get("lrd_rank", 16))
-    mode = str(group.get("lrd_mode", "svd")).strip().lower()
-    if mode in {"randomized_svd", "stochastic_svd"}:
-        mode = "svd"
-    if mode not in {"svd", "oja"}:
-        mode = "svd"
-    update_every = max(1, int(group.get("lrd_update_every", 20)))
-    buffer_size = max(max(2, rank_cfg + 1), int(group.get("lrd_buffer_size", 64)))
-    oja_eta = float(group.get("lrd_oja_eta", 0.02))
-    if (not math.isfinite(oja_eta)) or (oja_eta <= 0.0):
-        oja_eta = 0.02
-    diag_floor = float(group.get("lrd_diag_floor", eps))
-    if (not math.isfinite(diag_floor)) or (diag_floor <= 0.0):
-        diag_floor = max(float(eps), 1e-12)
-
-    v = state.get("exp_avg_sq", None)
-    if (not isinstance(v, torch.Tensor)) or v.shape != g.shape or v.device != g.device or v.dtype != g.dtype:
-        v = torch.zeros_like(g)
-        state["exp_avg_sq"] = v
-    if not freeze_preconditioner:
-        v.mul_(beta).addcmul_(g, g, value=(1.0 - beta))
-    step_i = int(state.get("step", 1))
-    if 0.0 <= float(beta) < 1.0:
-        v_hat = v / (1.0 - (float(beta) ** max(step_i, 1)))
-    else:
-        v_hat = v
-    d2 = (1.0 / (float(eps) + v_hat.clamp_min(0.0).sqrt())).clamp_min(diag_floor)
-    d_flat = d2.reshape(-1)
-
-    comp_states = state.get("lrd_component_states", None)
-    if not isinstance(comp_states, dict):
-        comp_states = {}
-    factors: list[dict] = []
-    diag_low = torch.zeros_like(g)
-    n_events, d_event = int(g.shape[0]), int(g.shape[1])
-    event_groups, comp_keys = _build_component_event_groups(state=state, component_ids=component_ids, n_events=n_events)
-
-    for ev_idx, comp_key in zip(event_groups, comp_keys):
-        m = int(ev_idx.numel())
-        if m <= 0:
-            continue
-        Dk = int(m * d_event)
-        rank = max(0, min(int(rank_cfg), Dk))
-        if rank <= 0:
-            continue
-        sub = comp_states.get(comp_key, {})
-        if not isinstance(sub, dict):
-            sub = {}
-
-        gk = g.index_select(0, ev_idx).reshape(-1)
-        U = sub.get("U", None)
-        lam = sub.get("lam", None)
-        if (not isinstance(U, torch.Tensor)) or U.shape != (Dk, rank) or U.device != g.device or U.dtype != g.dtype:
-            U = torch.zeros((Dk, rank), device=g.device, dtype=g.dtype)
-        if (not isinstance(lam, torch.Tensor)) or lam.shape != (rank,) or lam.device != g.device or lam.dtype != g.dtype:
-            lam = torch.zeros((rank,), device=g.device, dtype=g.dtype)
-
-        if not (freeze_preconditioner or bool(group.get("lrd_subspace_frozen", False))):
-            if mode == "oja":
-                u_ready = bool(sub.get("U_ready", False))
-                if not u_ready:
-                    u_ready = bool(torch.any(torch.isfinite(U))) and float(U.abs().sum().item()) != 0.0
-                if not u_ready:
-                    gn = float(gk.norm().item())
-                    if gn > 0.0:
-                        U[:, 0] = gk / max(gn, 1e-12)
-                    if rank > 1:
-                        U[:, 1:] = torch.randn((Dk, rank - 1), device=g.device, dtype=g.dtype)
-                    try:
-                        U, _ = torch.linalg.qr(U, mode="reduced")
-                    except Exception:
-                        pass
-                    u_ready = (gn > 0.0) or (rank > 1)
-                sub["U_ready"] = bool(u_ready)
-                q = U.mT @ gk
-                U = U + (oja_eta * torch.outer(gk, q))
-                try:
-                    U, _ = torch.linalg.qr(U, mode="reduced")
-                except Exception:
-                    pass
-                if U.shape[1] > rank:
-                    U = U[:, :rank].contiguous()
-                if U.shape[1] < rank:
-                    U_pad = torch.zeros((Dk, rank), device=g.device, dtype=g.dtype)
-                    if U.shape[1] > 0:
-                        U_pad[:, : U.shape[1]] = U
-                    U = U_pad
-                q = U.mT @ gk
-                lam.mul_(beta).addcmul_(q, q, value=(1.0 - beta))
-            else:
-                ring = sub.get("grad_ring", None)
-                pos = int(sub.get("grad_ring_pos", 0))
-                fill = int(sub.get("grad_ring_fill", 0))
-                if (
-                    (not isinstance(ring, torch.Tensor))
-                    or ring.shape != (int(buffer_size), int(Dk))
-                    or ring.device != g.device
-                    or ring.dtype != g.dtype
-                ):
-                    ring = torch.zeros((int(buffer_size), int(Dk)), device=g.device, dtype=g.dtype)
-                    pos = 0
-                    fill = 0
-                    old = sub.pop("grad_buffer", None)
-                    if isinstance(old, torch.Tensor) and old.ndim == 2 and int(old.shape[1]) == int(Dk):
-                        rows = old[-int(buffer_size):].to(device=g.device, dtype=g.dtype)
-                        n0 = int(rows.shape[0])
-                        if n0 > 0:
-                            ring[:n0].copy_(rows)
-                            fill = n0
-                            pos = n0 % int(buffer_size)
-                    sub["grad_ring"] = ring
-                ring[pos].copy_(gk.detach())
-                pos = (pos + 1) % int(buffer_size)
-                fill = min(fill + 1, int(buffer_size))
-                sub["grad_ring_pos"] = pos
-                sub["grad_ring_fill"] = fill
-                if (int(step_i) % int(update_every) == 0) and fill >= max(2, rank):
-                    if fill < int(buffer_size):
-                        buf = ring[:fill]
-                    elif pos == 0:
-                        buf = ring
-                    else:
-                        buf = torch.cat([ring[pos:], ring[:pos]], dim=0)
-                    X = buf - buf.mean(dim=0, keepdim=True)
-                    try:
-                        _, S, Vh = torch.linalg.svd(X, full_matrices=False)
-                        r_eff = min(rank, int(Vh.shape[0]), int(S.shape[0]))
-                        if r_eff > 0:
-                            U_new = Vh[:r_eff, :].mT.contiguous()
-                            lam_new = (S[:r_eff] * S[:r_eff]) / float(max(1, int(X.shape[0]) - 1))
-                            U.zero_()
-                            U[:, :r_eff] = U_new
-                            lam.mul_(beta)
-                            lam[:r_eff].add_(lam_new.to(dtype=lam.dtype, device=lam.device), alpha=(1.0 - beta))
-                    except Exception:
-                        pass
-
-        lam = lam.clamp_min(0.0)
-        sub["U"] = U.detach()
-        sub["lam"] = lam.detach()
-        comp_states[comp_key] = sub
-
-        if int(U.numel()) > 0 and int(lam.numel()) > 0:
-            try:
-                diag_low_k = (U * U).matmul(lam).reshape(m, d_event)
-                diag_low[ev_idx, :] = diag_low_k
-                factors.append({"event_idx": ev_idx, "U": U.detach(), "lam": lam.detach()})
-            except Exception:
-                pass
-
-    diag_proxy = (d2 + diag_low).clamp_min(diag_floor)
-    state["lrd_component_states"] = comp_states
-    state["precond_diag"] = diag_proxy.detach()
-    return d_flat, factors
-
-
-def _apply_component_lowrank_drift(
-    *,
-    grad_for_drift: torch.Tensor,
-    pre_flat: torch.Tensor,
-    factors: list[dict],
-) -> torch.Tensor:
-    if not factors:
-        return pre_flat
-    out_flat = pre_flat
-    pre2 = pre_flat.reshape_as(grad_for_drift) if grad_for_drift.ndim == 2 else None
-    d_event = int(grad_for_drift.shape[1]) if grad_for_drift.ndim == 2 else 0
-    for fac in factors:
-        ev_idx = fac.get("event_idx", None)
-        U = fac.get("U", None)
-        lam = fac.get("lam", None)
-        if not isinstance(U, torch.Tensor) or not isinstance(lam, torch.Tensor):
-            continue
-        if int(U.numel()) <= 0 or int(lam.numel()) <= 0:
-            continue
-        if ev_idx is None:
-            try:
-                g_flat = grad_for_drift.reshape(-1)
-                q = U.mT @ g_flat
-                out_flat = out_flat + (U @ (lam * q))
-                if pre2 is not None:
-                    pre2 = out_flat.reshape_as(grad_for_drift)
-            except Exception:
-                continue
-            continue
-        if pre2 is None or not isinstance(ev_idx, torch.Tensor) or int(ev_idx.numel()) <= 0:
-            continue
-        try:
-            gk = grad_for_drift.index_select(0, ev_idx).reshape(-1)
-            q = U.mT @ gk
-            add = (U @ (lam * q)).reshape(int(ev_idx.numel()), d_event)
-            pre2.index_add_(0, ev_idx, add)
-            out_flat = pre2.reshape(-1)
-        except Exception:
-            continue
-    return out_flat
-
-
-def _apply_component_lowrank_noise(
-    *,
-    grad_shape_like: torch.Tensor,
-    noise_flat: torch.Tensor,
-    factors: list[dict],
-) -> torch.Tensor:
-    if not factors:
-        return noise_flat
-    out_flat = noise_flat
-    noise2 = noise_flat.reshape_as(grad_shape_like) if grad_shape_like.ndim == 2 else None
-    d_event = int(grad_shape_like.shape[1]) if grad_shape_like.ndim == 2 else 0
-    for fac in factors:
-        ev_idx = fac.get("event_idx", None)
-        U = fac.get("U", None)
-        lam = fac.get("lam", None)
-        if not isinstance(U, torch.Tensor) or not isinstance(lam, torch.Tensor):
-            continue
-        if int(U.numel()) <= 0 or int(lam.numel()) <= 0:
-            continue
-        if ev_idx is None:
-            try:
-                z2 = torch.randn((int(lam.numel()),), device=out_flat.device, dtype=out_flat.dtype)
-                out_flat = out_flat + (U @ (lam.clamp_min(0.0).sqrt() * z2))
-                if noise2 is not None:
-                    noise2 = out_flat.reshape_as(grad_shape_like)
-            except Exception:
-                continue
-            continue
-        if noise2 is None or not isinstance(ev_idx, torch.Tensor) or int(ev_idx.numel()) <= 0:
-            continue
-        try:
-            z2 = torch.randn((int(lam.numel()),), device=noise2.device, dtype=noise2.dtype)
-            add = (U @ (lam.clamp_min(0.0).sqrt() * z2)).reshape(int(ev_idx.numel()), d_event)
-            noise2.index_add_(0, ev_idx, add)
-            out_flat = noise2.reshape(-1)
-        except Exception:
-            continue
-    return out_flat
 
 
 class SGHMC(torch.optim.Optimizer):
@@ -642,10 +116,7 @@ class SGHMC(torch.optim.Optimizer):
             group.setdefault("alpha", alpha)
             group.setdefault("n_obs", n_obs)
             preconditioning = bool(group.get("preconditioning", True))
-            # Supported preconditioners in current runtime:
-            # - rmsprop (diagonal)
-            # - lrd (global low-rank plus diagonal)
-            # - component_lrd (component-wise low-rank plus diagonal)
+            # Supported preconditioners in current runtime: rmsprop (diagonal); identity when disabled.
             preconditioner_type = _canonical_preconditioner_name(group.get("preconditioner", "rmsprop"))
             add_noise = bool(group.get("add_noise", True))
             noise_scale = float(group.get("noise_scale", 1.0))
@@ -659,19 +130,13 @@ class SGHMC(torch.optim.Optimizer):
                 grad = p.grad
                 reparam_scale = _blocked_reparam_scale(group, p)
 
-                # --- Optional gauge projection: remove translation mode before preconditioner stats update ---
-                try:
-                    gauge_enable = bool(getattr(self, "_gauge_project_enable", False))
-                    gauge_param = getattr(self, "_gauge_project_param", None)
-                    if gauge_enable and (gauge_param is p):
-                        if isinstance(grad, torch.Tensor) and grad.ndim == 2 and int(grad.shape[1]) >= 4:
-                            dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
-                            mode = str(getattr(self, "_gauge_project_mode", "global"))
-                            cid = getattr(self, "_gauge_cluster_ids", None)
-                            cc = getattr(self, "_gauge_cluster_counts", None)
-                            project_event_mean_inplace(grad, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
-                except Exception:
-                    pass
+                # NOTE: the raw gradient is deliberately NOT gauge-projected here. Subtracting the
+                # cluster-mean gradient before the per-element preconditioner makes every event carry the
+                # same gradient at the fixed point, which prior-dominated (weakly observed) events can
+                # only satisfy by moving kilometres (Kumamoto: 1-2-dtime events driven to the depth clamp).
+                # The gauge is enforced on the preconditioned UPDATE (the momentum, below) and by re-centering the
+                # parameters after each step (state._project_gauge_inplace), so stiff events absorb the
+                # collective mode and weak events stay at their own conditional modes.
                 
                 # Drift always uses N * ḡ
                 grad_eff = grad if reparam_scale is None else (grad * reparam_scale)
@@ -704,137 +169,6 @@ class SGHMC(torch.optim.Optimizer):
                     ema_g2 = torch.zeros_like(p)
                     state["ema_g2"] = ema_g2
                 state["step"] = int(state.get("step", 0)) + 1
-
-                if preconditioning and preconditioner_type == BLOCK_GN_NAME:
-                    # Block Gauss-Newton metric (see spider/optim/block_gn.py): fixed per-event 4x4 M_i,
-                    # natural step s = lr * N (dimensionless), momentum in metric-scaled units.
-                    M_blk, L_blk = ensure_block_gn_metric(self, group, state, p)
-                    if reparam_scale is not None and not bool(getattr(self, "_block_gn_reparam_warned", False)):
-                        _warn("block_gn preconditioner ignores sampler.reparameterization (the metric already "
-                              "carries the coordinate units).", section="PRECOND")
-                        setattr(self, "_block_gn_reparam_warned", True)
-                    g_drift = grad.mul(n_obs)
-                    s_nat = block_gn_natural_step(group)
-                    ema_g.mul_(grad_ema_beta).add_(g_drift, alpha=(1.0 - grad_ema_beta))
-                    ema_g2.mul_(grad_ema_beta).addcmul_(g_drift, g_drift, value=(1.0 - grad_ema_beta))
-                    std = (math.sqrt(2.0 * alpha * s_nat) * math.sqrt(max(temperature, 0.0)) * noise_scale
-                           if (add_noise and temperature > 0.0 and noise_scale > 0.0) else 0.0)
-                    drift_blk, noise = block_gn_drift_and_noise(M=M_blk, L=L_blk, g=g_drift, noise_std=std, gauge=block_gn_gauge_spec(self, p))
-                    m.mul_(1.0 - alpha)
-                    m.add_(drift_blk, alpha=-s_nat)
-                    if noise is not None:
-                        try:
-                            if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
-                                if bool(getattr(self, "_gauge_project_apply_noise", True)):
-                                    dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
-                                    mode = str(getattr(self, "_gauge_project_mode", "global"))
-                                    cid = getattr(self, "_gauge_cluster_ids", None)
-                                    cc = getattr(self, "_gauge_cluster_counts", None)
-                                    project_event_mean_inplace(noise, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
-                        except Exception:
-                            pass
-                        m.add_(noise)
-                    try:
-                        if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
-                            if bool(getattr(self, "_gauge_project_apply_momentum", True)):
-                                dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
-                                mode = str(getattr(self, "_gauge_project_mode", "global"))
-                                cid = getattr(self, "_gauge_cluster_ids", None)
-                                cc = getattr(self, "_gauge_cluster_counts", None)
-                                project_event_mean_inplace(m, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
-                    except Exception:
-                        pass
-                    p.add_(m)
-                    continue
-
-                if preconditioning and preconditioner_type in {"lrd", "component_lrd"}:
-                    if preconditioner_type == "component_lrd":
-                        d_flat, comp_factors = _build_component_lrd_metric(
-                            group=group,
-                            state=state,
-                            grad_for_precond=grad_for_precond,
-                            beta=float(beta),
-                            eps=float(eps),
-                            freeze_preconditioner=bool(freeze_preconditioner),
-                        )
-                        g_flat = grad_for_drift.reshape(-1)
-                        pre_flat = d_flat * g_flat
-                        pre_flat = _apply_component_lowrank_drift(
-                            grad_for_drift=grad_for_drift,
-                            pre_flat=pre_flat,
-                            factors=comp_factors,
-                        )
-                    else:
-                        d_flat, U_lrd, lam_lrd = _build_lrd_metric(
-                            group=group,
-                            state=state,
-                            grad_for_precond=grad_for_precond,
-                            beta=float(beta),
-                            eps=float(eps),
-                            freeze_preconditioner=bool(freeze_preconditioner),
-                        )
-                        g_flat = grad_for_drift.reshape(-1)
-                        pre_flat = d_flat * g_flat
-                        if int(U_lrd.numel()) > 0 and int(lam_lrd.numel()) > 0:
-                            try:
-                                q = U_lrd.mT @ g_flat
-                                pre_flat = pre_flat + (U_lrd @ (lam_lrd * q))
-                            except Exception:
-                                pass
-                    # Keep diagnostics consistent with other paths.
-                    ema_g.mul_(grad_ema_beta).add_(grad_for_drift, alpha=(1.0 - grad_ema_beta))
-                    ema_g2.mul_(grad_ema_beta).addcmul_(grad_for_drift, grad_for_drift, value=(1.0 - grad_ema_beta))
-
-                    m.mul_(1.0 - alpha)
-                    drift_inc = pre_flat.reshape_as(p)
-                    if reparam_scale is not None:
-                        drift_inc = drift_inc * reparam_scale
-                    m.add_(drift_inc, alpha=-lr)
-
-                    if add_noise and temperature > 0.0 and noise_scale > 0.0:
-                        std = math.sqrt(2.0 * alpha * lr) * math.sqrt(max(temperature, 0.0)) * noise_scale
-                        noise_flat = torch.randn_like(g_flat) * d_flat.sqrt()
-                        if preconditioner_type == "component_lrd":
-                            noise_flat = _apply_component_lowrank_noise(
-                                grad_shape_like=grad_for_drift,
-                                noise_flat=noise_flat,
-                                factors=comp_factors,
-                            )
-                        else:
-                            if int(U_lrd.numel()) > 0 and int(lam_lrd.numel()) > 0:
-                                try:
-                                    z2 = torch.randn((int(lam_lrd.numel()),), device=p.device, dtype=p.dtype)
-                                    noise_flat = noise_flat + (U_lrd @ (lam_lrd.clamp_min(0.0).sqrt() * z2))
-                                except Exception:
-                                    pass
-                        noise = std * noise_flat.reshape_as(p)
-                        if reparam_scale is not None:
-                            noise = noise * reparam_scale
-                        try:
-                            if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
-                                if bool(getattr(self, "_gauge_project_apply_noise", True)):
-                                    dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
-                                    mode = str(getattr(self, "_gauge_project_mode", "global"))
-                                    cid = getattr(self, "_gauge_cluster_ids", None)
-                                    cc = getattr(self, "_gauge_cluster_counts", None)
-                                    project_event_mean_inplace(noise, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
-                        except Exception:
-                            pass
-                        m.add_(noise)
-
-                    try:
-                        if bool(getattr(self, "_gauge_project_enable", False)) and (getattr(self, "_gauge_project_param", None) is p):
-                            if bool(getattr(self, "_gauge_project_apply_momentum", True)):
-                                dims = tuple(getattr(self, "_gauge_project_dims", (0, 1, 2)))
-                                mode = str(getattr(self, "_gauge_project_mode", "global"))
-                                cid = getattr(self, "_gauge_cluster_ids", None)
-                                cc = getattr(self, "_gauge_cluster_counts", None)
-                                project_event_mean_inplace(m, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
-                    except Exception:
-                        pass
-
-                    p.add_(m)
-                    continue
 
                 # Update diagonal preconditioner stats and compute G
                 G = None
@@ -930,8 +264,7 @@ class SGHMC(torch.optim.Optimizer):
         Return summary stats for the preconditioner (dict):
           {min, p25, median, p75, max}
 
-        - Diagonal: stats of diagonal G.
-        - Matrix (FIM): stats of diagonal elements of M^{-1}.
+        - Diagonal (rmsprop): stats of diagonal G.
         """
         try:
             def _nan() -> dict:
@@ -959,7 +292,6 @@ class SGHMC(torch.optim.Optimizer):
                 return _nan()
             group = self.param_groups[0]
             preconditioning = bool(group.get("preconditioning", True))
-            preconditioner_type = _canonical_preconditioner_name(group.get("preconditioner", "rmsprop"))
             if not preconditioning:
                 return _nan()
             
@@ -977,13 +309,6 @@ class SGHMC(torch.optim.Optimizer):
             
             state = self.state.get(p, {})
             
-            if preconditioner_type == BLOCK_GN_NAME:
-                return _five_num(block_gn_diag_metric(state, p))
-            if preconditioner_type in {"lrd", "component_lrd"}:
-                G_diag = state.get("precond_diag", None)
-                if isinstance(G_diag, torch.Tensor):
-                    return _five_num(G_diag)
-
             v = state.get("exp_avg_sq", None)
             if v is None:
                 G = torch.ones_like(p)
@@ -1037,7 +362,6 @@ class SGHMC(torch.optim.Optimizer):
             beta = float(group.get("beta", 0.99))
             eps_g = float(group.get("eps", 1e-5))
             preconditioning = bool(group.get("preconditioning", True))
-            preconditioner_type = _canonical_preconditioner_name(group.get("preconditioner", "rmsprop"))
             add_noise = bool(group.get("add_noise", True))
             noise_scale = float(group.get("noise_scale", 1.0))
             temperature = float(group.get("temperature", 1.0))
@@ -1068,16 +392,8 @@ class SGHMC(torch.optim.Optimizer):
                 
                 var_g = (ema_g2 - ema_g * ema_g).clamp_min(0.0)
                 
-                lr_use = lr
                 if preconditioning:
-                    if preconditioner_type == BLOCK_GN_NAME:
-                        G = block_gn_diag_metric(state, p)
-                        lr_use = block_gn_natural_step(group)
-                    elif preconditioner_type in {"lrd", "component_lrd"}:
-                        G = state.get("precond_diag", None)
-                        if (not isinstance(G, torch.Tensor)) or G.shape != p.shape:
-                            G = torch.ones_like(p)
-                    elif v is None:
+                    if v is None:
                         G = torch.ones_like(p)
                     else:
                         step = int(state.get("step", 1))
@@ -1087,11 +403,11 @@ class SGHMC(torch.optim.Optimizer):
                     G = torch.ones_like(p)
                 
                 # SGHMC noise variance per parameter in momentum/update space
-                var_noise = (2.0 * alpha * lr_use) * (noise_scale * noise_scale) * max(temperature, 0.0) * G
+                var_noise = (2.0 * alpha * lr) * (noise_scale * noise_scale) * max(temperature, 0.0) * G
                 denom = torch.where(var_noise > 0.0, var_noise, var_noise.new_full(var_noise.shape, eps))
                 
                 # Gradient noise-induced update variance via EMA stats
-                num = (lr_use * lr_use) * (G * G) * var_g
+                num = (lr * lr) * (G * G) * var_g
                 
                 ratio = (num / denom).clamp_min(1e-30)
                 finite_mask = torch.isfinite(ratio)
@@ -1156,7 +472,6 @@ class SGHMC(torch.optim.Optimizer):
             beta = float(group.get("beta", 0.99))
             eps_g = float(group.get("eps", 1e-5))
             preconditioning = bool(group.get("preconditioning", True))
-            preconditioner_type = _canonical_preconditioner_name(group.get("preconditioner", "rmsprop"))  # "rmsprop" | "lrd" | "component_lrd"
             add_noise = bool(group.get("add_noise", True))
             noise_scale = float(group.get("noise_scale", 1.0))
             temperature = float(group.get("temperature", 1.0))
@@ -1179,27 +494,18 @@ class SGHMC(torch.optim.Optimizer):
                     continue
 
                 # Compute effective G used for noise injection
-                lr_eff_t = lr
-                if preconditioning and preconditioner_type == BLOCK_GN_NAME:
-                    G_eff = block_gn_diag_metric(state, m)
-                    lr_eff_t = block_gn_natural_step(group)
-                elif preconditioning and preconditioner_type in {"lrd", "component_lrd"}:
-                    G_eff = state.get("precond_diag", None)
-                    if (not isinstance(G_eff, torch.Tensor)) or G_eff.shape != m.shape:
+                if preconditioning:
+                    v = state.get("exp_avg_sq", None)
+                    if v is None:
                         G_eff = torch.ones_like(m)
-                else:
-                    if preconditioning:
-                        v = state.get("exp_avg_sq", None)
-                        if v is None:
-                            G_eff = torch.ones_like(m)
-                        else:
-                            step = int(state.get("step", 1))
-                            v_hat = v / (1.0 - (beta ** max(step, 1)))
-                            G_eff = 1.0 / (eps_g + v_hat.sqrt())
                     else:
-                        G_eff = torch.ones_like(m)
+                        step = int(state.get("step", 1))
+                        v_hat = v / (1.0 - (beta ** max(step, 1)))
+                        G_eff = 1.0 / (eps_g + v_hat.sqrt())
+                else:
+                    G_eff = torch.ones_like(m)
 
-                denom = (lr_eff_t * (noise_scale * noise_scale)) * G_eff
+                denom = (lr * (noise_scale * noise_scale)) * G_eff
                 denom = torch.where(denom > 0.0, denom, denom.new_full(denom.shape, eps))
                 # m^2-based (may include drift mean)
                 teff_msq = (scale * (m * m)) / denom

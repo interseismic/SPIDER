@@ -233,43 +233,6 @@ class ConfigBridgeTests(unittest.TestCase):
         self.assertAlmostEqual(legacy["_shared_event_re_edge_weight_power"], 0.25)
         self.assertFalse(legacy["_shared_event_re_edge_weight_normalize"])
 
-    def test_sampler_lrd_materialization(self) -> None:
-        cfg = _base_config()
-        pre = cfg["inference"]["sampler"]["preconditioning"]
-        pre["type"] = "lrd"
-        pre["lrd"] = {
-            "rank": 12,
-            "mode": "oja",
-            "update_every": 7,
-            "buffer_size": 40,
-            "eta": 0.015,
-            "diag_floor": 1e-6,
-            "target": "dX_src_only",
-        }
-
-        resolved = load_config(cfg, mode="sample")
-        legacy = to_legacy_runtime_params(resolved, profile="all", require_priors=False)
-        self.assertEqual(legacy["sampler_preconditioner"], "lrd")
-        self.assertEqual(legacy["sampler_preconditioning_lrd_rank"], 12)
-        self.assertEqual(legacy["sampler_preconditioning_lrd_mode"], "oja")
-        self.assertEqual(legacy["sampler_preconditioning_lrd_update_every"], 7)
-        self.assertEqual(legacy["sampler_preconditioning_lrd_buffer_size"], 40)
-        self.assertAlmostEqual(legacy["sampler_preconditioning_lrd_oja_eta"], 0.015)
-        self.assertAlmostEqual(legacy["sampler_preconditioning_lrd_diag_floor"], 1e-6)
-        self.assertEqual(legacy["sampler_preconditioning_lrd_target"], "dx_src_only")
-
-    def test_sampler_component_lrd_alias_materialization(self) -> None:
-        cfg = _base_config()
-        pre = cfg["inference"]["sampler"]["preconditioning"]
-        pre["type"] = "cc_lrd"
-        pre["lrd"] = {"rank": 8, "mode": "svd"}
-
-        resolved = load_config(cfg, mode="sample")
-        legacy = to_legacy_runtime_params(resolved, profile="all", require_priors=False)
-        self.assertEqual(legacy["sampler_preconditioner"], "component_lrd")
-        self.assertEqual(legacy["sampler_preconditioning_lrd_rank"], 8)
-        self.assertEqual(legacy["sampler_preconditioning_lrd_mode"], "svd")
-
     def test_sampler_blocked_reparameterization_materialization(self) -> None:
         cfg = _base_config()
         sampler = cfg["inference"]["sampler"]

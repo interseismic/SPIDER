@@ -17,7 +17,6 @@ from spider.core.modeling import (
 )
 from spider.utils.wandb_gates import want_wandb_group as _want_wandb_group
 from spider.optim.gauge import project_event_mean_inplace
-from spider.optim.block_gn import block_gn_prior_updated_hook
 
 
 # Standardized stdout helper
@@ -78,13 +77,11 @@ def _maybe_apply_gauge_projection_for_optimizer(state: LocateState, optimizer: t
     cid = state.cluster_ids if mode == "cluster" else None
     cc = state.cluster_counts if mode == "cluster" else None
 
-    # Project the gradient of dX_src in-place.
-    try:
-        g = getattr(state.dX_src, "grad", None)
-        if isinstance(g, torch.Tensor) and g.ndim == 2 and int(g.shape[0]) == int(state.dX_src.shape[0]):
-            project_event_mean_inplace(g, dims=dims, mode=mode, cluster_ids=cid, cluster_counts=cc)
-    except Exception:
-        pass
+    # The gradient itself is deliberately left unprojected: with Adam's per-element scaling a
+    # zero-mean gradient does not give a zero-mean step, and forcing every event to carry the same
+    # gradient at the fixed point displaces prior-dominated events by kilometres. The constraint is
+    # enforced exactly by re-centering ΔX_src after each step (state._project_gauge_inplace).
+    return
 
 
 def _maybe_apply_gauge_projection_to_momentum_buffers(state: LocateState, optimizer: torch.optim.Optimizer) -> None:
@@ -1636,12 +1633,6 @@ def _run_epoch(
                     else:
                         new_P0 = update_precision_hyperparameter(state.dX_src.detach(), nu, V_inv_common, mode="sample")
                         state.event_precision_matrix = new_P0
-                    # The block Gauss-Newton metric includes the prior precision; schedule a rebuild
-                    # (no-op for other preconditioners or when the preconditioner is frozen).
-                    try:
-                        block_gn_prior_updated_hook(state, getattr(state, "sampler", None))
-                    except Exception:
-                        pass
                     # Lightweight visibility: report implied stds periodically (or every update if update_every is large).
                     try:
                         # Prefer the existing diagnostics cadence knob if present.
@@ -1677,16 +1668,16 @@ def _run_epoch(
                     # Avoid silent failures; warn once per epoch.
                     warn("Hierarchical event prior update failed; leaving P0 unchanged for this epoch.", section="PRIORS")
 
-        # Optional: independence-Metropolis resampling of weakly-observed events (sampling only).
-        # Draws fresh positions from the hierarchical event prior with an MH correction over
-        # each weak event's own rows, so prior-dominated events contribute properly smeared
-        # marginals instead of slow lumpy random walks. See docs/weak-event-mh.md.
+        # Optional: Metropolis resampling of weakly-observed events (sampling only). Proposes from each
+        # weak event's Gauss-Newton conditional fit (or from the prior) with an exact MH correction over
+        # the event's own rows, so few-row events get near-independent draws instead of the slow RMSprop
+        # random walk. See docs/weak-event-mh.md.
         if (
             bool(state.params.get("_weak_mh_enable", False))
             and phase_id == 4
             and getattr(state, "event_precision_matrix", None) is not None
         ):
-            wm_every = max(1, int(state.params.get("_weak_mh_every_epochs", 10)))
+            wm_every = max(1, int(state.params.get("_weak_mh_every_epochs", 1)))
             wm_start = int(state.params.get("_weak_mh_start_epoch", 0) or 0)
             if epoch_index >= wm_start and (epoch_index % wm_every) == 0 and ((not ddp_enabled) or ddp_is_main):
                 try:
@@ -1695,7 +1686,8 @@ def _run_epoch(
                     wm_cache = getattr(state, "_weak_mh_cache", None)
                     wm_max = int(state.params.get("_weak_mh_max_dtimes", 100))
                     if wm_cache is None or wm_cache.get("max_dtimes") != wm_max:
-                        wm_cache = build_weak_event_cache(state.II, int(state.dX_src.shape[0]), wm_max)
+                        wm_cache = build_weak_event_cache(state.II, int(state.dX_src.shape[0]), wm_max,
+                                                          dX0=state.dX_src.detach())
                         state._weak_mh_cache = wm_cache
                         info(
                             f"Weak-event MH: {wm_cache.get('n_weak', 0)} events with <= {wm_max} dtimes "
@@ -1705,6 +1697,16 @@ def _run_epoch(
                     cen_std = None
                     if bool(state.params.get("prior_centroid_enable", False)):
                         cen_std = state.params.get("prior_centroid_std", None)
+                    # Data scales for the MH target: with the shared-event RE likelihood a weak event's row is
+                    # effectively scored with the batch-marginal variance sigma^2 + 2 tau^2 (its effect and its
+                    # partner's are not identifiable from ~one row per batch); otherwise phase_unc.
+                    sig = [float(v) for v in state.params.get("phase_unc", (0.02, 0.02))][:2]
+                    if bool(state.params.get("_shared_event_re_enabled", False)):
+                        tau = state.params.get("_shared_event_re_tau_s", None)
+                        if isinstance(tau, (list, tuple)) and len(tau) >= 2:
+                            sig = [math.sqrt(sig[0] ** 2 + 2.0 * float(tau[0]) ** 2),
+                                   math.sqrt(sig[1] ** 2 + 2.0 * float(tau[1]) ** 2)]
+                    _t_dof = state.params.get("_weak_mh_t_dof", 5.0)
                     wm_stats = weak_event_mh_sweep(
                         dX=state.dX_src.data,
                         X_src=state.X_src,
@@ -1713,19 +1715,23 @@ def _run_epoch(
                         model=state.model,
                         precision=state.event_precision_matrix,
                         cluster_ids=state.cluster_ids,
-                        sigma_ps=tuple(state.params.get("phase_unc", (0.02, 0.02))),
+                        sigma_ps=(sig[0], sig[1]),
                         cache=wm_cache,
                         centroid_std=cen_std,
-                        batch_size=int(state.params.get("batch_size_warmup", 500_000)),
-                        params=state.params,
+                        proposal=str(state.params.get("_weak_mh_proposal", "conditional")),
+                        gn_iters=int(state.params.get("_weak_mh_gn_iters", 4)),
+                        t_dof=(None if _t_dof is None else float(_t_dof)),
+                        scale_inflation=float(state.params.get("_weak_mh_scale", 1.2)),
                     )
-                    if wm_stats["n_proposed"] > 0:
+                    _wm_log_every = max(1, int(state.params.get("display_precond_every", 50) or 50))
+                    if wm_stats["n_proposed"] > 0 and (epoch_index % _wm_log_every == 0 or wm_every > 1):
                         by = wm_stats.get("accept_by_degree", {})
                         by_s = " | ".join(f"{k} dtimes: {a}/{n}" for k, (a, n) in by.items()) if by else ""
                         info(
-                            f"Weak-event MH sweep: accepted {wm_stats['n_accepted']}/{wm_stats['n_proposed']} "
+                            f"Weak-event MH sweep ({wm_stats['proposal']}): accepted {wm_stats['n_accepted']}/{wm_stats['n_proposed']} "
                             f"(median jump {wm_stats['median_jump_m']:.0f} m)"
-                            + (f" [{by_s}]" if by_s else ""),
+                            + (f" [{by_s}]" if by_s else "")
+                            + (f" | {wm_stats['n_fit_nonfinite']} non-finite fits" if wm_stats.get("n_fit_nonfinite") else ""),
                             section="SAMPLER",
                         )
                 except Exception as exc:

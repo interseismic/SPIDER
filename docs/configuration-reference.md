@@ -30,7 +30,7 @@ Unknown keys at any strict block level raise a validation error. Two levels of s
   `validate-config`.
 - **Pass-through blocks** (`model.priors`, `model.likelihoods.*` sub-blocks, `model.filters.*`,
   `model.eikonet`, `inference.batching.*`, `inference.runtime.gauge_projection`,
-  `inference.runtime.torch`, `inference.sampler.preconditioning.lrd`, `inference.sampler.overrides`,
+  `inference.runtime.torch`, `inference.sampler.overrides`,
   `observability.diagnostics`, `synth`): the block itself must be a dict, but its keys are read by
   the runtime with defaults. A misspelled key inside a pass-through block **does not fail
   validation and has no effect at runtime**; instead `spider validate-config` prints a non-fatal
@@ -453,14 +453,12 @@ Optional:
 | `overrides` | `{}` | see below |
 | `lr_schedule` | `{}` | see below |
 | `phase1_two_pass` | `{}` | see below |
+| `weak_event_mh` | `{}` | see below |
 
 `preconditioning` (strict sub-block):
 
 - `enabled` (bool, default `false`; `false` forces type `none` regardless of `type`)
-- `type` (`rmsprop`, `lrd`, `component_lrd`, or `block_gn` when enabled; aliases `cc_lrd`, `block_lrd`, and
-  `component-lrd` are accepted). With `block_gn`, `lr[1..3]` are dimensionless natural steps and
-  values `>= 2` are rejected; `inference.runtime.gauge_projection.enabled` must be `true` (and
-  `dims` must be `[0, 1, 2, 3]` when the centroid prior is enabled); see {doc}`sampler-options`.
+- `type` (`rmsprop` when enabled; see {doc}`sampler-options`)
 - `include_gamma` (bool, default **`false`**): add the pSGLD Γ correction drift (pSGLD + `rmsprop`
   only). Γ is the diagonal approximation to the derivative of the preconditioner,
   `Γ = -(1-β) ḡ √v / (ε + √v)²`, computed from the minibatch-mean gradient; in exact pSGLD it
@@ -468,14 +466,6 @@ Optional:
   frozen, see `freeze_preconditioner_sampling`) RMSprop preconditioner the term is negligible and
   only adds cost, so it is off by default; both shipped example configs also set it to `false`.
   Set `true` to recover the full pSGLD drift when the preconditioner is adapting quickly.
-- `lrd` (dict when present; **keys are not whitelisted**): `rank` (16), `mode` (`svd` | `oja`,
-  default `svd`; `randomized_svd` / `stochastic_svd` alias to `svd`, other values fall back to
-  `svd`), `update_every` (20), `buffer_size` (64), `eta` (or `oja_eta`, 0.02), `diag_floor`
-  (defaults to `inference.sampler.eps`), `target` (`dX_src_only`)
-- `block_gn` (strict sub-block, used with `type: block_gn`): `fallback_std` (4 positive numbers
-  `[km, km, km, s]` or `null`), `min_std` (4 non-negative numbers or `null`),
-  `refresh_every_epochs` (int `>= 1` or `null`), `refresh_on_prior_update` (bool, default
-  `true`), `batch_size` (int `>= 1`, default 262144), `jitter` (`>= 0`, default 1e-6)
 
 `overrides` (dict): `core.{lr_mult, temperature_mult, eps, freeze_preconditioner_sampling}`.
 `core` is the name of the single sampler parameter group (the event shifts); other group names are
@@ -490,7 +480,7 @@ the global flag (it can freeze, never unfreeze).
 - `dt_scale` (`> 0`, default 1.0): static scale for `dt`
 
 See {doc}`sampler-options` for what the scales do. The example configs use `dt_scale: 0.3` with
-pSGLD. Ignored (with a warning) under `preconditioning.type: block_gn`.
+pSGLD.
 
 `lr_schedule` (strict sub-block; Phase-1 / MAP learning-rate schedule; default constant `lr[0]`):
 
@@ -523,6 +513,26 @@ the second pass's epoch lines `phase1-pass2`. The pass-1 catalog is kept as
 pass is skipped when `epochs_per_phase[0] = 0`, and (with a warning) under torchrun/DDP. It is
 intended for fresh runs (`inference.runtime.reset_batch_numbers: true`), not for resuming into the
 second pass.
+
+`weak_event_mh` (strict sub-block; independence-Metropolis resampling of weakly-observed events
+during Phase 4; default disabled; see {doc}`weak-event-mh`):
+
+- `enabled` (bool, default `false`)
+- `every_epochs` (int `>= 1`, default `1`): run one sweep every this many Phase-4 epochs
+- `start_epoch` (int `>= 0`, default `0`): first Phase-4 epoch at which sweeps run
+- `max_dtimes` (int `>= 1`, default `50`): events with at most this many dtimes are resampled
+- `proposal` (`conditional` (default) or `prior`): `conditional` fits each event's conditional
+  posterior (Gauss-Newton over its own rows, partners fixed) and proposes from a Student-t centred
+  on the fit; `prior` proposes from the event prior and only accepts for near-isolated events
+- `gn_iters` (int `>= 1`, default `4`): Gauss-Newton iterations of the conditional fit
+- `t_dof` (number `> 2` or `null`, default `5.0`): Student-t degrees of freedom of the proposal;
+  `null` uses a Gaussian proposal
+- `scale_inflation` (`> 0`, default `1.2`): multiplier on the proposal scale (square root of the
+  fitted conditional covariance)
+
+Sweeps run only in Phase 4 and never test two events that share a dtime in the same pass. The
+console reports acceptance by degree bucket every `observability.diagnostics.display_precond_every`
+epochs.
 
 ### `inference.batching`
 
@@ -567,12 +577,14 @@ Optional (defaults applied at load time and reported by `validate-config --print
   `cluster`, default `global`; other values fall back to `global`), `dims` (default `[0, 1, 2]`;
   indices into `[x, y, z, t]`), `apply_noise` (true), `apply_momentum` (true). When enabled, the
   mean over events (globally, or per connected component with `cluster`) of the selected dimensions
-  is removed from the gradient before the preconditioner statistics, from the injected noise and
-  momentum in the samplers, and, decisively, from the parameters themselves after every optimizer
-  or sampler step in all phases (the frame is re-centered exactly). The last step is what makes it
-  a hard constraint: Adam and the RMSprop-preconditioned samplers rescale each element by its own
-  running statistics, so a zero-mean gradient alone does not give a zero-mean update and the frames
-  would still drift. With `mode: cluster` and `dims: [0,1,2,3]` each connected component keeps its
+  is removed from the preconditioned update, the injected noise and the momentum in the samplers,
+  and, decisively, from the parameters themselves after every optimizer or sampler step in all
+  phases (the frame is re-centered exactly). The raw gradient is deliberately **not** projected:
+  subtracting the mean gradient before a per-element preconditioner makes every event carry the
+  same gradient at the fixed point, which prior-dominated (weakly observed) events can only satisfy
+  by moving kilometres (on Kumamoto the 1-2-dtime events were driven to the depth clamp). Projecting
+  the update instead lets the well-observed events absorb the collective mode with metre-scale
+  displacements while weak events stay at their own conditional modes. With `mode: cluster` and `dims: [0,1,2,3]` each connected component keeps its
   input-catalog frame in position and origin time, independent of how many events or dtimes it has;
   the centroid prior then has no effect (its term is identically zero). This is the recommended way
   to fix the gauge when the absolute frame of the input catalog is to be preserved (the convention

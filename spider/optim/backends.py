@@ -5,14 +5,10 @@ from typing import Tuple, List
 
 from .sgld import pSGLD  # default backend
 from .sghmc import SGHMC
-from .block_gn import BLOCK_GN_NAME, attach_block_gn_provider
 
 
 def _normalize_preconditioner_name(name: str) -> str:
-    x = str(name).strip().lower()
-    if x in {"cc_lrd", "block_lrd", "component-lrd"}:
-        return "component_lrd"
-    return x
+    return str(name).strip().lower()
 
 
 def _attach_set_lr(opt: torch.optim.Optimizer) -> None:
@@ -102,32 +98,17 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         if precond_enabled:
             if precond in {"none", "false", ""}:
                 precond = "rmsprop"
-            if precond not in {"rmsprop", "lrd", "component_lrd", BLOCK_GN_NAME}:
+            if precond != "rmsprop":
                 raise ValueError(
-                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd, component_lrd, block_gn."
+                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop (or disable preconditioning)."
                 )
         else:
             precond = "none"
         for g in opt.param_groups:
             g["preconditioner"] = precond
             g["preconditioning"] = precond_enabled
-            if precond in {"lrd", "component_lrd"}:
-                g["lrd_rank"] = int(params.get("sampler_preconditioning_lrd_rank", 16))
-                g["lrd_mode"] = str(params.get("sampler_preconditioning_lrd_mode", "svd")).strip().lower()
-                g["lrd_update_every"] = int(params.get("sampler_preconditioning_lrd_update_every", 20))
-                g["lrd_buffer_size"] = int(params.get("sampler_preconditioning_lrd_buffer_size", 64))
-                g["lrd_oja_eta"] = float(params.get("sampler_preconditioning_lrd_oja_eta", 0.02))
-                g["lrd_diag_floor"] = float(params.get("sampler_preconditioning_lrd_diag_floor", params.get("sampler_eps", 1e-8)))
-                g["lrd_target"] = str(params.get("sampler_preconditioning_lrd_target", "dX_src_only")).strip().lower()
-                if precond == "component_lrd":
-                    cid = getattr(state, "cluster_ids", None)
-                    cc = getattr(state, "cluster_counts", None)
-                    if isinstance(cid, torch.Tensor) and isinstance(cc, torch.Tensor):
-                        g["lrd_component_ids"] = cid
-                        g["lrd_component_counts"] = cc
 
         _maybe_attach_gauge_projection(opt, params=params, state=state)
-        attach_block_gn_provider(opt, params=params, state=state)
         return "psgld", opt
 
     if backend == "sghmc":
@@ -153,36 +134,21 @@ def create_sampler_backend(params: dict, state) -> Tuple[str, torch.optim.Optimi
         if precond_enabled:
             if precond in {"none", "false", ""}:
                 precond = "rmsprop"
-            if precond not in {"rmsprop", "lrd", "component_lrd", BLOCK_GN_NAME}:
+            if precond != "rmsprop":
                 raise ValueError(
-                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop, lrd, component_lrd, block_gn."
+                    f"Unsupported sampler preconditioner '{precond}'. Supported: rmsprop (or disable preconditioning)."
                 )
         else:
             precond = "none"
         for g in opt.param_groups:
             g["preconditioner"] = precond
             g["preconditioning"] = precond_enabled
-            if precond in {"lrd", "component_lrd"}:
-                g["lrd_rank"] = int(params.get("sampler_preconditioning_lrd_rank", 16))
-                g["lrd_mode"] = str(params.get("sampler_preconditioning_lrd_mode", "svd")).strip().lower()
-                g["lrd_update_every"] = int(params.get("sampler_preconditioning_lrd_update_every", 20))
-                g["lrd_buffer_size"] = int(params.get("sampler_preconditioning_lrd_buffer_size", 64))
-                g["lrd_oja_eta"] = float(params.get("sampler_preconditioning_lrd_oja_eta", 0.02))
-                g["lrd_diag_floor"] = float(params.get("sampler_preconditioning_lrd_diag_floor", params.get("sampler_eps", 1e-8)))
-                g["lrd_target"] = str(params.get("sampler_preconditioning_lrd_target", "dX_src_only")).strip().lower()
-                if precond == "component_lrd":
-                    cid = getattr(state, "cluster_ids", None)
-                    cc = getattr(state, "cluster_counts", None)
-                    if isinstance(cid, torch.Tensor) and isinstance(cc, torch.Tensor):
-                        g["lrd_component_ids"] = cid
-                        g["lrd_component_counts"] = cc
 
         # Ensure alpha exists in groups
         for g in opt.param_groups:
             g.setdefault("alpha", float(params.get("sghmc_alpha", 0.01)))
         # Attach optional gauge-projection config (hard constraint on translation mode) to optimizer instance.
         _maybe_attach_gauge_projection(opt, params=params, state=state)
-        attach_block_gn_provider(opt, params=params, state=state)
         return "sghmc", opt
 
     raise ValueError(
@@ -194,9 +160,9 @@ def _maybe_attach_gauge_projection(opt: torch.optim.Optimizer, *, params: dict, 
     """
     Attach gauge-projection configuration to the optimizer instance (not stored in state_dict).
 
-    This allows sampler backends to:
-    - project out the mean gradient before preconditioner updates, and
-    - project injected noise / momentum so the translation mode cannot random-walk.
+    This allows sampler backends to project the mean out of the preconditioned update, the injected
+    noise and the momentum so the translation mode cannot random-walk (the raw gradient is not
+    projected; see spider/optim/gauge.py).
     """
     try:
         enable = bool(params.get("gauge_project_enable", False))

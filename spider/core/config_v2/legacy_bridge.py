@@ -127,48 +127,13 @@ def _materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     precond = _require_dict(sampler.get("preconditioning"), "inference.sampler.preconditioning")
     precond_enabled = bool(precond.get("enabled", False))
     precond_type = str(precond.get("type", "none")).strip().lower()
-    if precond_type in {"cc_lrd", "block_lrd", "component-lrd"}:
-        precond_type = "component_lrd"
     if not precond_enabled:
         precond_type = "none"
-    if precond_type not in {"none", "rmsprop", "lrd", "component_lrd", "block_gn"}:
+    if precond_type not in {"none", "rmsprop"}:
         raise ValueError(
             "Invalid config at `inference.sampler.preconditioning.type`: "
-            "supported values are 'rmsprop', 'lrd', 'component_lrd', and 'block_gn' (or disable preconditioning)."
+            "the only supported preconditioner is 'rmsprop' (or disable preconditioning)."
         )
-    # Block Gauss-Newton metric options (spider/optim/block_gn.py). Unset keys keep module defaults.
-    bgn_cfg = precond.get("block_gn", {})
-    if not isinstance(bgn_cfg, dict):
-        bgn_cfg = {}
-    def _bgn_std_list(key: str):
-        v = bgn_cfg.get(key, None)
-        if v is None:
-            return None
-        return [float(x) for x in v]
-    bgn_fallback_std = _bgn_std_list("fallback_std")
-    bgn_min_std = _bgn_std_list("min_std")
-    _bre = bgn_cfg.get("refresh_every_epochs", None)
-    bgn_refresh_every = None if _bre is None else int(_bre)
-    bgn_refresh_on_prior = bool(bgn_cfg.get("refresh_on_prior_update", True))
-    bgn_batch_size = int(bgn_cfg.get("batch_size", 262144))
-    bgn_jitter = float(bgn_cfg.get("jitter", 1e-6))
-    lrd_cfg = precond.get("lrd", {})
-    if not isinstance(lrd_cfg, dict):
-        lrd_cfg = {}
-    lrd_rank = int(lrd_cfg.get("rank", 16))
-    lrd_mode = str(lrd_cfg.get("mode", "svd")).strip().lower()
-    if lrd_mode in {"randomized_svd", "stochastic_svd"}:
-        lrd_mode = "svd"
-    if lrd_mode not in {"svd", "oja"}:
-        lrd_mode = "svd"
-    lrd_update_every = int(lrd_cfg.get("update_every", 20))
-    lrd_buffer_size = int(lrd_cfg.get("buffer_size", 64))
-    lrd_oja_eta = float(lrd_cfg.get("eta", lrd_cfg.get("oja_eta", 0.02)))
-    lrd_diag_floor = float(lrd_cfg.get("diag_floor", sampler.get("eps", 1e-8)))
-    lrd_target = str(lrd_cfg.get("target", "dX_src_only")).strip().lower()
-    _fs = lrd_cfg.get("freeze_subspace_after", None)
-    lrd_freeze_subspace_after = None if _fs is None else int(_fs)
-
     params["phase1_epochs"] = int(epochs[0])
     params["phase2_epochs"] = int(epochs[1])
     params["phase3_epochs"] = int(epochs[2])
@@ -187,9 +152,14 @@ def _materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(wm, dict):
         wm = {}
     params["_weak_mh_enable"] = bool(wm.get("enabled", False))
-    params["_weak_mh_every_epochs"] = int(wm.get("every_epochs", 10))
+    params["_weak_mh_every_epochs"] = int(wm.get("every_epochs", 1))
     params["_weak_mh_start_epoch"] = int(wm.get("start_epoch", 0))
-    params["_weak_mh_max_dtimes"] = int(wm.get("max_dtimes", 100))
+    params["_weak_mh_max_dtimes"] = int(wm.get("max_dtimes", 50))
+    params["_weak_mh_proposal"] = str(wm.get("proposal", "conditional")).strip().lower()
+    params["_weak_mh_gn_iters"] = int(wm.get("gn_iters", 4))
+    _wm_dof = wm.get("t_dof", 5.0)
+    params["_weak_mh_t_dof"] = None if _wm_dof is None else float(_wm_dof)
+    params["_weak_mh_scale"] = float(wm.get("scale_inflation", 1.2))
     noise_scale_mult = sampler.get("noise_scale_mult", 1.0)
     grad_clip_norm = sampler.get("grad_clip_norm", None)
     params["sampler_noise_scale_mult"] = float(1.0 if noise_scale_mult is None else noise_scale_mult)
@@ -207,20 +177,6 @@ def _materialize_block2(params: Dict[str, Any]) -> Dict[str, Any]:
     # disable it and the term is a diagonal approximation that mainly adds cost.
     params["sampler_preconditioning_include_gamma"] = bool(precond.get("include_gamma", False))
     params["_sampler_lr_per_phase"] = list(lrs)
-    params["sampler_preconditioning_lrd_rank"] = int(lrd_rank)
-    params["sampler_preconditioning_lrd_mode"] = str(lrd_mode)
-    params["sampler_preconditioning_lrd_update_every"] = int(lrd_update_every)
-    params["sampler_preconditioning_lrd_buffer_size"] = int(lrd_buffer_size)
-    params["sampler_preconditioning_lrd_oja_eta"] = float(lrd_oja_eta)
-    params["sampler_preconditioning_lrd_diag_floor"] = float(lrd_diag_floor)
-    params["sampler_preconditioning_lrd_target"] = str(lrd_target)
-    params["_lrd_freeze_subspace_after"] = lrd_freeze_subspace_after
-    params["sampler_preconditioning_block_gn_fallback_std"] = bgn_fallback_std
-    params["sampler_preconditioning_block_gn_min_std"] = bgn_min_std
-    params["sampler_preconditioning_block_gn_refresh_every_epochs"] = bgn_refresh_every
-    params["sampler_preconditioning_block_gn_refresh_on_prior_update"] = bool(bgn_refresh_on_prior)
-    params["sampler_preconditioning_block_gn_batch_size"] = int(bgn_batch_size)
-    params["sampler_preconditioning_block_gn_jitter"] = float(bgn_jitter)
 
     reparam = sampler.get("reparameterization", None)
     if not isinstance(reparam, dict):
